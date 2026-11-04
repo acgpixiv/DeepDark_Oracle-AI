@@ -12,6 +12,8 @@
 //!   stats                     库统计
 //!   index [--what auto|text|embed] [--wait]
 //!   rules                     列分类规则
+//!   gpu [--json]              显卡/后端能力诊断
+//!   semgraph [--nodes N]      语义星图聚类诊断（"排序模式"的数据自检）
 //!   serve [--port N]          启动局域网服务
 
 use std::path::PathBuf;
@@ -89,6 +91,9 @@ struct Ctx {
     audio: Arc<VectorStore>,
     clip_model: Option<Arc<crate::ai::clip::ClipModel>>,
     clap_model: Option<Arc<crate::ai::clap::ClapModel>>,
+    /// 惰性加载的文本 embedder：只有 search --semantic / sem / index 会用到。
+    /// 用 Mutex 而不是 Option<T> 直接放字段，是因为 Ctx 在 &self 上传给各子命令。
+    embedder: parking_lot::Mutex<Option<Arc<dyn crate::ai::Embedder>>>,
 }
 
 impl Ctx {
@@ -110,9 +115,23 @@ impl Ctx {
         let db = Db::open(&data_dir.join("index.db")).map_err(|e| format!("打开数据库失败：{e}"))?;
         db.sync_index_roots(&cfg.scan.roots, &cfg.scan.disabled_roots)
             .map_err(|e| format!("同步索引目录失败：{e}"))?;
-        // 维度必须和真正要用的 embedder 一致，否则向量库会按错误步长解析
-        let dim = crate::ai::build_embedder_with_index(&cfg.model, &cfg.index, cfg.index.batch_size)
-            .map(|e| e.dim())
+        // 维度必须和真正要用的 embedder 一致，否则向量库会按错误步长解析。
+        //
+        // 这里**不能**为了拿维度就去 build_embedder_with_index：那会把 558 MB 的
+        // GGUF 完整加载一遍（实测 CLI 每次启动多花 3.4 秒、吃 500+ MB 内存），
+        // 而 stats/gpu/search 这些子命令根本用不到模型。改成按证据推断：
+        //   1. 已存在的向量库 meta.json（最权威，就是上次真正落盘用的维度）；
+        //   2. config 里缓存的 embedding_dim（model_load_inner 成功后写回）；
+        //   3. 512 兜底。
+        // 只有真正要跑 index/sem 时才在 cmd_index / query_vec 里加载模型。
+        let dim = crate::vector::saved_dim_of(&data_dir.join("vectors"))
+            .or_else(|| {
+                if cfg.model.embedding_dim > 0 {
+                    Some(cfg.model.embedding_dim)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(512);
         let vectors = VectorStore::open(&data_dir.join("vectors"), dim)
             .map_err(|e| format!("打开向量库失败：{e}"))?;
@@ -122,12 +141,32 @@ impl Ctx {
             .map_err(|e| format!("打开跨模态图片向量库失败：{e}"))?;
         let audio = VectorStore::open(&data_dir.join("vectors_audio"), 512)
             .map_err(|e| format!("打开跨模态音频向量库失败：{e}"))?;
-        // 命令行跑跨模态：模型缺失就静默关闭，不阻塞其它子命令。
+        // 命令行跑跨模态：模型缺失就关掉，不阻塞其它子命令。
+        //
+        // 但**不能静默** —— CLIP/CLAP 依赖一个 ≥1.20 的 onnxruntime.dll，
+        // 以前这里全是 `.ok()?`，dll 版本不对就无声无息地退化成"没有
+        // 跨模态能力"，用户只会觉得"图片怎么搜不到"。
         let threads = if cfg.model.n_threads > 0 { cfg.model.n_threads } else { 0 };
-        let clips = crate::ai::clip::resolve_dir(&cfg.model, &app_dir, &data_dir);
-        let clip_model = clips.and_then(|d| crate::ai::clip::ClipModel::load(&d, threads)).map(Arc::new);
-        let claps = crate::ai::clap::resolve_dir(&cfg.model, &app_dir, &data_dir);
-        let clap_model = claps.and_then(|d| crate::ai::clap::ClapModel::load(&d, threads)).map(Arc::new);
+        let clip_model = match crate::ai::clip::resolve_dir(&cfg.model, &app_dir, &data_dir) {
+            Some(d) => match crate::ai::clip::ClipModel::load(&d, threads) {
+                Some(m) => Some(Arc::new(m)),
+                None => {
+                    eprintln!("[cli] CLIP 未能加载（{}），跨模态图片检索不可用", d.display());
+                    None
+                }
+            },
+            None => None,
+        };
+        let clap_model = match crate::ai::clap::resolve_dir(&cfg.model, &app_dir, &data_dir) {
+            Some(d) => match crate::ai::clap::ClapModel::load(&d, threads) {
+                Some(m) => Some(Arc::new(m)),
+                None => {
+                    eprintln!("[cli] CLAP 未能加载（{}），声音检索不可用", d.display());
+                    None
+                }
+            },
+            None => None,
+        };
         Ok(Self {
             app_dir,
             data_dir,
@@ -139,6 +178,7 @@ impl Ctx {
             audio: Arc::new(audio),
             clip_model,
             clap_model,
+            embedder: parking_lot::Mutex::new(None),
         })
     }
 
@@ -161,10 +201,32 @@ impl Ctx {
         );
     }
 
+    /// 惰性获取文本 embedder，进程内只加载一次。
+    ///
+    /// 原来 `query_vec` 每次都 `build_embedder_with_index`（GGUF 558 MB 完整
+    /// 加载一遍），而 `Ctx::open` 为了取维度还会再加载一次 —— 一次 `--cli sem`
+    /// 要白跑两遍模型。现在统一走这里，最多加载一次。
+    fn text_embedder(&self) -> Option<Arc<dyn crate::ai::Embedder>> {
+        let mut slot = self.embedder.lock();
+        if slot.is_none() {
+            match crate::ai::build_embedder_with_index(
+                &self.cfg.model,
+                &self.cfg.index,
+                self.cfg.index.batch_size,
+            ) {
+                Ok(emb) => *slot = Some(Arc::from(emb)),
+                Err(error) => {
+                    // 不要静默：模型加载失败是「语义检索没结果」最直接的原因。
+                    eprintln!("[cli] 嵌入模型加载失败：{error}");
+                    return None;
+                }
+            }
+        }
+        slot.clone()
+    }
+
     fn query_vec(&self, text: &str) -> Option<Vec<f32>> {
-        crate::ai::build_embedder_with_index(&self.cfg.model, &self.cfg.index, self.cfg.index.batch_size)
-            .ok()
-            .and_then(|e| e.embed_text(text, true).ok())
+        self.text_embedder()?.embed_text(text, true).ok()
     }
 
 }
@@ -211,7 +273,7 @@ fn positional(args: &[String]) -> Vec<String> {
         }
         if a.starts_with("--") {
             // 除开关型 flag 外，其余都吃掉下一个参数
-            if !matches!(a.as_str(), "--no-semantic" | "--wait" | "--help" | "-h") {
+            if !matches!(a.as_str(), "--no-semantic" | "--wait" | "--help" | "-h" | "--json") {
                 skip = true;
             }
             continue;
@@ -249,6 +311,8 @@ pub fn run(argv: &[String]) -> i32 {
         "stats" => cmd_stats(&ctx),
         "index" => cmd_index(&ctx, args),
         "rules" => cmd_rules(&ctx),
+        "gpu" => cmd_gpu(&ctx, args),
+        "semgraph" => cmd_semgraph(&ctx, args),
         "serve" => cmd_serve(&ctx, args),
         "-h" | "--help" | "help" => {
             print_usage();
@@ -277,7 +341,82 @@ fn print_usage() {
     println!("  stats                       库统计");
     println!("  index [--what auto|text|embed] [--wait]");
     println!("  rules                       列分类规则");
+    println!("  gpu [--json]                显卡/后端能力诊断（写 gpu_report.log）");
+    println!("  semgraph [--nodes N] [--json]  语义星图聚类诊断（排序模式的数据自检）");
     println!("  serve [--port N]            启动局域网服务（前台运行）");
+}
+
+fn cmd_gpu(_ctx: &Ctx, args: &[String]) -> i32 {
+    let as_json = has_flag(args, "--json");
+    let report = crate::ai::gpu::probe();
+    if as_json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                println!("序列化失败：{e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+    println!("平台      {} / {}", report.platform, report.arch);
+    println!("后端      {}（状态 {}）", report.backend, report.status);
+    if report.gpu_name.is_empty() {
+        println!("显卡      未检测到");
+    } else {
+        println!(
+            "显卡      {}（{}，{} MiB / 空闲 {} MiB，Tier {}）",
+            report.gpu_name, report.vendor, report.vram_mb, report.vram_free_mb, report.tier
+        );
+    }
+    match (&report.cuda_version, &report.cuda_hint) {
+        (Some(v), _) => println!("CUDA      {v}"),
+        (None, Some(hint)) => println!("CUDA      未安装（建议 {hint}）"),
+        (None, None) => println!("CUDA      未安装（本版无需）"),
+    }
+    // REQ-102：ONNX Runtime 是可选的跨模态扩展。没装是常态，装了就顺带把
+    // 该按什么顺序挑 ExecutionProvider 打出来，免得用户以为装了却没生效。
+    if report.ort_present {
+        println!("ONNX EP   {}", report.ort_providers.join(" → "));
+    }
+    println!("驱动      {}", report.driver_version.as_deref().unwrap_or("未知"));
+    println!();
+    println!("结论      {}", report.reason);
+    if !report.devices.is_empty() {
+        println!();
+        println!("设备：");
+        for d in &report.devices {
+            println!(
+                "  [{}] {} · {} · {} MiB{} · Tier {}",
+                d.backend,
+                d.name,
+                d.vendor,
+                d.total_mb,
+                if d.integrated { " · 核显" } else { "" },
+                d.tier
+            );
+        }
+    }
+    if !report.backends.is_empty() {
+        println!();
+        println!("已编入的后端：");
+        for b in &report.backends {
+            println!(
+                "  {:<10} 设备 {}  {} ",
+                b.name,
+                b.device_count,
+                if b.accelerator { "加速器" } else { "纯 CPU" }
+            );
+        }
+    }
+    if !report.notes.is_empty() {
+        println!();
+        println!("提示：");
+        for n in &report.notes {
+            println!("  - {n}");
+        }
+    }
+    0
 }
 
 fn cmd_scan(ctx: &Ctx, args: &[String]) -> i32 {
@@ -458,21 +597,40 @@ fn cmd_stats(ctx: &Ctx) -> i32 {
 
 fn cmd_index(ctx: &Ctx, args: &[String]) -> i32 {
     let what = parse_flag(args, "--what").unwrap_or_else(|| "auto".into());
-    let Some(emb) = crate::ai::build_embedder_with_index(&ctx.cfg.model, &ctx.cfg.index, ctx.cfg.index.batch_size).ok() else {
-        println!("错误：模型未加载");
+    let Some(emb) = ctx.text_embedder() else {
+        println!("错误：模型未加载（检查 data/config.json 的 model.embed_model）");
         return 1;
     };
+    // 建索引前把真实后端与设备打出来：用户最常问的就是「GPU 到底有没有在被用」。
+    // 必须显式 flush：stdout 接管道时是块缓冲，进程被 Ctrl-C / timeout 掐掉
+    // 时缓冲区整段丢失，用户看到的现象就是「什么都没打印就退出了」。
+    let info = emb.info();
+    println!(
+        "模型：{} · {} 维 · {} · {} · 模态 {}",
+        info.model, info.dim, info.backend, info.device,
+        if info.modalities.is_empty() { "text".to_string() } else { info.modalities.join("/") }
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     let idx = crate::index::Indexer::new(
         ctx.db.clone(),
         ctx.vectors.clone(),
         ctx.media.clone(),
         ctx.clip.clone(),
         ctx.audio.clone(),
-        Arc::from(emb),
+        emb,
         Arc::new(crate::ai::hash::HashEmbedder::new()),
         ctx.cfg.index.clone(),
         ctx.data_dir.join("thumbs"),
     );
+    // CLI 也必须走 GUI 那套批尺寸推导，否则永远用配置文件里的 8。
+    //
+    // 实测：GUI 在 7 GiB 空闲显存上会调到 32，而 CLI 一直是 8 ——
+    // 同一台机器、同一份数据，命令行索引的吞吐只有界面的三分之一。
+    idx.set_batch_size(crate::ai::effective_batch_size(
+        &ctx.cfg.model,
+        ctx.cfg.index.batch_size,
+    ));
+    idx.set_worker_threads(crate::ai::effective_parallel_threads(&ctx.cfg.model));
     idx.set_cross_modal(ctx.clip_model.clone(), ctx.clap_model.clone());
     let idx = Arc::new(idx);
     let mut queued = idx.enqueue_all_pending(&what);
@@ -493,27 +651,86 @@ fn cmd_index(ctx: &Ctx, args: &[String]) -> i32 {
     if queued == 0 {
         return 0;
     }
-    idx.start();
-    if has_flag(args, "--wait") {
-        print!("索引中 …");
-        let ok = idx.wait_idle(1800);
-        let s = idx.snapshot();
-        println!();
-        println!(
-            "{}：正文 {}（失败 {}），向量 {}（失败 {}），缩略图 {}",
-            if ok { "完成" } else { "超时" },
-            s.text_done,
-            s.text_fail,
-            s.emb_done,
-            s.emb_fail,
-            s.thumb_done
-        );
-        idx.stop();
-        if !ok {
-            return 1;
-        }
+    // 之前只有带 --wait 才等，默认路径在 start() 之后立刻 return，
+    // 进程退出把 worker 线程一起杀掉 —— 用户看到的现象就是「索引跑了
+    // 一下就没动静、GPU 占用几乎为零」。所以默认改成等索引跑完并打
+    // 进度；只想排队不等的话显式加 --no-wait。
+    if has_flag(args, "--no-wait") {
+        idx.start();
+        println!("已在后台启动；加 --wait 或去掉 --no-wait 可等待完成。");
+        return 0;
     }
-    0
+    idx.start();
+    // 0 表示不限时：1 TB 级别的库本来就要跑很久，硬性超时只会把
+    // 一次本来能完成的索引切成半截。需要上限时用 --timeout <秒>。
+    let timeout_secs = parse_flag(args, "--timeout")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let ok = wait_with_progress(&idx, timeout_secs);
+    let s = idx.snapshot();
+    println!();
+    println!(
+        "{}：正文 {}（失败 {}），向量 {}（失败 {}），跨模态 {}（失败 {}），缩略图 {}，用时 {}s",
+        if ok { "完成" } else { "超时" },
+        s.text_done,
+        s.text_fail,
+        s.emb_done,
+        s.emb_fail,
+        s.cross_done,
+        s.cross_fail,
+        s.thumb_done,
+        s.elapsed_seconds
+    );
+    if let Some(error) = s.last_error.as_deref() {
+        println!("最后一条错误：{error}");
+    }
+    idx.stop();
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// 等索引跑完并每秒刷新一行进度。timeout_secs 为 0 表示不限时。
+fn wait_with_progress(idx: &crate::index::Indexer, timeout_secs: u64) -> bool {
+    let started = std::time::Instant::now();
+    let deadline = if timeout_secs == 0 {
+        None
+    } else {
+        Some(started + std::time::Duration::from_secs(timeout_secs))
+    };
+    let mut last_report = started;
+    loop {
+        let snapshot = idx.snapshot();
+        if snapshot.queued == 0 && !snapshot.running {
+            // 与 wait_idle 同样的宽限：队列刚空时 worker 可能还没置 busy。
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let settled = idx.snapshot();
+            if settled.queued == 0 && !settled.running {
+                return true;
+            }
+        }
+        if last_report.elapsed() >= std::time::Duration::from_secs(1) {
+            last_report = std::time::Instant::now();
+            // 先清行再打印，避免上一次更长的行留下尾巴。
+            print!(
+                "\r  索引中 · 剩余 {:<7} · 正文 {:<7} · 向量 {:<7} · 失败 {:<5} · 用时 {}s\x1b[K",
+                snapshot.queued,
+                snapshot.text_done,
+                snapshot.emb_done,
+                snapshot.emb_fail,
+                snapshot.elapsed_seconds
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
 }
 
 fn cmd_rules(ctx: &Ctx) -> i32 {
@@ -569,4 +786,244 @@ fn cmd_serve(ctx: &Ctx, args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// `semgraph`：把语义星图的构建过程跑一遍并打印统计。
+///
+/// 为什么要有这个子命令：语义星图的结果是"一团点"，在 GUI 里只能靠肉眼
+/// 判断"看起来像不像一坨"。这里直接把可量化的指标打出来 ——
+/// 簇数、每簇大小、连通分量数、孤立点数、平均度数 ——
+/// 一坨和好布局的区别在这些数字上是可判定的：
+/// 好布局连通分量 = 1、孤立点 = 0、每簇规模分布均匀。
+fn cmd_semgraph(ctx: &Ctx, args: &[String]) -> i32 {
+    let mut max_nodes = 260usize;
+    let mut as_json = false;
+    let mut threshold = 0.55f64;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--nodes" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
+                    max_nodes = v;
+                }
+                i += 2;
+            }
+            "--threshold" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<f64>().ok()) {
+                    threshold = v;
+                }
+                i += 2;
+            }
+            "--json" => {
+                as_json = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    // CLI 里没有 AppState（那需要完整的 Tauri 上下文），但语义星图真正需要的
+    // 只有"向量库 + 数据库"两样，Ctx 正好都有 —— 所以直接复用同一套算法。
+
+    // 与 star_semantic 一致：按每个向量空间各自取样。
+    // （只看 files.embed_state 会拿到一堆"状态为 ok 但向量在别的空间"的记录。）
+    let spaces_src: Vec<(&str, &Arc<VectorStore>)> = vec![
+        ("text", &ctx.vectors),
+        ("media", &ctx.media),
+        ("clip", &ctx.clip),
+        ("audio", &ctx.audio),
+    ];
+    let spaces_src: Vec<(&str, &Arc<VectorStore>)> = spaces_src.into_iter().filter(|(_, s)| s.len() > 0).collect();
+    if spaces_src.is_empty() {
+        println!("四个向量空间都是空的，先建索引再试。");
+        return 1;
+    }
+    let total_len: usize = spaces_src.iter().map(|(_, s)| s.len()).sum();
+    let mut picked: Vec<(i64, &str)> = Vec::new();
+    let mut got: Vec<(i64, Vec<f32>)> = Vec::new();
+    for (name, store) in &spaces_src {
+        let quota = if spaces_src.len() == 1 {
+            max_nodes
+        } else {
+            (((store.len() as f64 / total_len as f64) * max_nodes as f64).round() as usize).max(12)
+        };
+        let ids = store.all_ids();
+        let rows = ctx.db.files_by_ids(&ids);
+        let pool: Vec<(i64, String)> = rows.into_iter().map(|r| (r.id, r.dir.clone())).collect();
+        let take = if pool.len() <= quota {
+            pool.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        } else {
+            crate::star::sample_ids_for_cli(&pool, quota)
+        };
+        for id in take {
+            picked.push((id, name));
+        }
+        for (id, v) in store.get_many(&picked.iter().filter(|(_, n)| n == name).map(|(i, _)| *i).collect::<Vec<_>>()) {
+            got.push((id, v));
+        }
+    }
+    let picked_ids: Vec<i64> = picked.iter().map(|(id, _)| *id).collect();
+    let available = picked_ids.len();
+    let rows = ctx.db.files_by_ids(&picked_ids);
+    let meta: std::collections::HashMap<i64, crate::db::FileRow> =
+        rows.into_iter().map(|r| (r.id, r)).collect();
+
+    let mut vectors: Vec<Vec<f32>> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    // 维度可能不同（不同向量空间），聚类前只保留同维度的点。
+    let mut dim_count: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (_, v) in got.iter() {
+        *dim_count.entry(v.len()).or_insert(0) += 1;
+    }
+    let keep_dim = dim_count.iter().max_by_key(|(_, c)| **c).map(|(d, _)| *d).unwrap_or(0);
+    for (id, mut v) in got {
+        if !meta.contains_key(&id) || v.is_empty() {
+            continue;
+        }
+        let _ = id;
+        if v.len() != keep_dim {
+            continue;
+        }
+        crate::star::normalize_vec_cli(&mut v);
+        vectors.push(v);
+        names.push(meta.get(&id).map(|r| r.name.clone()).unwrap_or_default());
+    }
+    let n = vectors.len();
+    if n < 4 {
+        println!("可用向量只有 {n} 条，太少，聚类没有意义。");
+        return 1;
+    }
+
+    let k = ((n as f64 / 2.0).sqrt() as usize).clamp(6, 24).min(n);
+    let (assign, _centers) = crate::star::kmeans_for_cli(&vectors, k, 12);
+
+    // ---- 统计 --------------------------------------------------------
+    let mut cluster_size: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for &c in assign.iter() {
+        *cluster_size.entry(c).or_insert(0) += 1;
+    }
+    let mut sizes: Vec<usize> = cluster_size.values().copied().collect();
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    let non_empty = sizes.len();
+
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut Vec<usize>, x: usize) -> usize {
+        let mut r = x;
+        while p[r] != r {
+            r = p[r];
+        }
+        let mut c = x;
+        while p[c] != r {
+            let nxt = p[c];
+            p[c] = r;
+            c = nxt;
+        }
+        r
+    }
+    fn union(p: &mut Vec<usize>, a: usize, b: usize) {
+        let ra = find(p, a);
+        let rb = find(p, b);
+        if ra != rb {
+            p[ra] = rb;
+        }
+    }
+
+    let mut deg = vec![0usize; n];
+    let mut edges = 0usize;
+    let mut by_cluster: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (i, &c) in assign.iter().enumerate() {
+        by_cluster.entry(c).or_default().push(i);
+    }
+    for i in 0..n {
+        let ci = assign[i];
+        let mut cand: Vec<(usize, f32)> = by_cluster[&ci]
+            .iter()
+            .filter(|&&j| j != i)
+            .map(|&j| (j, crate::star::cosine_cli(&vectors[i], &vectors[j])))
+            .collect();
+        cand.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let k1 = (by_cluster[&ci].len() / 8).clamp(2, 6);
+        for (j, sim) in cand.into_iter().take(k1) {
+            if j <= i || sim < (threshold * 0.75) as f32 {
+                continue;
+            }
+            union(&mut parent, i, j);
+            deg[i] += 1;
+            deg[j] += 1;
+            edges += 1;
+        }
+    }
+    let mut bridged = 0usize;
+    for i in 0..n {
+        if deg[i] > 0 {
+            continue;
+        }
+        bridged += 1;
+        let mut best: Vec<(usize, f32)> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| (j, crate::star::cosine_cli(&vectors[i], &vectors[j])))
+            .collect();
+        best.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (j, _) in best.into_iter().take(2) {
+            union(&mut parent, i, j);
+            deg[i] += 1;
+            deg[j] += 1;
+            edges += 1;
+        }
+    }
+    // 与 build_semantic 一致：按真实连通分量收口（簇内也可能分裂）。
+    {
+        let mut roots: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        for i in 0..n {
+            let r = find(&mut parent, i);
+            roots.entry(r).or_default().push(i);
+        }
+        if roots.len() > 1 {
+            let mut reps: Vec<usize> = roots.values().map(|m| m[0]).collect();
+            reps.sort_unstable();
+            for w in reps.windows(2) {
+                union(&mut parent, w[0], w[1]);
+                deg[w[0]] += 1;
+                deg[w[1]] += 1;
+                edges += 1;
+            }
+        }
+    }
+    let mut comps: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        comps.insert(r);
+    }
+    let isolated = deg.iter().filter(|&&d| d == 0).count();
+    let avg_deg = deg.iter().sum::<usize>() as f64 / n as f64;
+
+    if as_json {
+        println!(
+            "{{\"available\":{},\"sampled\":{},\"clusters\":{},\"edges\":{},\"components\":{},\"isolated\":{},\"bridged\":{},\"avgDegree\":{:.2},\"sizes\":{:?}}}",
+            available, n, non_empty, edges, comps.len(), isolated, bridged, avg_deg, sizes
+        );
+        return 0;
+    }
+
+    println!("语义星图诊断");
+    println!("  可用向量     {}", available);
+    println!("  本次取样     {}", n);
+    println!("  簇数         {}（目标 {}）", non_empty, k);
+    println!("  边数         {}", edges);
+    println!("  连通分量     {}  <- 必须为 1，否则图上会有漂在角落的孤岛", comps.len());
+    println!("  孤立点       {}（已桥接 {}）", isolated, bridged);
+    println!("  平均度数     {:.2}", avg_deg);
+    println!("  簇规模       {:?}", &sizes[..sizes.len().min(12)]);
+    println!();
+    println!("  各簇代表（前 5 个）：");
+    let mut shown = 0;
+    for (ci, idxs) in by_cluster.iter() {
+        if shown >= 5 {
+            break;
+        }
+        shown += 1;
+        let sample: Vec<&str> = idxs.iter().take(3).map(|&i| names[i].as_str()).collect();
+        println!("    簇 {}（{} 个）  {}", ci, idxs.len(), sample.join(" · "));
+    }
+    0
 }

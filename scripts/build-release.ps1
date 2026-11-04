@@ -5,8 +5,10 @@ $ProgressPreference = "SilentlyContinue"
 # CUDA is only a build-time switch for Candle kernels; the app picks the GPU at run time.
 $repo = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "activate-local.ps1")
-if (-not $env:DEEPAISEE_VULKAN) { $env:DEEPAISEE_VULKAN = "0" }
-if (-not $env:DEEPAISEE_VULKAN) { $env:DEEPAISEE_VULKAN = "0" }
+# Vulkan 由 build.rs 自动探测：不在这里给 DEEPAISEE_VULKAN 设默认值。
+# 早期版本在这写了一行 "= 0"，结果把自动探测永远关掉，装好的 MSYS2 Vulkan SDK
+# 白放着不用，GPU 推理只能退回 CPU。需要强制关闭时由用户显式设置
+# DEEPAISEE_VULKAN=0 即可（activate-local.ps1 与 build.rs 都尊重这个值）。
 
 function Find-CudaRoot {
   $candidates = @()
@@ -55,10 +57,6 @@ function Stage-CudaRuntime([string]$cudaRoot) {
 function Assert-ReleasePrerequisites {
   $required = @(
     "tools\bin\ffmpeg.exe",
-    "libstdc++-6.dll",
-    "libgcc_s_seh-1.dll",
-    "libwinpthread-1.dll",
-    "WebView2Loader.dll",
     "src-tauri\nsis\installer.nsi",
     "src-tauri\nsis\installer-hooks.nsh",
     "scripts\install-onnxruntime.ps1",
@@ -70,7 +68,7 @@ function Assert-ReleasePrerequisites {
   }
   if ($missing.Count -gt 0) {
     $list = ($missing -join ([Environment]::NewLine + "  "))
-    throw ("Missing installer resources:" + [Environment]::NewLine + "  " + $list + [Environment]::NewLine + "Stage the required native runtime DLLs next to the repo root.")
+    throw ("Missing installer resources:" + [Environment]::NewLine + "  " + $list + [Environment]::NewLine + "Restore the missing installer resources before packaging.")
   }
   foreach ($pattern in @("models\clip\*", "models\clap\*")) {
     $hits = Get-ChildItem -Path (Join-Path $repo $pattern) -File -ErrorAction SilentlyContinue
@@ -91,8 +89,24 @@ function Resolve-TargetRoot {
   return (Join-Path $repo "src-tauri\target")
 }
 
+# esbuild 会往 %TEMP% 写临时文件再把它删掉。本机的用户 Temp 目录
+# （C:\Users\alin\AppData\Local\Temp）上这个删除会被拒，vite 的
+# esbuild-transpile 随即报 "remove ...: Access is denied"，整个
+# `npm run tauri:release` 在 beforeBuildCommand 阶段就挂掉，以前只能在外层
+# 手动覆写 TEMP 才跑得动。这里把临时目录钉在仓库内的 .tmpbuild，
+# 让 VSCode 终端里直接敲 `npm run tauri:release` 就能出包。
+# 注意必须放在仓库内：放到构建盘的 D:\DeepDark_Oracle-build\tmp 实测仍然被拒。
+function Set-BuildTemp {
+  $tempRoot = Join-Path $repo ".tmpbuild"
+  New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+  $env:TEMP = $tempRoot
+  $env:TMP = $tempRoot
+  Write-Host "Temp dir     : $tempRoot"
+}
+
 Push-Location $repo
 try {
+  Set-BuildTemp
   & (Join-Path $PSScriptRoot "patch-llama-embeddinggemma2.ps1")
   Assert-ReleasePrerequisites
   $runtimeDir = Join-Path $repo ".tools\cuda-runtime"

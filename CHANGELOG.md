@@ -5,560 +5,305 @@
 
 ---
 
-## v0.22 — 2026-10-27
 
-**项目更名 DeepDark_Oracle + 右上角「索引目录结构」树状图面板**
+## v0.27 — 2026-11-03
 
-### 一、项目更名
+**七项需求收尾：2D 蓝图、1TB 卡顿、星星点不开、盘符恒星、GPU 空转**
 
-- 全局把 `deepaisee` 改成 `DeepDark_Oracle`：Tauri 的 `productName` / `identifier`（`com.deepdarkoracle.desktop`）/ 窗口标题、Cargo 包名与 `[lib] name`（`deepdark_oracle_lib`，`main.rs` 的 `deepdark_oracle_lib::run()` 同步）、`package.json` 的 `name`、启动器 `DeepDark_Oracle 启动器.cmd`、`launcher.ps1` 横幅、NSIS 安装目录与开始菜单目录、日志与错误文件名、CMake 工程名与 CMake 缓存目录（`.deepdark-oracle-cmake`）。
-- **刻意保留**：`src/theme.ts` 的 `localStorage` 键 `deepaisee.lang` / `deepaisee.theme`（改了会丢用户已保存的语言与主题偏好）；`CHANGELOG.md` 里的历史条目、`HANDOFF-2026-10-27.md` 等历史文档保持原文。
+本版处理用户提出的 7 项改造。需求原文见 `docs/aegis/work/2026-11-02-StarAndBlueprint/TaskIntent.md`，蓝图规格见 `清晰平面与蓝图风格需求明细表.xlsx`（单表 15 条）。
 
-### 二、右上角「索引目录结构」树状图面板
+### 一、2D 星图改成清晰平面蓝图风格（需求①）
 
-顶栏原本只显示「143,522 个文件 · 54.5 GB」的统计按钮，现在点开就是一棵可展开的索引目录树。
+按需求表「去光、加框、换底、变直」的口诀重做：
 
-- **三段式面板**：顶部栏（标题 + 刷新 + 在资源管理器中打开 + 极小搜索框）/ 主体树区 / 底部统计栏（「当前目录包含 12 个子文件夹，340 个文件 · 22.7 GB」）。宽 400px、从按钮下方垂直弹出、最大高度 80vh。
-- **只读索引库，不重新扫描**：打开面板不触发任何磁盘遍历，全部数据来自 SQLite。
-- **按层懒加载**：每展开一层才查一次该层，已加载的层级缓存在前端，收起面板不销毁，再打开直接复用。
-- **搜索**：面板内搜索框按目录名匹配，命中项高亮（`#E6F7FF` 背景 + 加粗），点结果自动逐级展开祖先目录并滚动定位。
-- **右键菜单**：打开文件位置 / 复制完整路径 / 复制文件名 / 加入工作区。
-- **视觉规范**：白底 `#FFFFFF`、主文字 `#333333`、次要 `#999999`、边框 `#CCCCCC`、选中 `#F5F5F5`、行高 28px、16px 单色线性图标、按后缀分类型图标、文件行右侧小圆点表示索引状态（绿=已索引 / 灰=未索引）、悬停 Tooltip 显示完整绝对路径；暗色主题有对应的一套变量。
-- **点击面板外部或按 Esc 收起**。
-
-### 三、后端新增命令
-
-- `tree_browse(path?, file_limit?)`：不传 `path` 返回索引根层（每个已添加的盘符/根目录），传了返回该层的直属子目录 + 直属文件（按修改时间倒序，默认最多 200 条，超出用「另有 N 个文件未显示」提示）。
-- `tree_search(query, limit?)`：按目录名模糊匹配，按递归文件数倒序返回。
-- `workspace_add(dir)`：把目录加进「工作区实时检索」，供右键菜单调用。
-- `db.rs` 新增 `dir_rollup_under(prefix)` 与 `dir_file_stats(dir)`：用 `dir >= lo AND dir < hi` 的字符串区间做前缀裁剪，**14 万文件的库上全量聚合约 140ms，带前缀裁剪只要 40~50ms**，且展开越深越快。区间查询单独 OR 了 `dir = 该目录` 的等值条件——只写区间会漏掉「目录自己的直属文件」（`D:\wx` 在字节序上排在 `D:\wx\` 之前）。
-
-### 四、顺手修掉的既有问题
-
-- `src/views/TreeView.vue` 用了 `t()` 却没 import i18n；且模板里 `v-for="(t, i) in trail"` 会把 i18n 的 `t` 遮蔽成 TreeNode，切到树状图页会直接崩。已改为 `(crumb, i)` 并补上 import。
-- `i18n.ts` 里「清空」「打开失败：」两处词条重复，esbuild 构建报 Duplicate key，已合并。
-- `src-tauri/src/bin/` 下的 5 个开发探针与 `src-tauri/examples/` 完全重复，会被 tauri-bundler 当成 external binary 打进安装包；已移出到仓库根的备份目录，只保留 `examples/`。
-
-### 五、本轮编译 / 打包踩到并修掉的问题
-
-- **`windres` 打不开含中文路径的 `.ico`**：Windows GNU 工具链下 `tauri-build` 生成的 `resource.rc` 里写的是绝对路径，项目放在 `D:\软件\DeepDark_Oracle` 时 `windres` 报 `can't open icon file ...: Invalid argument`，构建直接 panic。`build.rs` 新增 `ascii_window_icon()`：图标绝对路径含非 ASCII 字符时先复制到 `OUT_DIR`（纯 ASCII）再交给 `tauri-build`；ASCII 路径下行为不变，MSVC 构建也不受影响。
-- **新版 llama.cpp 的 encoder 断言会让长文本嵌入直接 abort**：`GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens")`。原来 shim 把 `n_batch`/`n_ubatch` 写死 512，索引到长文档时 token 数超过 512 就被**直接 abort（不是返回错误码）**，表现为「窗口突然消失、没有任何日志」。现在 `n_batch`/`n_ubatch` 跟随上下文长度，并在 `ds_llama_embed` 里按 `n_batch` 截断 token，超长文本不会再打崩进程。
-- **构建环境要求（记录备查）**：本机无 MSVC，改用 `x86_64-pc-windows-gnu` + MSYS2 UCRT64（`D:\dsh-tools\msys64`）。GNU 工具链不认中文路径，`CARGO_HOME` / `RUSTUP_HOME` / `CARGO_TARGET_DIR` / `TMP` 必须全在纯 ASCII 目录，项目本身通过 `subst X:` 映射后构建。
-
----
-
-## v0.21 — 2026-10-26
-
-**工作区检索 + 视频智能抽帧 / 音轨识别 + 通用配置页 + 界面动效 + 启动自动扫描 + NSIS 安装包**
-
-### 一、工作区目录（不用建索引也能搜正文）
-
-- 设置页新增「通用配置 → 工作区」：可添加**多个**目录，配置上限体积与遍历深度。
-- 搜索时工具栏多了「工作区」开关（默认按配置启用）。开启后，除索引库结果外还会遍历工作区目录里**尚未入库**的文件，现场抽取正文参与匹配，两类结果合并排序。
-- 实现：新增 `src-tauri/src/workspace.rs`（`WorkspaceSearch`），持有目录列表缓存（4 秒）与正文缓存（按 mtime+size 校验）、已索引路径集合缓存（10 秒），单次搜索最多现场抽取 **160 个文件 / 8M 字符**，仅在 `offset == 0` 时工作，避免翻页时重复抽全文。
-- 工作区命中用**负数 id**（-1 递减）区分「不在索引库里」，`tags` 带「工作区」、`reason` 为「工作区正文匹配」，缩略图字段为 false，前端不会去请求不存在的缩略图。
-- 新增 `db.rs::paths_under(root)` 用索引库前缀查询排除已入库文件，避免同一文件被算两次。
-
-### 二、视频抽帧：从「固定 4 帧」改成「智能采样」
-
-- 新增 4 个索引参数：`video_frame_interval`（最小抽帧间隔，**下限强制 4 秒**）、`video_max_frames`（单视频帧数上限，默认 64）、`video_dedup_distance`（帧指纹去重阈值，默认 6）、`video_frames` 默认值从 4 提到 16。
-- `media.rs` 新增 `sample_video_frames_smart()`：按时长与间隔算出目标帧数 → 分时间窗 → 每窗按「**场景切换点 > I 帧 > 窗口中心**」的优先级挑一帧 → 抽帧后用 **64 位 dHash**（9×8 灰度图逐点左右比较）**加上平均颜色**与上一张比对：只有结构相近（汉明距离 ≤ 阈值）且颜色也相近（RGB 差的平方和 ≤ 300，约每通道 10/255）才丢弃。只比结构的话，纯色/低对比画面（幻灯片白底、黑屏、纯色转场）指纹几乎一样，「红底切绿底」会被误判成同一帧。
-- I 帧探测：`ffmpeg -skip_frame nokey -vf select=eq(pict_type\,I),showinfo` 解析 `pts_time`，只解码关键帧，长视频也很快。
-- **Scene Change Detection**：`video_scene_change_times()` 用 `fps=2,scale=160:-2,select='gt(scene,0.4)',showinfo` 取镜头切换时间戳（降帧 + 缩图控制开销，超过 40 分钟的片子跳过该探测，改用 I 帧兜底）；场景切换点比 I 帧更贴近「内容真的变了」的位置，作为首选候选。
-- **自适应采样**：`adaptive_interval()` 按镜头切换密度调间隔 —— 几乎不换镜头（PPT / 网课 / 录屏）放稀到 1.5 倍，换镜头频繁（动作片 / 体育）加密到 0.5 倍，中间档保持配置值；任何情况下都不低于需求的 4 秒。
-- 帧数封顶：`wanted = ceil(duration / interval)` 再夹到 `[1, max_frames]`，窗口步长 = `max(duration/wanted, interval)` —— 长视频不会切出几万帧。
-- **只存特征向量与压缩缩略图**：抽出的帧只用于即时计算 CLIP / 媒体向量，算完立刻 `remove_file`，库里不留原始帧，索引体积不随时长线性膨胀。
-- `ai/hash.rs::video_vec` 也切到智能抽帧（间隔 4 秒、最多 6 帧、最大边 128），兜底向量同样受益；`ai/candle_backend.rs::embed_video`（candle 多模态视频塔）同步从「均匀切 32 帧」改成智能抽帧（间隔 4 秒、最多 32 帧、最大边 1024），三条编码路径策略一致。
-
-### 三、视频音轨语义识别（CLAP）
-
-- 新增 `index.video_index_audio`（默认开）+ 设置页「索引视频音轨（说话声/环境声）」开关。
-- `index.rs::embed_cross_modal` 的 `"video"` 分支重写：CLIP 部分逐帧编码后**求和再平均 + L2 归一化**（原来只取中间一帧）；音轨部分在开关打开且 CLAP 已装载时调 `clap.audio_vec(path)` 产出音频向量。
-- 失败静默：无声视频、解不出音轨都属正常，不写入错误计数、不刷日志。
-
-### 四、通用配置页（设置页左栏第一项）
-
-- 新增 `src/components/SettingsGeneralTab.vue`，设置页左栏从 5 项变 6 项，第一项为**通用配置**。
-- **语言**：中文 / English，**真正的前端 i18n**。新增 `src/i18n.ts`：以「中文原文」为词条 key，英文查表替换，未收录的文案自然回落中文（不会出现 `settings.general.title` 这类占位符）。词表约 400 条，覆盖顶栏、搜索页（含打字机标题、类型/排序、工具栏、结果计数、导出/重命名等提示）、六个设置标签全部静态文案与报错前缀、树状图、模型页、扩展页。语言状态是 `reactive` 的，保存后 `applyLanguage()` 立刻切全站文案，重启沿用；`applyAppearance(ui)` 会按新配置重新应用，避免保存后被默认值覆盖。
-- **主题**：明亮 / 暗色 / **跟随系统**（默认 system）。新增 `src/theme.ts` + `styles.css` 的一整段 `html[data-theme="dark"]` 变量覆盖；`system` 用 `matchMedia("(prefers-color-scheme: dark)")` 实时跟随；启动前先读 localStorage 预应用，避免首帧闪白。
-- **启动行为**：开机自启、启动时自动扫描、文件变化提示三个开关。
-- **默认搜索模式**：全文 / 语义 / 综合（影响搜索页初始开关状态）。
-- **工作区**：目录列表 + 上限体积 + 遍历深度 + 启用/实时抽取开关。
-- 配置层：`UiConfig` 新增 `language` / `autostart` / `auto_scan_on_start` / `notify_file_changes` / `default_search_mode`，默认 `theme` 从 "dark" 改为 **"system"**；`AppConfig` 新增 `workspace` 段（全部 `#[serde(default)]`，旧配置可直接加载）。
-
-### 五、界面动效
-
-- 页面切换用 `<Transition name="page" mode="out-in">`（透明度 + 6px 上移，0.18s）；toast 改 `<TransitionGroup>`，自带进出与位置移动过渡。
-- 按钮加 `:active` 缩放反馈；搜索框原有高度/圆角过渡保留。
-- 尊重系统设置：`@media (prefers-reduced-motion: reduce)` 下关闭所有过渡。
-
-### 六、启动自动扫描与文件变化提醒
-
-- `lib.rs` 新增 `schedule_startup_scan()`：启动 2.5 秒后（`ui.auto_scan_on_start` 且已配置扫描根时）在后台线程跑一次增量扫描，只对比修改时间同步新增/修改/删除，不重算已有向量；「已在进行中」不当作错误。
-- `App.vue` 每 3 秒轮询扫描进度，一次扫描结束时统计 `新增/更新/移除`，有变化且 `notify_file_changes` 打开时在右下角弹一条轻量提示（6 秒），并刷新顶部统计。
-
-### 七、NSIS 安装包
-
-- `bundle.targets` 改为 `["nsis"]`，并提供**自定义模板** `src-tauri/nsis/installer.nsi`（基于 tauri-cli v2.12.3 官方模板）与 `installer-hooks.nsh`。
-- **安装路径可选、默认不落 C 盘**：`installMode = currentUser`（不需要管理员），默认目录顺序为「上次安装位置 → `D:\Apps\deepaisee` → `E:\Apps\deepaisee` → `%LOCALAPPDATA%\deepaisee`」，用户仍可在目录页自选。
-- **DLL 依赖**：`bundle.resources` 改成 map 形式，把 `onnxruntime.dll` / `WebView2Loader.dll` / `libstdc++-6.dll` / `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` / `models\` / `tools\bin\ffmpeg.exe` 直接平铺进安装目录；CUDA 运行时 DLL 若存在，由 `NSIS_HOOK_POSTINSTALL` 拷到根目录。
-- **快捷方式与卸载**：开始菜单 + 桌面快捷方式（官方模板自带），注册表写入 `DisplayName/DisplayVersion/InstallLocation/UninstallString`，卸载时清理运行时 DLL、保留用户数据（除非勾选删除）。
-- **插件扩展预留**：安装时创建 `$INSTDIR\plugins` 并写说明文件，注册表记 `InstallDir` / `PluginsDir` / `Layout=nsis`；卸载时只在目录为空时移除 `plugins`。
-- `config.rs::data_dir` 改造：exe 同级 `data\` 不可写时自动回退 `%LOCALAPPDATA%\deepaisee\data` → `%APPDATA%\deepaisee\data` → `%TEMP%\deepaisee\data`，并用 `.write-probe` 探针验证可写（结果缓存在 `OnceLock`）。**这是装到受保护目录后仍能建索引的前提。**
-- 新增 `config.rs::plugins_dir()`，为后续插件加载留出入口。
-- `cmd.rs::extension_status_for` 改为双布局探测：优先 `.tools\onnxruntime\onnxruntime.dll`，找不到再看安装根目录。
-- **WebView2 用户数据目录可写性**：`tauri.conf.json` 的窗口改为 `create: false`，由 `lib.rs::create_main_window()` 手动 `WebviewWindowBuilder` 建窗并指定 `data_directory`（`webview_data_dir()` 依次尝试 exe 同级 `webview-data\` → `<数据目录>\webview\` → `%LOCALAPPDATA%\deepaisee\webview`，优先非 C 盘可写目录，可用 `WEBVIEW2_USER_DATA_FOLDER` 覆盖）。这样安装到 `D:\Apps` 或 `Program Files` 后不会因为默认的 `%LOCALAPPDATA%\<bundle-id>\EBWebView` 被占用/拒绝而启动失败（本机曾复现 `HRESULT(0x800700AA) 请求的资源在使用中`）。
-- **首次运行自动探测模型（自检不再误报哈希基线）**：新增 `models.rs::autodetect_embed_model()`，主程序后台线程、`--selftest`、`--cli` 三条入口共用同一套规则（优先多模态 safetensors，其次可直接加载的嵌入 GGUF，依次看 exe 同级 `models\` 与数据目录 `models\`）。此前自动探测只写在 `lib.rs` 的 GUI 后台线程里，`--selftest` / `--cli` 拿到的是空 `embed_model`，会报「未配置模型，改用哈希基线」——安装包验证时正是因此误判。
-- **CPU 推理回退（语义检索不再整体降级）**：本机没有 CUDA toolkit，发布构建的 llama.cpp 只带 CPU 后端，而旧代码在 `gpu_devices()` 为空时直接返回错误（`当前 llama.cpp 构建或驱动没有可用 GPU`），上层只能退回 256/512 维哈希基线 —— 装好的程序看起来「能跑」，实际语义检索失效。`ai/llama.rs::LlamaEmbedder::load` 改为：显式选 `cpu` 或枚举不到加速设备时 `selected = None`，`create_handle` 传空 `device_name` 走 llama.cpp 的 CPU 默认路径；错误 target 与 `Embedder::info()` 的 detail 同步显示「CPU 推理（没有可用加速后端）」。模型设置页的 GPU 下拉新增「CPU（无可用加速设备时）」选项，空态文案改为「未检测到可用加速设备，将使用 CPU 推理」。
-- **发布包不再夹带开发探针**：`claptest` / `crossprobe` / `melprobe` / `smoke` / `visdemo` 五个源码从 `src-tauri/src/bin/` 移到 `src-tauri/examples/`。tauri-bundler 会把 `src/bin/` 下每个 bin 都当外部二进制塞进安装包（上一版安装目录里多出 5 个探针 exe，约 13 MB），移到 `examples/` 后由 `cargo run --example <名字>` 运行，不会进分发包。
-
-### 八、清理与文档
-
-- 根目录的 `启动 deepaisee.bat`（与启动器功能重复）删除；`launcher.ps1` 保留并修正：
-  - 数据目录改为按「exe 同级 → LOCALAPPDATA → APPDATA」探测，兼容安装版；
-  - 版本兜底文案更新到 0.21，标题栏版本号按宽度自适应。
-- 删除本次改造留下的一次性脚本与临时文件（`_do_backup.ps1`、`_do_replace.ps1`、`_tmp_*`），README 全面更新：安装包用法、默认安装路径、六个设置标签、工作区开关、视频抽帧参数、音轨识别、数据目录回退规则。
-- **交付产物归档 + 大目录清理**：最终安装包与便携版 exe 复制到根目录 `release\`（`deepaisee_0.0.21_x64-setup.exe` 650.85 MiB + `deepaisee.exe`），方便直接取用；随后把 `build-target\`（13 GB 构建缓存）、`_backup_old_20261026\`（1.7 GB）、`dist-app\`（998 MB 旧便携包）、`AI--deepaisee-main\`（32 MB 旧源码副本）四个目录整体移入回收站（不是永久删除，可从回收站还原），项目体积 **约 20.7 GB → 4.7 GB**。`.gitignore` 补 `release/`、`dist-app/`、`AI--deepaisee-main/`；README 的安装包路径同步改为 `release\`。重新构建时 `cargo` 会重新生成目标目录（首次编译约 3 分钟）。
-- `scripts/build-release.ps1` 增加发布前置检查：`src-tauri\src\bin` 下若还有 `*.rs` 就中止构建，避免 tauri-bundler 把开发探针当外部二进制打进安装包（本次曾多出 `claptest/crossprobe/melprobe/smoke/visdemo` 五个 exe，约 13 MB）。
-- 界面文案国际化（见第四节「语言」）：新增 `src/i18n.ts`（约 380 条词条），顶栏、搜索页、六个设置标签、树状图、模型页、扩展页与各类提示/报错前缀全部走 `t()`；`main.ts` 启动前调 `primeAppearance()` 预应用主题与语言，避免首帧闪烁。
-
-### 九、构建与版本
-
-- 版本号同步到 **0.0.21 / 显示 0.21**（`Cargo.toml`、`tauri.conf.json`、`package.json`、`lib.rs`）。
-- `Cargo.toml` 的默认 feature 从 `["llama", "candle-cuda"]` 改为 `["llama"]`：本机没有 CUDA toolkit 时 `cudarc` 的 build script 会因 `nvcc` 缺失直接失败，发布构建改用 `--features llama,candle,custom-protocol` 显式指定。
-- `scripts/activate-local.ps1` 兼容两套工具链布局（`.tools` 与 `tools`）并补上 `msys64\ucrt64\bin`；`CARGO_TARGET_DIR` 不再硬编码，外部指定优先。
-
----
-
-## v0.20 — 2026-10-24
-
-**跨模态检索：用一句话找图片 / 音频 / 视频 + 同模态找相似**
-
-### 一、为什么单独接两个 ONNX 模型
-
-v0.17 试过用 EmbeddingGemma 2 的视觉塔：mtmd 能导出、能编码、向量也是 512 维，但视觉塔与文本塔**不在同一语义空间**（实测图文余弦 0.03~0.09），真正做对齐的 `embed_vision.embedding_projection` 层没被 `convert_hf_to_gguf.py` 导出。所以「文字找图」在 GGUF 路线上走不通。
-
-本版改为：**ONNX Runtime + 两个专门做跨模态对齐的量化模型**，与主嵌入模型完全解耦。
-
-| 模型 | 文件 | 体积 | 输入 | 输出 |
-| --- | --- | --- | --- | --- |
-| Chinese-CLIP ViT-B/16（Xenova，U8 量化） | `models\clip\model.onnx` + `vocab.txt` | 182MB | 图片 `1×3×224×224` / BERT 文本 `1×64` | 512 维 |
-| CLAP HTSAT（Xenova，U8 量化） | `models\clap\audio_model.onnx` + `text_model.onnx` + `vocab.json` + `merges.txt` | 154MB | 音频 `1×1×1001×64` log-mel / RoBERTa BPE 文本 | 512 维 |
-
-### 二、自写 ONNX Runtime 绑定（`src-tauri/src/ai/ort.rs`，约 380 行）
-
-不引 `ort` crate（rsproxy 上没有），直接 `LoadLibraryW("onnxruntime.dll")` + `OrtGetApiBase()->GetApi(20)` 拿函数表，用 `transmute` 索引字段。踩过的坑：
-
-- `OrtApiBase.get_api` 拿到的函数指针必须先 `(*base).get_api` **解引用**再调用，否则报 `E0599: no method named get_api`；
-- 字段索引错一位就是崩溃或乱值，本版实测可用的一组：`CREATE_ENV=3` / `CREATE_SESSION=7` / `RUN=9` / `CREATE_SESSION_OPTIONS=10` / `SET_GRAPH_OPT=23` / `SET_INTRA_THREADS=24` / `CREATE_TENSOR_WITH_DATA=49` / `GET_TENSOR_DATA=51` / `CREATE_CPU_MEM=69` / `RELEASE_SESSION=95`；
-- ONNX Runtime 1.20.1 只支持到 **API v20**，传 23 直接返回空指针。
-
-实测性能：session 创建 561ms，单次前向 27~35ms（8 线程），图片与文本同价。
-
-### 三、CLIP：文字 ↔ 画面
-
-- 预处理按 CLIP 标准：短边缩到 224 → 中心裁剪 → CHW → `mean=[0.48145466,0.4578275,0.40821073]`、`std=[0.26862954,0.26130258,0.27577711]`。
-- 分词是极简 BERT WordPiece（中文按字、英文贪心最长匹配，`[CLS]`/`[SEP]` 包裹，64 token）。
-- **量化模型质量实测可用**：4 张真实照片（峡湾/黑狗/海象/狮子）对 4 句话，4×4 矩阵对角全胜，正确对 0.43~0.47、错配全 < 0.35。曾担心 U8 量化会毁掉语义（tract 跑同一模型时纯色图排序完全随机），换 ORT 后正常。
-- 视频取**首帧**进同一个 CLIP 空间。
-
-### 四、CLAP：文字 ↔ 声音
-
-这里踩了三个大坑，都是「看起来能跑、结果全是噪声」：
-
-1. **分词器完全错**：CLAP 文本塔是 RoBERTa，不是 BERT。用 BERT 词表编出来的 token 全错。补了 `src-tauri/src/ai/bpe.rs`（GPT-2 字节映射 + merges 里的 BPE merge）。修好后 Rust 编出的 token 与 Python transformers 逐 token 一致。
-2. **音频 mel 归一化错**：一开始用 HTK mel + `log10`，4 段完全不同的音频两两余弦 **0.9986~0.9996**，等于没有区分度；换成 **Slaney 刻度 + Slaney 归一化三角滤波 + `10*log10(max(1e-10,x))`**（照 transformers.js 的 `ClapFeatureExtractor` 实现）后降到 **0.23~0.66**。
-3. **中文直接喂 CLAP 不可靠**：该模型英文语料训练，纯中文 prompt 命中 13/36。加了一张 40 条的「中文音效词 → 英文提示」映射表（`clap.rs::prompt_for`）后命中 **13/15**。
-
-预处理细节（全部自己实现，无第三方音频库）：48kHz 单声道 → repeatpad 到 480000 采样 → reflect 填充 512 → Hann(1024, periodic) → `rfft` → 513 bin → 64 个 Slaney 三角滤波 → `10*log10` → `[1001, 64]`。
-
-### 五、检索与打分
-
-- `SearchQuery` 新增 `cross_modal: Option<bool>` 与 `clip_query` / `audio_query` 两个 `#[serde(skip)]` 预编码向量。
-- `AppState::search` 在 `cross_modal == Some(true)` 且查询 ≥ 2 字时，现场用 CLIP/CLAP 文本塔编出查询向量。
-- 新增 `search.rs::cross_modal_segment`：CLIP 余弦 < 0.25 丢弃、`0.25→0.55` ~ `0.45→0.90` 线性；CLAP 余弦 < 0.16 丢弃、`0.16→0.52` ~ `0.46→0.88` 线性。**只加分不降分**，不会把已经由文件名命中的结果拉低。
-- **两个空间互相串味**：只靠绝对阈值调不好 —— CLIP 对不相干描述天生给的余弦高（随便配都 0.30），CLAP 只有 0.13，两边永远此消彼长。改为按「突出版」仲裁：`peak = top1 - 中位数`，抬升不足 **0.05** 就认为这个空间对这句话无话可说，整段丢弃；再加上意图分流 —— 查询里含声音词表（`clap.rs::sound_intent`）时 CLAP 说了算、CLIP 让路，纯画面描述里 CLAP 要突出到 CLIP 的 2 倍才准插话。实测「钢琴」不再带出图片、「一只黑色的狗」不再带出音频。
-- `similar()` 升级为按源文件类型挑空间：图片/视频 → CLIP 优先，音频 → CLAP 优先，文本 → 主向量库优先，找不到再跨空间兜底。
-- 四个向量空间：`vectors\`（768 维）、`vectors_media\`（256 维兜底）、`vectors_clip\`（512）、`vectors_audio\`（512）。
-
-### 六、真机实测（本地测试目录，6 图 + 6 音频 + 2 视频）
-
-| 查询 | 结果 |
-| --- | --- |
-| 「一只黑色的狗」 | p2.jpg **0.90**（其余 0.65~0.76） |
-| 「钢琴」 | piano.wav **0.88** |
-| 「下雨的声音」 | rain.wav **0.63** |
-| 「打鼓」 | drum.wav **0.79** |
-| 「鸟叫」 | birds.wav **0.72** |
-| 「弹吉他」 | guitar.wav **0.85** |
-| 「一只黑色的狗」（含视频） | clip_dog.mp4 **0.90** |
-| 「峡湾和湖泊」 | clip_fjord.mp4 **0.87** |
-| 图片 p1 找相似 | p6.jpg 0.71、p4 0.59、p3 0.56 |
-
-加入突出度仲裁后复测（`_xtest` 库，6 图 + 6 音频 + 2 视频）：`钢琴` → piano.wav 0.88（前 6 条全是音频）、`一只黑色的狗` → p2.jpg 与 clip_dog.mp4 并列 0.90（前 6 条全是图片/视频）、`峡湾和湖泊` → p1.jpg 0.87 / clip_fjord.mp4 0.87（无音频）、`下雨的声音` → rain.wav 0.62（无图片）。`--selftest` 仍是 `[OK] 文字找图 — 「一只黑色的狗」→ p2.jpg (0.90)`、`[OK] 文字找声音 — 「钢琴」→ piano.wav (0.85)`。
-
-`--selftest` 新增两项（文字找图 / 文字找声音），全绿时 **通过 14 项，失败 0 项**。
-
-### 七、顺手修掉的三个真问题
-
-1. **`%TEMP%` 不可写导致视频抽帧全部静默失败**：`media.rs` 原来直接用 `std::env::temp_dir()`，本机在该目录下建子目录失败，视频向量 0 条、用户只看到「视频搜不到」却没有任何提示。改为依次尝试 `exe/data/tmp`、`cwd/data/tmp`、`%TEMP%/deepaisee`，并在抽帧为空时把原因写进 `last_error`（「视频 xxx: 抽帧失败（需要 ffmpeg）」）。顺带清理历史 `frames-*` 残留目录。
-2. **`selftest` 的「画面标签检索」示例标签是空串**：`tags` 里第一项可能是「图片」「视频」这类通名，被跳过之后没有兜底。改为按 `length(tags) DESC` 取标签最多的那条文件，取不到有辨识度的标签就 `[SKIP]` 而不是显示「示例「」」。
-3. **`search.rs` 被 `Set-Content -NoNewline` 压成一行**（编辑事故）：`//` 注释把后面整段代码注释掉。已手写重写回 636 行并编译通过 —— 教训是别再对含注释的源码用 `-NoNewline` 拼接。
-
-### 八、轻量化
-
-- 新增的 `bpe.rs` / `ort.rs` / `clip.rs` / `clap.rs` 全部自写，**没有新增任何 crate 依赖**（Cargo.toml 未变），音频 FFT / mel / BPE / ORT 绑定都是手写。
-- 代码净增约 1200 行，但外部依赖与构建产物不增（onnxruntime.dll 13.5MB 随包）。
-- 临时目录 `_clip`（1.6GB 下载与探针）、`_xtest` / `_mmtest` / `_shot`（测试库、探针与截图）、废弃的 `src-tauri\target`（1.4GB，旧 ACL 已不可用）与 `build-target\debug`（3.7GB）在验收后清理，**项目体积 14.0GB → 6.2GB**；`dist-app\crossprobe.exe` 探针也一并删掉。
-
----
-
-
-**模型管理页 + 全文/拼音搜索增强 + 轻量化**
-
-### 一、模型管理页（新增）
-
-顶栏多了一个「模型」模式，模型不再需要手改 `config.json`：
-
-- 扫描 `<exe>\models\`（不存在则 `data\models\`）里的所有 `.gguf`，显示大小、修改时间、类型、是否为当前模型
-- 读取 GGUF 头里的 `general.name` 作为展示名，读不到才退回文件名
-- 按文件名自动归类：`mmproj`/`projector`/`vision` → 视觉投影，`embed`/`bge`/`gte`/`minilm` → 嵌入，`chat`/`instruct`/`qwen`/`llama-3` → 对话
-- 一键「设为嵌入模型」即时加载并刷新状态栏；「切回哈希基线」不需要任何模型文件
-- 「导入模型」从任意位置复制进来（重名自动加序号）；「删除」有保护：**当前正在使用的模型不允许删**
-- 后端新增 `model_list` / `model_dir_path` / `model_delete` / `model_import` 四个命令，`src-tauri/src/models.rs` 是独立实现
-
-### 二、全文搜索：Word / Excel / PDF / TXT 全部支持
-
-修了一个让全文搜索形同虚设的 bug：`index.rs` 里判断「要不要抽正文」写的是 `matches!(kind, "text" | "doc")`，而 `ext_kind()` 返回的是 `"document"`，导致 **所有 PDF/DOCX/XLSX 都被跳过**，全文索引里只有 `.txt`。改为 `"text" | "document"` 后文档类才真正入库。
-
-`textract.rs` 整体重写（216 → 约 700 行），格式覆盖：
-
-| 类别 | 扩展名 | 实现 |
+| 项 | 值 | 落点 |
 | --- | --- | --- |
-| 纯文本 | txt md log csv tsv json yaml html css js ts vue … (50 种) | `decode_bytes` 依次试 BOM / UTF-8 / GB18030 |
-| Word | docx、**doc** | docx 解 XML；doc 自写 OLE2 + Word 97 分片表（PlcPcd，含 fc 压缩位判断 UTF-16/单字节） |
-| Excel | xlsx、**xls** | xlsx 读 sharedStrings + 各 sheet；xls 解 BIFF8：SST(0x00FC) / LABELSST(0x00FD) / NUMBER(0x0203) / RK(0x027E) |
-| PPT | pptx、**ppt** | pptx 取各页 `a:t`；ppt 解 OLE2 记录树里的 TextCharsAtom(0x0FA0) / TextBytesAtom(0x0FA8) |
-| PDF | pdf | `pdf-extract` |
-| RTF | rtf | 自写控制字解析：`\uN`、`\'hh`（双字节按 GBK 组字）、`\par`/`\line` → 换行 |
-| EPUB / ODF | epub、odt/ods/odp | EPUB 解 zip 内 xhtml 去标签；ODF 读 `content.xml` |
+| 底色 | `#dcebf5` | `engine.ts:898` |
+| 网格 | `#cce0f0`，间距 40px | `engine.ts:898-901` |
+| 节点 | 白底 `#ffffff` + `#2c3e50` 3px 描边，140×40 圆角胶囊 | `engine.ts:1018-1055` |
+| 连线 | `#5d768f`，直线，文件级虚线 `[5,5]` | `engine.ts:960`、`glRenderer.ts:259` |
+| 文字 | Courier New bold 14px `#2c3e50` | `engine.ts:108` `BLUEPRINT_FONT` |
+| 面板 | 白底 + 3px 深边 + 12px 圆角 + 硬阴影 `8px 8px 0` | `GalaxyCanvas.vue:450-589` |
 
-**没有引入新依赖**：老式 Office 的 OLE2 容器解析是自己写的（约 120 行），比引入 `cfb` + `fnv` + `uuid` 更符合「轻量化」。单元测试 `plain_exts_decode` / `rtf_strips_controls` 随代码一起提交。
+配置集中在 `src/galaxy/model.ts:77` 的 `BLUEPRINT_CONFIG`，`BLUEPRINT_FORCE_CANVAS2D = true`（`:114`）强制走 Canvas 2D 路径 —— WebGL 的 `gl.POINTS` 画不出「白底 + 描边」的胶囊。CDP 实测首屏 1564 节点 / 240 FPS。
 
-### 三、全文命中片段（高亮）
+### 二、1TB 库卡顿（需求②）
 
-原先 `Hit.snippet` 字段存在但后端从不填，全文命中只有一个分数、看不到命中在哪里。现在：
+四处聚合热点全部换成按层查询：
 
-- `search.rs` 记录哪些 id 是全文命中的，映射结果时调 `make_snippet(raw, text, 60)` 从 `docs.raw` 里截前后各 60 字上下文，两端补 `…`
-- 用整串小写查找；查不到时退回「用查询里的 2-gram 去 raw 里找最早出现的位置」，保证中文长查询也能定位
-- 前端 `ResultTable.vue` 用 `<mark>` 高亮，两行截断
-
-### 四、搜索页的三个开关
-
-搜索框下方新增三个 toggle，直接决定发给后端的 `use_fts` / `use_pinyin` / `use_semantic`：
-
-- **全文**：在 Word / Excel / PDF / TXT 等文档正文里检索
-- **拼音**：`huiyijilu` / `hyjl` 都能找到「会议记录」
-- **语义**：用一句话描述找相近的文件
-
-### 五、修掉的其它 bug
-
-- **筛选与全文冲突**：筛「图片」时全文命中的 PDF 也会冒出来。现在带结构化筛选时，全文命中必须在候选集内才计入
-- **原因标签被覆盖**：文件名精确命中的结果，原因曾被改写成「全文内容匹配」。现在只升级不降级
-- **`doc` 类型键不一致**：前端 `KIND_COLORS` / `Treemap.vue` 图例用的键是 `doc`，后端 `ext_kind()` 返回 `document`，导致文档类型永远显示成默认灰色。已统一为 `document`
-
-### 六、轻量化
-
-删除的文件（合计约 1.6 GB 冗余 + 19.8 GB 可重建缓存）：
-
-| 对象 | 大小 | 判断依据 |
+| 热点 | 改法 | 效果 |
 | --- | --- | --- |
-| `models\embeddinggemma2-mm.gguf` | 532 MB | SHA256 与 `embeddinggemma2.gguf` 完全相同 |
-| `models\mmproj-embeddinggemma2.gguf` | 937 MB | 全仓库 grep `mmproj`/`clip`/`multimodal` 零命中 |
-| `dist-app2\` | 695 MB | 旧绿色发布版，README 只引用 `dist-app` |
-| `tmp\` | 32 MB | 测试残留 |
-| `vendor\llama.tar.gz` | 37 MB | `vendor/llama.cpp` 已解包 |
-| `tools\msys2-…exe` / `node-…zip` / `rustup-init.exe` | 126 MB | 安装包，工具链已装好 |
-| `tools\patch_*.py` / `fix_*.py`（14 个） | 30 KB | 开发期一次性补丁脚本，改动早已落到源码 |
-| `acl-recovery\` | 0.2 MB | 本轮 ACL 修复的备份与报告 |
+| `graph_data` 首屏 | 逐目录 `dir_child_rollup`（每层 N 次全表扫）→ 全库 `GROUP BY dir` 一次 + 内存折叠 | **15.9~18.8 s → 0.69~0.89 s** |
+| `tree_level` | `dir_rollup_under` 拉整棵子树 → `dir_recursive_stats` + `dir_child_rollup` + `dir_direct_counts` | — |
+| `tree_search` | 全量 `dir_rollup()` 内存过滤 → `dir_name_search` LIKE 粗筛 + 精确二次过滤 | — |
+| `star_children` | `expand_dir` 三条全表级查询 → 折叠表复用 | 1177 → 372 ms |
 
-代码精简：
+折叠函数 `fold_dir_children` / `dir_lookup_key` 从 `cmd.rs` 迁到 `db.rs`（:1465 / :1527）供 `star.rs` 复用；`db.rs` 另新增 `ix_files_kind_dir`、`ix_files_dir_size`、`ix_files_drive_kind` 三个索引。
 
-- `fileops.rs` 297 → 95 行：删掉 `copy_paths` / `move_paths` / `delete_paths` / `rename_paths` / `rename_pattern` / `unique_target` / `retry` / `OpResult` —— 这些只被前端从不调用的 `op_copy` / `op_move` / `op_delete` / `op_rename` / `op_rename_pattern` 使用
-- `cmd.rs` 删掉 11 个零引用命令：`facets` / `index_wait` / `op_copy` / `op_move` / `op_delete` / `op_rename` / `op_rename_pattern` / `categories_list` / `log_add` / `embed_preview` / `now_label`
-- `db.rs` 删掉 `Category` 结构与 `categories` 表及其 CRUD（只服务于已删的 `categories_list`）
-- `api.ts` 262 → 224 行：同步删掉对应的 8 个方法与 `OpResult` 接口；`ModelEntry` 去掉从未使用的 `arch` / `quant` / `referenced`
-- `models.rs` 删掉 `gguf_meta` 里读 `general.size_label` 的分支、`now()`；`ModelsView.vue` 删掉本地重复的 `humanSize`（改用 `store.ts` 的）
-- `Cargo.toml` 去掉 `trash` 依赖（唯一使用者 `delete_paths` 已删除）
-- `src-tauri/src/bin/selftest.rs` 删除：与 `src/selftest.rs` 是两份重复的自检实现，`main.rs` 只走后者
+### 三、星星点不开、一点就报错（需求④）
 
-**未删**：`dist-app\`（唯一发布版）、`tools\bin\ffmpeg.exe`（`media.rs` 会找）、`src-tauri\src\bin\smoke.rs`（README 引用的端到端验证）、`visdemo.rs`（视觉标签调试）。
+根因不在后端，在 `d3-force`：`initializeLinks` 会把 `link.source/target` **就地改写成节点对象引用**，而 `three-forcegraph` 的更新顺序是 `numDimensions()` 先于 `nodes()`。复用同一份 links 数组重跑时，新一轮还在用旧节点表查新节点，查不到就抛出 `node not found`。
 
-### 七、真机实测后追加修复
+控制台实测：`Error: node not found: kind:other@D:`，抛完 HUD/面包屑/标签全部清空。
 
-打完包用 8 个真文档（docx / xlsx / pdf / txt / rtf / pptx / odt / 名字带 `.doc` 的纯文本）做端到端验收，又暴露了几个问题：
+修法（`engine3d.ts`）：新增 `private graphLinks()`，用 `idOf` 把两端规范回字符串 id 并过滤掉不在 `byId` 里的残边，`pushGraph()` 每次传新副本。CDP 连钻三层无异常。
 
-- **RTF 抽不出正文**：`textract.rs` 里 RTF 只有在「纯文本分支落空」时才走解析，而 `.rtf` 又在 `PLAIN_EXTS` 里，于是被 `read_plain` 按 latin1 读成花括号控制字、正文全丢。现在 RTF 从纯文本组移出，直接走 `rtf_text`
-- **删掉的文件还能从全文里搜出来**：`db.rs::search_fts` 只查 `docs` 虚表，已被标记 `missing`/删除的文件依旧返回 id。SQL 里加了 `JOIN files ON files.id = docs.rowid WHERE files.missing = 0`，删文件时也同步删 `docs` 行
-- **`docs_map` 映射串号**：FTS5 虚表的 `last_insert_rowid()` 在批量插入 / id 复用时会错位，表现为「搜到 A 文件、片段却是 B 的内容」。直接删表，改成 **`docs.rowid` 恒等于 `files.id`**，`FTS_SCHEMA_VERSION` 升到 3 并在启动时自动重建索引
-- **OOXML 段落没换行**：`w:p` / `a:p` 之间的换行原来被吃掉了，整篇 docx 抽出来是一长串。现在段尾补 `\n`
-- **`--selftest` 空库误报**：新装用户库里没文件时，全文/拼音/文件名/语义四项必然 0 条，原来记 FAIL，现在改成 `[SKIP]` 行，结尾单独统计「跳过 N 项」，不再混进成功数里冒充满绿
-- **`launcher.ps1` 丢了 BOM**：本轮编辑把 UTF-8 BOM 弄掉了，Windows PowerShell 5.1 会按 GBK 解析中文，启动器菜单直接报解析错误。已按 UTF-8 with BOM + CRLF 重新保存并实测 0 解析错误
+### 四、盘符恒星与行星轨道（需求⑤⑥）
 
-### 八、二次轻量化（构建产物）
+- `star.rs` `build_drive_level`：`drive_kind_stats` 按盘聚合，产出 `drive:D:` / `drive:E:` 节点。
+- `engine3d.ts:540-643` `assignOrbits`：drive 恒星**两两互绕**（`r = 150 + driveCount*46`、`speed = 0.16/sqrt(driveCount)`、奇偶反向）；单盘时 `radius 0 / speed 0` 静止不动 —— 即「一个盘自转、三个盘三体、四个盘四体」。
+- kind 行星环 `ring = 2.4 + idx*0.62`；folder/file 卫星环 `1.7 + (idx%8)*0.34`。
+- 点开不再爆量：`GalaxyView.vue:215` 的 `dir-limit=24`、`starFileLimit` 上限 24。
 
-- 删除 `src-tauri\target\`：16 GB 旧构建缓存（含一个起不来的 test harness 和 3 个 libllama.a 副本）
-- 删除 `build-target\`：7.6 GB（本轮为绕开旧 target 的 ACL 问题另建的 CARGO_TARGET_DIR，源码与 Cargo.lock 都在，随时 `cargo build` 重建）
-- 删除 `_fttest\`（端到端测试用的临时 app/文档/脚本）、`acl-recovery\`（ACL 修复备份，已无用）
-- 删除 `src-tauri\Cargo.lock.bak`、`Cargo.lock.test`、`src-tauri\data\smoke\`（smoke 测试产物）
-- 删掉 `dist-app\data\` 里的测试索引（`index.db` 64MB + `vectors*` + `thumbs`），恢复出厂态：目录为空、`scan.roots` 清空，用户第一次打开只需挑自己的目录
-- 验证截图归档到 `docs\screenshots\`
+### 五、GPU 占用几乎为零（需求⑦）
 
-**项目体积：约 32.4 GB → 4.0 GB**（其中 `tools\` 2.6 GB 是编译工具链，`dist-app\` 632 MB 含模型 533MB + ffmpeg 84MB，`vendor\llama.cpp` 182 MB）
+诊断过程中排除了两个错误假设：
 
----
+1. **「模型没上 GPU」是错的**。最初用 `nvidia-smi` 每 0.8 s 采样看不到台阶就下了结论。正确方法是 `--loop-ms=200` 原生循环（单次调用要 0.48 s，bash 的 for/sleep 会被自己拖慢）。改用后立刻看到 **+1.7 GiB 台阶**。
+2. **「Db 单 Mutex 导致单核串行」是错的**。实测 `TotalProcessorTime` 斜率 1.03~1.25 核（32 核机器）。真元凶是 `ai/hash.rs` 的 `image_vec_from` 对 pixiv 原图（4000×6000）做全尺寸 `to_rgb8()` 复制再遍历两遍。
 
-## v0.18 — 2026-10-22
+四处修复：
 
-**带菜单的启动器 + 清理旧项目**
+1. `ai/hash.rs`：先 `resize_exact(64, 64, Triangle)` 再统计直方图与亮度。
+2. `index.rs` `run_loop`：`first_image` 不再要求主模型有多模态能力。
+3. `index.rs` `process_image_batch`：新增 embedder/store 选择器；CLIP 改批量前向 `ClipModel::image_data_vecs`。
+4. `db.rs` `pending_cond` / `kind_scope`：队列按 kind 过滤。原来 `pending_ids("text")` 不看 kind，**47,691 张图片**被排进文本队列白跑。
 
-### 启动器（新增）
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 图片索引吞吐（120 s） | 357 条 = 2.98 张/秒 | **1430 条 = 11.9 张/秒** |
+| GPU util 均值 | 11.9% | **28.0%** |
+| GPU util 峰值 | 100% | 100% |
 
-`dist-app\deepaisee 启动器.cmd` + `dist-app\launcher.ps1`，六个入口：
+另外 `ai/ort.rs` 接通了 ONNX Runtime 的 **DirectML 执行提供器**（`detect_ep` / `attach_ep`），CLIP 实测 `EP=DML` 加载成功 —— 在 CUDA 不可用的前提下补上了 GPU 推理能力。
 
-- `[1]` 正常启动：起主界面，并在启动前回显上一轮模型加载耗时（读 `data\autoload.log` 末三行）
-- `[2]` 自检：跑 `--selftest`，按行着绿/着红回显 12 项结果
-- `[3]` 重建索引：`--cli index --what auto --force --wait`，执行前二次确认
-- `[4]` 扫描目录：交互输入路径，校验存在性后 `--cli scan`
-- `[5]` 命令行：`--cli help`
-- `[6]` 打开数据目录：Explorer 定位到 `data\`
+### 六、CUDA 后端暂缓（需求③的遗留部分）
 
-实现要点：
+**本版不产出 CUDA 版**，维持 Vulkan（llama.cpp）+ DirectML（ONNX Runtime）。硬阻断在 `src-tauri/build.rs:26-28`：CUDA 构建必须用 MSVC 目标，本机是 MSYS2 UCRT64 + GNU 工具链，`build.rs` 直接 panic。
 
-- **批处理文件里不放中文**：`.cmd` 是纯 ASCII 引导层（0 个非 ASCII 字节），所有中文文案在 `launcher.ps1`，由 PowerShell 渲染。
-- **`launcher.ps1` 必须 UTF-8 with BOM + CRLF**：Windows PowerShell 5.1 读无 BOM 的 `.ps1` 会按 GBK 解析，中文注释直接让脚本报「字符串缺少终止符」。已用 `[Parser]::ParseFile` 在 PS 5.1 与 pwsh 7 上分别校验 0 错误。
-- **`[Console]::IsInputRedirected` 时跳过 `ReadKey`**：否则在管道/自动化场景下 `ReadKey` 会卡死，无法做回归测试。
-- 顶部版本号从 exe 的 `ProductVersion`（`0.0.18`）裁成 `0.18`，与界面显示一致。
+本机无 MSVC、无 CUDA Toolkit、C 盘只剩 20 GB。将来换到装有 VS 2022 Build Tools + CUDA Toolkit 的机器，直接跑 `scripts/build-release.ps1` 即可，脚本会自动切换 features 并 Stage CUDA 运行库。完整接手步骤见 `HANDOFF.md` 的「v0.27 增量 → CUDA 后端」章。
 
-### 清理
+### 七、修掉一个会让整个进程消失的 BUG
 
-- 删除旧项目 `D:\软件\123`（DiskSeek，Python + PySide6）：释放 **10.5 GB**（`.venv` 5.4G / `dist` 4.4G / `build` 480M / `data` 201M + 源码）。
-- 目录内容已全部清空并核实（`ls -A` 为 0 项）；空目录本身残留一个内核句柄（`Device or resource busy`，RestartManager 也查不到用户态进程），重启后即可删除，不影响任何功能。
-- 删除前已确认：`tools\bin\ffmpeg.exe`、`models\embeddinggemma2.gguf` 在新项目里都有副本，且 `grep -rn "软件/123"` 在 `src-tauri/src`/`src`/`tools` 下零命中。
+`db.rs` `fold_dir_children` 用 `&dir[..prefix.len()]` 做前缀判断，`prefix.len()` 是**字节数**，目录名含中文时切片落在多字节字符中间 → `byte index N is not a char boundary`。这是 Tauri 命令线程里的 panic，**非 unwinding 直接 abort 整个进程**（日志只有一行 `thread caused non-unwinding panic. aborting.`）。
 
-### 验证
+改用 `dir.get(..prefix.len())` / `dir.get(prefix.len()..).unwrap_or("")`，并用 CDP 实测点开 `D:\软件` → `触手迷宫1.1` 三层中文目录不闪退。
 
-- 启动器在 PS 5.1 实跑：菜单渲染正常、`[2]` 自检 12 项全绿、`[4]` 扫描 1 文件入库成功、`[5]` 帮助正常、`[1]` 起进程正常（425MB 常驻）。
-- `deepaisee.exe --selftest` 直接跑：通过 12 项，失败 0 项，`llama.cpp · 768 维`。
+### 八、产物
 
----
-
-## v0.17 — 2026-10-22
-
-**补回「用文字找图片」：视觉标签 + mtmd 路线失败的完整记录**
-
-重构到 llama.cpp 之后丢了一项原始需求（m00002）：「可以通过文字描述查找图片」。这一版先花大力气尝试用 llama.cpp 的多模态投影（mtmd）把图片编码进向量空间，失败了；随后换了一条可解释的路线补回来。
-
-### 尝试过但放弃的路线（mtmd）
-
-- 用 `convert_hf_to_gguf.py --mmproj` 成功导出视觉塔：`mmproj-embeddinggemma2.gguf`（963 张量 / 982MB，含 `v.blk.0..9.*`、`v.patch_embd.weight {16,16,3,768}`）。
-- 用独立探针工程（`tools/mtmd-probe/`，CMake 直连 `vendor/llama.cpp`）验证：图片 tokenize 成 130~1000 个 image token、`mtmd_encode_chunk` 成功、视觉向量 512 维且**不同图片确实不同**（head 前几维差异明显）。
-- 卡在向量空间对齐：
-  1. 直接用 `llama_get_embeddings_seq` 的 768 维 pooled 向量 → 三张不同图几乎相同（范数 3453.20 / 3453.76，head 差异仅 1e-4），证明池化只吃了文本前缀。
-  2. 用文本 GGUF 的 `output.weight [512,768]` 把 512 投到 768 → 余弦 −0.19 / −0.19 / −0.17，全是负数且几乎相同，说明那是词表投影，不是视觉→文本的共享投影。
-  3. 绕开池化，比「文本塔最后一层 hidden 512 维均值」vs「视觉塔 512 维均值」→ 0.03~0.09，四种描述、两张图全部无区分度。
-- 根因：HF 版靠 `embed_vision.embedding_projection.weight [512,768]` + 对比学习把两个塔对齐，而 `convert_hf_to_gguf.py` 没有导出这一层，mtmd 的 clip 图里也没有它。补齐需要改转换脚本 + 改 clip 计算图 + 重新训练对齐，风险与工作量都超出范围。
-- **结论：回退主构建的 `LLAMA_BUILD_MTMD`，保留探针工程与 mmproj 文件作为证据。**
-
-### 实际采用的方案：可解释的视觉标签
-
-新增 `src-tauri/src/vision.rs`（约 330 行）：
-
-- `analyze()` 把图缩到 64×64 网格采样，算出这些指标：平均色相（用 `cos/sin` 加权平均避免 0/360 断裂）、饱和度、亮度、上下半区亮度、上下半区蓝/暖色占比、蓝/绿/暖/白/黑/灰各色系占比、边缘密度。
-- `tags_of()` 把指标翻译成**用户真的会输入的中文词**：蓝天、蓝天白云、白云、天空、海洋、水、湖、倒影、绿色、森林、树木、草地、草原、自然、户外、风景、雪景、冰雪、雪山、夕阳、黄昏、晚霞、日落、夜景、暖色、红色、白色、黑色、灰色、黑白、单色、纯色、背景图、壁纸、截图、文档、照片、色彩鲜艳。
-- `describe_file()` 直接读图出标签；索引时**优先分析已生成的缩略图**（几百像素，快且稳，视频也能复用中间帧）。
-
-接入点：
-
-- `src-tauri/src/index.rs` 的 `process_one` 在缩略图之后（2.5 步）写 `files.tags`；只对 `image` / `video` 做，且已有标签不重复算。
-- `src-tauri/src/search.rs` 的名称打分段新增「画面标签」匹配：命中一个标签 0.62 起，命中越多越高，上限 0.82；低于文件名精确匹配（1.0），高于路径匹配（0.5~0.65）。
-- `Hit` 与 `src/api.ts` 增加 `tags` 字段；结果表在文件名后显示前 3 个标签（青色小胶囊），预览面板新增「画面标签」区块列出全部。
-
-实测（临时目录 `ds-test`，13 张图 + 视频）：
-
-| 图片 | 自动标签 |
+| 项 | 值 |
 | --- | --- |
-| `forest.png` | 图片 / 壁纸 / 户外 / 纯色 / 绿色 / 背景图 / 自然 / 草地 |
-| `ocean.png` | 图片 / 壁纸 / 纯色 / 背景图 / 蓝色 |
-| `sunset.png` | 图片 / 壁纸 / 暖色 / 红色 / 纯色 / 背景图 |
-| `img102.jpg`（日落雪山湖） | 图片 / 夕阳 / 晚霞 / 暖色 / 黄昏 |
-| `img100.jpg` | 倒影 / 图片 / 壁纸 / 天空 / 湖 / 纯色 / 背景图 / 蓝色 |
-| `img105.jpg`（纯蓝壁纸） | 图片 / 壁纸 / 纯色 / 背景图 / 蓝色 |
+| 安装包 | `release/DeepDark_Oracle_0.0.27_x64-setup.exe` |
+| 构建特性 | `llama,candle,custom-protocol`（无 candle-cuda） |
 
-搜索验证：
+### 九、清理
+
+根目录删掉 17 个 `_` 前缀临时脚本、2 个 57 MB 的旧 exe、`.tmpbuild/`（417 MB）、`webview-data/`（81 MB）、`dist/`。
+
+---
+
+## v0.26 — 2026-11-01
+
+**3D 星图：把索引铺成星云 + 安装包清掉一堆过时二进制**
+
+本版按 `2D转3D与星图需求明细.xlsx` 的 **33 条需求**（序号 1~33）实现，同时把安装包里用不上的陈旧 DLL 与临时产物全部清掉，包体回到 33 MB。
+
+### 一、3D 星图引擎（新增 `src/galaxy/star/`，2588 行）
+
+- **`engine3d.ts`（1043 行）**：`ForceGraph3D` 只负责力学与相机（`nodeVisibility` 全关），节点绘制交给一块 `InstancedBufferGeometry` —— 位置/颜色/尺寸/透明度/LOD 全走实例属性，**全场景节点 1 次 draw call**、连线 1 次、星尘 1 次。这是需求 #4「千节点不卡」与 #30「实例化渲染」的共同底座。
+- **`StarCanvas.vue`（901 行）**：Vue 外壳，管数据加载、钻取历史、HUD、图例过滤、右键菜单与慢帧降级。
+- **`nebula.ts`（297 行）**：3000 粒星尘球内均匀分布（`r = R·cbrt(rnd)`），空间哈希就近配对连线（每点至多一条，`maxLen = R*0.07`），`SphereGeometry(R*1.6)` 球壳做背景，`FogExp2` 密度 0.002。
+- **`shaders.ts`（174 行）**：glow（512px）/ dot（64px）/ cloud（256px）三张**运行时程序化生成**的贴图 + 节点与粒子着色器。源码里没有任何图片资源。
+- **`sketch.ts`（173 行）**：铅绘滤镜 ShaderPass，Sobel 采样深度出线条 + fbm 噪声偏 UV 做手抖 + 噪声等值线做拓扑线 + 程序化纸纹 Multiply。默认关闭（设置 → 图形与 GPU 里开）。
+
+**视觉**（需求 #8~17）：背景 `#050510` + 深色雾效；节点 `ShaderMaterial` + `AdditiveBlending` + 程序化 glow；连线 `0x225588` / `0xaab8ff`，alpha 0.06，悬停升到 0.45；星尘自转 0.08。
+
+### 二、Bloom 参数有意偏离需求表（附实测）
+
+需求 #12 / #17 给的基准是 `strength 1.8 / radius 0.5 / threshold 0.1`。**照抄的实测结果是整屏过曝** —— 亮像素占比 51.2%，画面基本是白的。原因是那套参数的前提是「纯黑背景 + 少量发光体」，而本项目的深空底色 `#050510` 亮度已经贴着 `threshold 0.1`，星云球壳又是整片参与泛光，叠完直接饱和。
+
+改法：`threshold 0.1 → 0.62`、`radius 0.5 → 0.35`、`strength 1.8 → 0.85（高端）/ 0.7 / 0.55`。复测亮像素降到 **4.65%**，观感上的辉光仍在，但只落在真正的发光体上。取舍写在 `engine3d.ts` 的 `applyBloom()` 注释里。
+
+### 三、修掉一个会让星图整页白屏的 BUG
+
+出包后实机启动星图，整页「界面加载出错」，控制台是：
 
 ```
-search 夕阳   → img102.jpg 0.66（画面里确实是落日晚霞）
-search 纯色   → img101.jpg 0.66、ocean.png 0.66
-search 壁纸   → img105.jpg 0.66、ocean.png 0.66
-search 草地   → forest.png 0.64
-search 蓝色   → img104.jpg 0.72、img0_1920x1200.jpg 0.67
+Uncaught Error: An error occurred. See https://github.com/styled-components/polished/...
 ```
 
-### 能力边界（务必如实告知）
+定位链：`3d-force-graph` 依赖的 `three-render-objects` 用 `polished` 解析背景色，而 `polished/lib/color/parseToRgb.js` 第一行就是 `if (typeof color !== 'string') throw`。本项目原来给 `backgroundColor()` 传的是数字 `0x050510`，直接抛错把整棵组件树打挂。
 
-- 这套标签是**颜色/构图统计**，不是语义理解。它能回答「有没有大片蓝天」「是不是暖色调的日落」「是不是纯色壁纸」，**不能**回答「有没有一只狗」「是不是在开会」「画面里有没有文字」。
-- 覆盖的词表是固定的四十多个（见上），超出词表的概念搜不到。
-- 旧 Python 版靠 PyTorch 四模态模型做过真正的跨模态检索，改用 llama.cpp 后失去了这个能力 —— 这是重构的技术代价，不是回归 bug。
+**修法**：`engine3d.ts:73-79` 拆成 `BG_PLAIN = 0x080b14`（给 `scene.background` 用，数字没问题）与 `BG_DEEP_CSS = "#050510"`（给 `backgroundColor()` 用，必须是 CSS 串）。这两条路径混用是这类 BUG 的常见来源。
 
-### 其它
+### 四、渐进式探索（需求 #19~23）
 
-- `Hit` 新增 `tags`，`search` 结果里带出，前端表格与预览面板都会展示。
-- 新增调试工具 `src-tauri/src/bin/visdemo.rs`（`visdemo.exe <图片或目录> [--profile]`），可直接打印标签与底层指标，方便调阈值。
+- **Level 0**：9 个类型节点（文件夹 / 文档 / 图片 / 代码 / 视频 / 音频 / 压缩包 / 程序 / 文本），由 `star_overview` 聚合。
+- **Level 1~3**：`star_children(nodeId)` 逐层下拉，带 `dirLimit` / `fileLimit`；300ms 内的 `star_layout_get/put` 复用坐标，钻取回来位置不跳。
+- **导航**：左下角面包屑逐级点击，工具栏 `←`/`→` 走 `history` 栈（`historyAt` 越界置灰）。
+- **防连线泛滥**（#22）：连线默认 alpha 0.06 只作视觉引导，悬停时该节点的边升到 0.45；图例条点一下按类型过滤节点。
 
-## v0.16 — 2026-10-22
+### 五、安装包清理
 
-**补回命令行接口（CLI）**
+删掉的（全部经实测确认不影响运行）：
 
-重构到 Tauri 之后，程序变成了纯 GUI，`--selftest` 之外没有任何命令行能力，而用户最初的需求里明确要求「批量操作与命令行接口」。这一版把它补回来，直接编译进发布版 exe。
+| 文件 / 目录 | 体积 | 为什么 |
+| --- | --- | --- |
+| `.gitattributes` | 163 B | 项目不是 git 仓库 |
+| `libgcc_s_seh-1.dll` / `libstdc++-6.dll` / `libwinpthread-1.dll` | 2.88 MB | MSYS2 编译期运行时，exe 已静态链接 |
+| `onnxruntime.dll` | 13.56 MB | 可选扩展，不该随包分发（用 `install-onnxruntime.ps1` 自己装） |
+| `vulkan-1.dll` | 724 KB | 系统 `System32` 自带；移走后实测启动正常 |
+| `resources/` `plugins/` | — | 冗余旧副本 / 源码零引用（安装时由 hooks 创建） |
+| 92 个临时脚本 / 截图 / 测试目录 | **79.1 MB** | 开发期取证残留 |
 
-- 新增 `src-tauri/src/cli.rs`，入口 `deepaisee.exe --cli <子命令>`：
-  - `scan <目录>...` 扫描入库，结束时打印目录/文件/新增/更新/跳过/错误/已消失/体积/耗时，并把目录写回配置。
-  - `search <关键词> [--kind K] [--limit N] [--no-semantic]` 混合检索：文件名、路径、拼音、全文、语义一起打分。
-  - `sem <一句话描述>` 纯语义检索。
-  - `similar <文件路径>` 找同类型相似文件。
-  - `stats` 库统计（按类型分布、正文/向量完成数、两套向量库条数）。
-  - `index [--what auto|text|embed] [--wait] [--force]` 建索引，`--wait` 阻塞到队列跑完。
-  - `rules` 列分类规则；`serve [--port N]` 前台启动局域网服务。
-- 打包版是 windowed 程序（没有控制台），CLI 用 `AttachConsole(ATTACH_PARENT_PROCESS)` 挂到父进程控制台，因此 **cmd / PowerShell 里能直接看到输出，双击运行则什么都不发生**。
-- 参数解析区分「开关型 flag」与「取值型 flag」（`--kind image` 的 `image` 不会被当成关键词，`--limit 3` 的 `3` 也不会）。
-- 自愈：`index` 发现文本向量库为空但记录状态仍是 `ok`（换模型导致维度变化时会出现）会自动重置并重新入队；`--force` 可强制全部重建。
-- 实测（debug 版，19 个文件）：
-  - `--cli stats` → 图片 13 / 文本 3 / 视频 1 / 音频 1 / 其他 1，媒体库 15 条 / 256 维。
-  - `--cli search 会议` → `会议纪要-2026Q3.md 1.24`；`--cli search 余弦` → `vector_search.py 0.31`；`--cli search hyjy` → `会议纪要-2026Q3.md 0.77`（拼音首字母）。
-  - `--cli sem 怎么比较两段文字的相似程度` → `vector_search.py 0.63`、`会议纪要 0.28`、`项目计划书 0.25`。
-  - `--cli similar .../forest.png` → 10 条，全部是图片（同类隔离生效），首条 `img104.jpg 0.50`。
-  - `--cli index --what embed --wait` → 「检测到文本向量库为空，已重置 18 条记录重新入队」→ `向量 18（失败 0）`。
-- 修复：CLI 在 PowerShell 管道 / 重定向输出时一个字都收不到。原因是 `attach_console()` 无条件 `AttachConsole` + `SetStdHandle`，把调用者已经给好的管道句柄覆盖掉了。现在先 `GetStdHandle(STD_OUTPUT_HANDLE)`，句柄有效就完全不碰（直接输出与 `> file` 重定向都验证过）。
-- 新增：`npm run tauri build` 现在能完整产出 **NSIS 安装包** `deepaisee_0.0.16_x64-setup.exe`（9.62 MB），不再只靠绿色免安装目录分发。
-- 发布版实测（绿色便携目录，16 个文件）：
-  - `--selftest` → **通过 11 项，失败 0 项**，模型 `llama.cpp · 768 维`。
-  - `--cli stats` → 16 个文件 / 6.12 MB，文本库 3 条 / 768 维，媒体库 196 条 / 256 维。
-  - `--cli search 余弦 --limit 2` → `vector_search.py 0.46`、`会议纪要-2026Q3.md 0.29`。
-  - GUI 连续运行 30 秒稳定（416MB 常驻），无 `panic.log`，界面顶栏 `deepaisee v0.16`、状态栏 `llama.cpp · 768 维 · cpu | 16 个文件 · 6.12 MB · 正文 3 · 向量 16`。
+**必须保留 `WebView2Loader.dll`（160,880 B）**：实测删掉即 `0xC0000135 STATUS_DLL_NOT_FOUND`（退出码 3221225781），窗口一个都不出。它由 cargo 在 `target/release/` 下生成但不会自动复制到项目根。
 
-## v0.15 — 2026-10-22
+根目录从 124 项降到 31 项，`_` 前缀残留 0 个。
 
-**修复一个会导致程序启动后自动退出的严重缺陷**
+### 六、产物
 
-- 修复（严重）：EmbeddingGemma 2 的 GGUF 在 llama.cpp 里同时有 `embedding_length = 512`（隐层）和 `embedding_length_out = 768`（投影输出）。`llama_shim.cpp` 原来用 `llama_model_n_embd()` 取维度，按 512 拷贝 `llama_get_embeddings*()` 返回的 768 维缓冲，**每次编码都越界写坏堆**。表现是程序能正常启动、能搜索，但运行一段时间后以 `0xc0000409`（`ucrtbase.dll` 里的堆损坏快速失败）无提示退出。现在改用 `llama_model_n_embd_out()`，维度正确报 **768**。
-  - 连带修复：向量库维度因此变化，旧的 512 维向量会被自动作废并触发重建；`vectors/meta.json` 现在写的是真实维度。
-- 修复（严重）：索引队列遇到「记录还在库里、文件已经不在磁盘」的条目时直接 `return Ok(())`，不改任何状态 —— 这条记录永远停在 `pending`，下次启动又被排进队列。库里积累几万条这种记录时（例如扫过整盘后大量临时文件消失），程序表现为**开机就满载空转、几十秒后自行退出**。现在会调 `mark_missing` 把它们标记掉。
-- 修复：启动阶段补索引会无条件把库里所有 `pending` 全部入队。新增 `enqueue_all_pending_limited(what, limit)`，启动时最多补 5000 条，其余留给用户在「扫描 / 索引」页手动重建；达到上限会在日志页留一条提示。
-- 修复：向量库每处理一条文件就全量 `save()`（几百 MB 量级），索引大目录时硬盘持续狂转。改成每 64 条落盘一次，并在队列空闲时 `flush()`。
-- 新增：发布版装 panic hook，未捕获的 panic 会写入 exe 同级 `panic.log` 与 `data\panic.log`（带 backtrace）。以前这类问题只会表现为「双击后窗口闪一下就没了」。
-- 索引线程每处理 200 条写一次「索引进度」心跳到活动日志，方便排查卡在哪一步。
-- 实测：干净数据目录启动后连续运行 5 分钟稳定（414MB 常驻）；768 维向量库 `meta.json` = `{"count":3,"dim":768}`；`--selftest` 模型维度项通过。
+| 项 | 值 |
+| --- | --- |
+| 安装包 | `release/DeepDark_Oracle_0.0.26_x64-setup.exe`，34,642,746 字节（33.04 MiB） |
+| SHA-256 | `a8e945321e1f220c587436285921cd97106c7b0adc114e4c6319eac0815530ea` |
+| 免安装 exe | 57,692,160 字节，SHA-256 `edfc792b2e506b34f4bc27c1bee09c5449edf00e05c1703129555a7828226074` |
 
-## v0.14 — 2026-10-22
+静默安装 → 启动 → 静默卸载三关实测通过；安装目录 7 文件 + 3 目录（139 MB，含 ffmpeg 87 MB），**不含**模型权重、索引数据、MinGW 运行时 DLL、`vulkan-1.dll`、`onnxruntime.dll`。
 
-**打包链路修复：发布版变成真正的生产构建**
+### 七、需求表里没有照做的部分
 
-- 修复：用 `cargo build --release` 出的 exe 打开后是 Edge 的「无法访问此页面 / localhost 拒绝连接」。原因是 Tauri 只有在 `tauri build` 下才会把 `frontendDist` 的静态资源嵌进二进制，直接 `cargo build` 编出来的程序仍去连 `devUrl: http://localhost:1420`。发布必须走 `npm run tauri build`。
-- 修复：`tauri build` 报 `failed to find main binary`，因为 crate 里还有 `smoke` / `selftest` 两个辅助 bin。`Cargo.toml` 增加 `default-run = "deepaisee"`。
-- 修复（严重）：`[features] default = []` 导致 `tauri build` 不带 `--features llama` 时编出**没有本地推理能力**的版本，运行时不报错、静默退回哈希基线（状态栏显示 `hash · 256 维`）。现在 `default = ["llama"]`，忘写参数也不会降级。
-- 修复：扫描统计计数器未清零，连续扫描两次会出现 `files: 31 → 46` 的假增长；扫描结束后对「本次没遇到、但路径在扫描根下」的记录标 `missing`，根目录整体消失时整批标记；扫描页新增「已消失」计数。
-- 修复：同一文件因 `C:/a/b` 与 `C:\a\b` 两种写法重复入库（实测 35 条记录只有 16 个真实文件）。`FileRow::new` 统一 `norm_path`，`migrate()` 对历史数据做去重。
-- 修复：重命名模板已含 `{ext}` 时又自动追加扩展名，得到 `forest.png.png`。
-- 发布版实测（`dist-app\deepaisee.exe`，14MB，内嵌前端 + llama.cpp）：`--selftest` **通过 11 项，失败 0 项**；语义检索「怎么计算余弦相似度」→ `vector_search.py (0.72)`；界面状态栏 `llama.cpp · 512 维 · cpu`；索引 18 个文件 8.97 MB；文本向量库 3 条 / 512 维、媒体向量库 15 条 / 256 维。
+| 条 | 原方案 | 理由 |
+| --- | --- | --- |
+| #13 SpriteMaterial | 每节点一个 Sprite | 换 Instanced 广告牌，1 draw call 顶掉 N 个 Sprite |
+| #31 KTX2 + Texture Atlas | 压缩纹理 / 图集 | 所有贴图运行时程序化生成，磁盘上没有图片资产可压；实际做的是 2 的幂尺寸 + mipmap + 各向异性 |
+| #32 Mesh BVH | 空间加速结构做射线检测 | 改 CPU 屏幕投影，比 `Raycaster` 对一万个球做检测快两个数量级 |
+| #4 移动端 `controlType=orbit` | 移动端手势 | 桌面程序，无触摸目标 |
 
-## v0.13 — 2026-10-22
-
-**扫描结果与磁盘真实状态对齐**
-
-- 修复：删掉的文件会永远留在库里，扫描几次后统计越滚越大（实测 16 个真实文件被记成 35 条）。现在扫描结束会把「本次没遇到、但路径在扫描根下」的记录标成 `missing`，文件恢复后再次扫描会自动回到正常状态。
-- 修复：扫描根目录本身被删除时，它下面的记录全部标记为缺失并计入「已消失」。
-- 修复：扫描统计计数器没有清零，连续扫描两次会出现 `files: 31 → 46` 的假增长。现在每次开扫前 `reset()`。
-- 修复：同一文件因斜杠写法不同（`C:/a/b` vs `C:\a\b`）重复入库。`FileRow::new` 统一走 `norm_path`，`migrate()` 增加历史数据去重（`UPDATE OR IGNORE ... replace(path,'/','\')` + `DELETE ... NOT IN (SELECT MIN(id) ...)`）。实测 35 条 → 19 条、重复组 0。
-- 修复：重命名模板已含 `{ext}` 时又自动追加 `.png`，得到 `forest.png.png`。
-- 界面：扫描页新增「已消失」计数，大于 0 时用琥珀色提示。
-- 实测：连扫两次统计稳定在 16 个文件 / 5 个目录；删掉 `forest.png` 再扫描 → 库内 19→18 条、`missing=1`；恢复文件再扫描 → `missing=0`。
-
-## v0.12 — 2026-10-22
-
-**打包版自检 + 换模型后自动重建向量**
-
-- 新增 `--selftest`：无界面自检 11 项（读配置、开库、加载 GGUF、文本向量化、开向量库、全文/拼音/文件名检索、语义检索、图片找相似、目录统计），结果写 exe 同级 `selftest.txt`。打包版没有控制台，这是用户确认「装好了能用」的唯一途径。
-- 修复：换嵌入模型导致维度变化时，`VectorStore` 会丢弃旧向量文件，但数据库里 `embed_state` 仍是 `ok`，于是「重建索引」排队永远是 0 个，用户以为重建了其实一条都没跑。现在打开向量库发现「原来有条目、现在变成 0 条」就把所有文件标回 `pending` 并立刻排队。
-- 修复：`model_load` 命令里还有一处 `cfg.save(&state.app_dir)`（把目录当文件写），保存配置会失败。
-- 发布版实测：`deepaisee.exe --selftest` **通过 11 项，失败 0 项**；语义检索「怎么计算余弦相似度」→ `vector_search.py (0.72)`；全文「会议」→ `会议纪要-2026Q3.md`；拼音 `hyjy` → 同一文件。
-
-## v0.11 — 2026-10-22
-
-**四合一界面与后端联调完成**
-
-- 界面：搜索/相似、树状图、扫描/索引 三个模式合并进单一窗口，右侧设置抽屉承载模型、分类规则、局域网、日志、设置五个分页。
-- 修复：空查询时结果列表永远为空（现在可以「只按类型/时间浏览」全部文件）。
-- 修复：`save_config` 把目录当文件路径写，导致保存配置报「拒绝访问 (os error 5)」。
-- 修复：找相似结果跨模态混入（图片源会返回音频/视频）。现在默认只在同类型里比较——图片的颜色直方图、音频的频谱、视频的帧均值物理含义不同，跨类型相似度没有意义。
-- 修复：`StatsOut` 前后端字段不一致导致状态栏崩溃。
-- 验证：界面验收 11 项全过；扫描 `C:\Windows\Web\Wallpaper\Windows` 新增 2 个文件；局域网服务 `http://<本机IP>:8770` 可访问，`/api/search?q=会议` 返回正确命中。
-
-## v0.10 — 2026-10-22
-
-**llama.cpp 真正接上**
-
-- 转换 `E:\quake\EmbeddingGemma 2\model` → `models/embeddinggemma2.gguf`（542.2MB，413 张量，架构 `gemma-embedding2`）。
-- 新增 `native/llama_shim.cpp`：用 C++ 包一层，只暴露 4 个 C ABI（create/dim/embed/free），避免在 Rust 里镜像 llama.cpp 的 struct（版本一变内存布局就错）。
-- 构建：CMake + Ninja 编译 llama.cpp 静态库，`build.rs` 把 `ggml.a` 复制成 `libggml.a` 供 rustc 链接。
-- 效果：模型加载 0.5s、单条编码 50~63ms、同文本余弦 1.0000、不同文本 0.7275。
-- 嵌入前缀纠正：查询加 `task: search result | query: `、文档加 `title: none | text: `（llama.cpp 路径原来把 `is_query` 丢弃了）。
-- **能力边界**：llama.cpp 只处理文本塔，输出 768 维（GGUF 的 `embedding_length_out`）；图片/音频/视频走 `HashEmbedder`（256 维）。两套向量分库存放（`vectors/` 与 `vectors_media/`），不会互相污染。因此「文字描述找图片/音频/视频」在 llama 后端下**不支持**，界面已标注。
-
-## v0.09 — 2026-10-22
-
-**四合一前端**
-
-- Vue 3 + Vite：`App.vue` 顶栏三个模式按钮 + 保活切换，`SearchView` / `TreeView` / `ScanView` / `SettingsDrawer`。
-- 组件：`ResultTable`（6 列 + 匹配进度条）、`PreviewPane`（缩略图/视频/元信息）、`Treemap`（TS 手写 squarify + ResizeObserver）。
-- 修复：`watch` 变量名遮蔽 Vue 的 `watch()` → `TypeError: watch2 is not a function`。
-- 修复：`open` 导入遮蔽 prop `open` → 设置抽屉永远开着。
-- 修复：Tauri 2 状态类型不匹配（`.manage(Arc<AppState>)` 而命令签名 `State<AppState>`）→ **所有命令全部失败**，界面能渲染但拿不到任何数据。
-- 修复：`AppConfig::load` 传目录而非文件 → 配置静默回退默认值，模型永远不自动加载。
-
-## v0.08 — 2026-10-21
-
-**Rust 后端骨架**
-
-- 模块：`config` / `db`（SQLite WAL + FTS5 unicode61 + 中文 2-gram）/ `scan`（walkdir）/ `textract`（PDF/DOCX/XLSX/PPTX/EPUB/TXT）/ `py`（拼音）/ `search`（名称+路径+拼音+模糊+FTS+语义）/ `vector`（暴カ点积）/ `index` / `fileops` / `watch` / `server`（axum）/ `state` / `cmd`（40+ 命令）。
-- 修复：`Db::update_fields(old_path, ...)` 参数名被 `path=` 撞掉，移动/重命名后库里路径不同步。
-- 修复：Windows 上 memmap 文件无法覆盖，向量库改纯内存 + 落盘时先写 tmp 再 replace。
-
-## v0.07 — 2026-10-21
-
-**工程骨架**
-
-- Tauri 2 + Vue 3 + Vite 脚手架，深色主题 CSS 变量，应用图标（32/64/128/256 + ico）。
-- 工具链：MSYS2 UCRT64 gcc 16.2 + rustc 1.99.1（`x86_64-pc-windows-gnu`）+ Node 22 + CMake/Ninja，走清华/rsproxy 镜像。
+其余 28 条全部按需求落地。详细对照见 `docs/DeepDark_Oracle_v0.26_交付说明.md`；需求 #18 的 AI 绘画提示词另出 `docs/星图视觉参考提示词.md`。
 
 ---
 
-## 从 DiskSeek 到 deepaisee
+## v0.25 — 2026-11-01
 
-旧版 DiskSeek（`D:\软件\123`，Python 3.12 + PySide6）功能完整并已实测交付：
+**GPU 加速兼容性：推理后端探测 + WebGL/Canvas 双渲染管线 + 图形质量面板**
 
-| 能力 | DiskSeek | deepaisee |
+本版按《需求明细汇总表》第三组「GPU 加速兼容性」REQ-093~108 实现。需求原文是按 Python + PyTorch 写的（`torch.cuda.is_available()`、`onnxruntime-directml`、`pip install` 之类），本项目是 Tauri + Rust + llama.cpp，没有 Python 运行时，加速后端在**编译期**就固定了，所以全部按现有架构做等价改写 —— 每一条的对应关系见下文。
+
+### 一、推理侧：GPU 能力探测（REQ-093 / 094 / 096 / 097 / 098~102）
+
+- **新增 `src-tauri/src/ai/gpu.rs`**：进程内唯一的 GPU 能力探测入口，`probe()` **永不返回 Err**（检测失败绝不该让主程序起不来）。
+- **后端来源**（REQ-093 / REQ-096）：不是 `torch.cuda.is_available()`，而是遍历 GGML 后端注册表（`ggml_backend_reg_count` / `ggml_backend_reg_get`），用 `ggml_backend_get_features` 拿每个后端编进二进制时启用的特性（`cuda` / `vulkan` / `metal` / `cpu` + 具体能力位）。为此在 `native/llama_shim.cpp` 新增三个 C 导出：`ds_llama_backend_count()` / `ds_llama_backend_info()` / `ds_llama_device_tier()`。
+- **显存分档**（REQ-097）：`classify_tier(vram_mb)` → Tier0 ≥8 GiB 全量下放 / Tier1 4~8 GiB 建议量化 / Tier2 1~4 GiB 小模型 / Tier3 <1 GiB 回落 CPU。阈值与 `llama_shim.cpp` 的 `ds_llama_device_tier()` **逐字一致**，否则界面说"显存够用"、实际加载却退回 CPU，用户只会觉得检测结果是骗人的。
+- **模型加载真的按分档走**：`llama_shim.cpp` 的 `ds_llama_create()` 里 `mparams.n_gpu_layers` 原来写死 `-1`（无脑全下放），改成：未指定设备 → `0`（纯 CPU）；指定设备 → 先查显存，低于 1 GiB 视为 Tier3 直接退回 CPU，否则 `-1` 全量下放。
+- **CUDA Toolkit 校验**（REQ-094）：解析 `nvcc --version` 的 `release X.Y`（回退读 `CUDA_PATH` 下的 `version.txt`）；不匹配时给出**按显卡型号**的版本建议（RTX 40/50 系 → CUDA 12.1+，RTX 30 系 → 11.8+，其余 → 11.8+），而不是"去装一下"这种废话。
+- **`--skip-cuda-check` 紧急跳过**：启动参数存在时探照常跑但不做工具包校验，报告里记一条"本次已跳过"。
+- **启动即写 `gpu_report.log`**（REQ-093）：数据目录下的 JSON 报告，同时在 stderr 打一行 `GPU: backend=... status=... tier=... — 原因`。整段在后台线程里做（探测会起 `nvidia-smi` 子进程，冷启动时能吃掉几百毫秒，放主线程会让窗口白屏更久）。
+- **新命令 `gpu_report` / `gpu_refresh_report`** + **`--cli gpu [--json]`**：命令行下能看到平台、后端、显卡、显存、分档、驱动、CUDA、结论、设备列表、已编入后端。
+- **AMD / Intel / Apple 分支**（REQ-098~101）：`classify_vendor()` 按设备名认厂商；AMD 额外探 `rocm-smi`，Intel 探 oneAPI/OpenVINO 安装路径，Apple 说明走 Metal。Windows 下 AMD 明确提示优先 Vulkan 或 DirectML。
+- **ONNX Runtime**（REQ-102）：`ort.rs` 仍是纯 CPU FFI 绑定（不引第三方 crate），本版把 `ORT_PROVIDER_ORDER`（CUDA → DirectML → CPU）固化下来并在报告里如实展示"装没装扩展 / 会按什么顺序协商"，**不假装装了扩展就一定跑 GPU** —— 普通 CPU 版 onnxruntime.dll 根本不会提供 DirectMLExecutionProvider。
+
+### 二、渲染侧：WebGL + Canvas 2D 双管线（REQ-103 / 104 / 105 / 106）
+
+- **新增 `src/galaxy/capability.ts`**：`detectWebGL()` 依次试 `webgl2` → `webgl` → 无，读 `UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL` / `MAX_TEXTURE_SIZE` / `MAX_VERTEX_ATTRIBS` / `EXT_float_blend` / `getShaderPrecisionFormat`，探测完**立刻 `loseContext()` 归还**（Chromium 系同时存活的上下文有硬上限）。`webglSupport()` 带缓存，一次会话只真探一次。
+- **新增 `src/galaxy/glRenderer.ts`**（380 行）：自绘 WebGL 点精灵。节点 = 1 顶点（位置/颜色/半径走顶点属性，圆形靠 fragment shader 里 `discard`），连线 = 2 顶点 `gl.LINES`，相机只改 uniform，CPU 侧不重算坐标。**没有引 PixiJS** —— 这里是离线桌面程序，而且图谱只需要"圆 + 线"两种图元，自绘 400KB 依赖不值当，也更容易在驱动异常时精确回退。
+- **着色器兼容降级**（REQ-104）：先试 `highp` 高性能版，编译失败自动换 `mediump` 兼容版；两个都失败就抛错让上层回退 Canvas 2D。`compile()` 刻意**不抛异常**，返回 null 交给调用方决定降级策略。
+- **已知驱动问题库**（REQ-105）：`KNOWN_DRIVER_BUGS` 里 4 条（老 Intel HD → 强制 Canvas 2D、AMD Vega/R 系 → 兼容着色器、SwiftShader/软件渲染 → 强制 Canvas 2D、NVIDIA → 建议关后处理）。匹配刻意保守：宁可少命中让用户手动切画质，也不要误判把正常显卡降级 —— 降级后帧率掉得明显，用户只会觉得"这软件越更新越卡"。
+- **DPI 自适应**（REQ-106）：`effectiveDpr(profile, backend, deviceRatio, override)`，Canvas 2D 路径压到 `min(2, 档位上限)`（圆本来就看不出锯齿，3 倍像素是纯浪费），WebGL 路径才给到档位上限。设置页可手动选 1x/2x/3x，**手动档位仍受画质上限约束**（低画质选 3x 只会更卡）。
+- **双管线切换**：`GalaxyEngine` 构造时按探测结果 + 用户偏好选后端；WebGL 初始化失败或绘制期抛错（驱动重置/休眠唤醒）自动回退 Canvas 2D 并记录原因，画布上方弹一条黄色提示条说明为什么降级。**一块 canvas 一旦绑定过某种上下文就不能再换**，所以切换后端时 `GalaxyCanvas` 用 `:key` 强制换一块新 DOM 画布重建引擎。
+- **鱼眼透镜在 GL 下也有**（REQ-077）：鱼眼位移做进顶点着色器（`u_fish` = 开关/鼠标位置/半径，`u_fishScale` = 放大倍数），几千节点的推开由 GPU 算，CPU 零成本。
+- **慢帧自动提示**（REQ-103 的"renderTime > 16ms 提示降级"）：连续 45 帧超过 16.7ms 才提示一次，切画质会重置计数（否则一次卡顿会永久压制后续提示）。
+
+### 三、设置页「图形与 GPU」（REQ-107 / 108）
+
+- **新增 `src/components/SettingsGpuTab.vue`**，设置抽屉第七个标签页，五张卡：GPU 能力报告（显卡/后端/显存条/驱动/CUDA/分档/ONNX EP）→ 画质档位（低/中/高/极高）→ 渲染后端与分辨率（自动/强制 WebGL/强制 Canvas 2D + 1x~3x）→ 渲染能力（探测到的渲染器/着色器精度/最大纹理/顶点属性/浮点混合/像素比 + 命中的驱动补丁）→ 兼容性诊断与崩溃记录。
+- **画质四档**（REQ-108）：`QUALITY_PROFILES` 控制光晕、贝塞尔连线、背景星点、`maxDpr`、节点上限（5000 / 12000 / 40000 / 120000）。
+- **崩溃留证**（REQ-108）：新增 `src/galaxy/telemetry.ts`。离线程序没有服务器可上报，做的是"本地留证"——记录 `context-lost` / `shader-fail` / `init-fail` / `slow-frame` 四类事件，设置页可直接复制给开发者。**隐私**：只记显卡/驱动/后端这类渲染元信息，**绝不记录文件名、路径或任何文件内容**（需求表点名要求）。
+- **新增 `scripts/gpu-check.ps1`**（REQ-107 的等价实现）：需求表原方案是 GitHub Actions 矩阵跑 chrome/firefox/safari/edge + 模拟 GPU 降级，本项目没有 CI 也没有浏览器矩阵，改成「本机自检 + 基线对比 + HTML 报告」：跑 `--cli gpu --json` → 归一化状态 → 打印摘要 → 给 `-Baseline` 时比对显存档位退化 / 后端变化 / 可用显存下降 >20% → 输出 `docs/gpu-report/gpu-report-<时间戳>.json` 与同名 `.html`；`-Strict` 模式下退化或"不支持"返回 1，可直接挂到发布前检查。
+
+### 四、Vulkan 后端默认启用
+
+- 之前必须手动设 `DEEPAISEE_VULKAN=1` + `VULKAN_SDK` 才编得进 Vulkan 后端，现在 **`build.rs` 自动探测**：依次找 `$VULKAN_SDK` / `$DEEPAISEE_VULKAN_ROOT` / `$MSYS2_ROOT` / 仓库内 `.tools/vulkan{,-sdk}` / `D:\dsh-tools\msys64\ucrt64` / `C:\msys64\ucrt64`，要求 `include/vulkan/vulkan.h` 与 `bin/glslc.exe` 同时存在。`scripts/activate-local.ps1` 同步做了探测与提示。
+- **`scripts/build-release.ps1` 删掉了两行重复的 `DEEPAISEE_VULKAN = "0"`** —— 那是早期为了出包稳定加的强制关闭，一直没删，导致自动探测形同虚设，装好的 Vulkan SDK 白放着不用，GPU 推理只能退回 CPU。
+- 本机实测：`CMakeCache.txt` 里 `DEEPAISEE_VULKAN:BOOL=ON`，NVIDIA RTX 4060 Laptop（8188 MiB）被正确识别为 `vulkan` 后端 + Tier 0。
+- 体积代价：exe 从 v0.24 的 23.9 MB 涨到 **57.3 MB**（Vulkan 后端 + 静态链接的 C++ 运行时），安装包从 30,501,454 字节（29.09 MiB）涨到 **34,276,337 字节（32.7 MB）**。仍然不含任何模型权重、索引数据或可选扩展。
+
+### 五、需求表里**没有**照做的部分（附理由）
+
+| 需求 | 原方案 | 本版做法 / 理由 |
 | --- | --- | --- |
-| 框架 | Python + PySide6 | **Rust + Tauri 2**（安装包 8MB 级，运行时用系统 WebView2） |
-| 前端 | Qt Widgets | **Vue 3 + Vite** |
-| AI 引擎 | PyTorch + sentence-transformers | **llama.cpp（GGUF）** |
-| 文本向量 | 768 维（EmbeddingGemma 2 四模态） | 768 维（llama.cpp 文本塔投影输出） |
-| 图片/音频/视频向量 | 768 维（同一个四模态模型） | 256 维哈希特征（llama.cpp 不支持这些模态） |
-| 跨模态「文字找图」 | 支持 | 不支持（降级为文件名/路径匹配，已在界面标注） |
-| 全文/拼音/模糊/名称检索 | 支持 | 支持 |
-| 图找相似图 / 音找相似音 / 视频找相似视频 | 支持 | 支持（同类型内比较） |
-| 树状图 | 支持 | 支持 |
-| 扫描 / 索引 / 实时监控 | 支持 | 支持 |
-| 批量操作 / 导出 | 支持 | 支持 |
-| 局域网访问 | 支持 | 支持 |
-| 安装包体积 | 4.4 GB（含 CUDA PyTorch） | 约 20 MB（不含模型） |
+| REQ-095 | `pip uninstall/install` 重装 GPU 版 PyTorch | 本项目无 PyTorch，等价改写为「该装哪个 CUDA Toolkit 才能编出带 CUDA 后端的版本」，按显卡型号给建议 |
+| REQ-102 | 装 `onnxruntime-directml` + provider 自动协商 | 只做 provider 顺序常量 + 如实展示；`ort.rs` 仍是纯 CPU FFI，跨模态扩展是可选安装项 |
+| REQ-107 | GitHub Actions 多浏览器 × 多 GPU 矩阵 | 无 CI、无浏览器矩阵，改为本机自检 + 基线回归 + HTML 报告脚本 |
+| REQ-105 | 在线驱动 Bug 数据库 JSON 远程更新 | 离线程序不联网，驱动库内置在 `capability.ts` 里，跟着版本走 |
+
+---
+## v0.24 — 2026-10-31
+
+**全局索引星系图谱 + 八种思维模型图 + 安装包瘦身**
+
+本版按《DeepDark_Oracle_需求明细汇总表》实现「双模态可视化引擎」与「思维模型图」两条主线，同时把安装包里用不上的陈旧 DLL 彻底清掉。
+
+### 一、全局索引星系图谱（`src/galaxy/`）
+
+- **新的画布引擎**：`src/galaxy/engine.ts`（789 行）用 `<canvas>` + `d3-force` 自己实现力导向渲染，而不是用 D3 的 SVG 选择器——按需求 REQ-032~041「禁用 DOM 节点」的要求，一万节点滚动缩放也不掉帧。
+- **节点视觉**：半径 `r = 8 + 3*log(childCount+1)`（REQ-006）；配色严格按需求表 —— 文件夹 `#4E79A7`、文档 `#59A14F`、图片 `#B07AA1`、代码 `#F28E2B`、视频 `#E15759`、其他 `#9C755F`（REQ-008）。
+- **三级 LOD**（REQ-034）：缩放 <0.3x 只画文件夹、0.3~1x 画文件夹 + 重要文件（半径 ≥9）、>1x 才画全部；标签按屏幕像素 ≥15px 才绘制（REQ-010），远景不糊成一团。
+- **视口裁剪**：只绘制视口外扩 50px 内的节点与连线，10 万文件量级下平移依然跟手。
+- **连线**：contains 关系用二次贝塞尔曲线，透明度 0.3~0.5、线宽 1~2px（REQ-011），父子方向靠曲率表达。
+- **交互**（REQ-016~031）：滚轮以鼠标位置为锚点缩放（0.1x~5x）、拖拽带 0.85 阻尼、双击展开/折叠子节点、右键菜单（打开文件 / 在文件夹中显示 / 聚焦 / 展开折叠 / 以此为根 / 复位）、相机缓动 260ms。
+- **鱼眼透镜**（REQ-077）：半径 150px、中心 1.5x 放大，鼠标附近的节点被推开，工具栏一键开关。
+- **捏合建边**（REQ-074）：Ctrl + 拖拽从一个节点连到另一个节点，松开预览一条黄色虚线关系边。
+
+### 二、四个入口
+
+- **顶栏星系图按钮**（`Network` 图标）进入全屏 `GalaxyView`：面包屑 + 「层数 / 每目录文件数」两个下拉 + 「全部根 / 聚焦选中」。
+- **快捷键**：`Ctrl+G` 在搜索页与星系图之间切换，`Ctrl+F` 从星系图直接回搜索并聚焦输入框。
+- **搜索结果页视图切换**：结果工具栏右侧多了「列表 / 图谱 / 思维图」三档，切到「图谱」就把当前这批命中结果渲染成星系图，**不用跳页面就能看这批结果的簇结构**。
+- **索引面板双 Tab**：右上角「N 个文件 · X GB」弹出的面板顶部新增「目录树 / 星系图」两个 Tab，星系图 Tab 里是紧凑版画布，跟随当前选中的目录。
+
+### 三、八种思维模型图（`src/components/MindMap.vue`）
+
+按 REQ-053~061 实现，全部用 SVG 绘制、支持选中与详情卡：
+
+| 模型 | 图形 | 说明 |
+| --- | --- | --- |
+| 界定图 definition | 嵌套圆 packing | 按文件类型分层，圆面积 = 体积 |
+| 描述图 description | 中心辐射 | 中心是检索词，周围是所在目录 |
+| 比较图 comparison | 韦恩图 | 三种主要类型的两两交集 |
+| 分类图 classification | 树状 dendrogram | 按扩展名逐级展开 |
+| 拆解图 decomposition | 旭日图 sunburst | 类型 → 扩展名两级下钻 |
+| 顺序图 sequence | 时间线 | 按修改月份排布，带时间轴 |
+| 因果图 causality | 桑基图 | 目录 → 类型的流向与权重 |
+| 类比图 analogy | 平行对照 | 类型 / 扩展名两组对照 |
+
+右下角选中条目详情卡支持直接打开文件或在文件夹中显示。
+
+### 四、后端新增命令
+
+- **`graph_data(root?, depth?, max_nodes?, file_limit?)`**（`src-tauri/src/cmd.rs:1823`）：返回 `GraphData { root, name, nodes, edges, total_files, total_bytes, truncated }`。数据全部来自 SQLite 的 `dir_rollup_under()` 前缀聚合，**不触发任何磁盘遍历**；逐层按递归文件数降序展开，超过 `max_nodes`（默认 900，上限 8000）时截断并置 `truncated`。
+  - 根路径大小写用库里的真实路径回填（`dir_canon` 映射），否则第 0 层 `WHERE dir = ?1`（区分大小写）查不到直属文件。
+  - 子目录归并从「每层全表扫描」改成预建 `child_index` / `dir_canon` 两张哈希表，复杂度从 O(目录数²) 降到 O(目录数)。
+- **`mind_map_data(model, paths, query?)`**（`src-tauri/src/cmd.rs:2149`）：把一批文件按指定思维模型分组，返回 `MindMapOut { model, title, subtitle, groups, total_files, total_bytes, buckets }`；不传 paths 时取最近 400 个已索引文件，每组上限 120 条。
+
+### 五、安装包瘦身与链接方式
+
+- **删掉根目录的历史遗留文件**：`.gitattributes`、`DeepDark_Oracle.exe`（旧构建）、`DeepDark_Oracle 启动器.cmd`、`launcher.ps1`、`WebView2Loader.dll`、`libgcc_s_seh-1.dll`、`libstdc++-6.dll`、`libwinpthread-1.dll`、`onnxruntime.dll`，以及 `tools/` 下的 msys2 安装器(85MB) / node zip(34.9MB) / rustup-init(12.7MB) 等下载残留 —— 合计约 170 MB，另外单独删掉了 682 MB 的 v0.22 旧安装包。
+- **`tauri.conf.json` 与 `scripts/build-release.ps1` 里对应的 resources 条目同步删除**，`installer-hooks.nsh` 只保留 `tools/bin/ffmpeg.exe` 的说明。
+- **静态链入 GNU 运行时**（`src-tauri/build.rs:244-262`）：改为 `-static-libgcc -static-libstdc++` 并静态链 `winpthread`，exe 不再依赖 `libstdc++-6.dll` / `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` 三个 MinGW DLL——少拷任何一个都会让程序双击后弹「系统错误」直接退出（0xC0000135）。
+- **`WebView2Loader.dll` 仍随包分发**：`webview2-com-sys 0.39` 的宏写死了「只有 MSVC 才用 `WebView2LoaderStatic` 静态库，GNU 目标必须动态链 DLL」。这个 DLL 是构建时从 crate 现取的（160,880B），和根目录那份 2021 年的陈旧副本不是一回事。
+- **安装包不含模型与索引**：`models/`（embeddinggemma2 GGUF 558 MB）与 `data/`（index.db + 缩略图 + 向量）都不进包，成品 **30,501,454 字节（29.09 MiB）**。
+
+### 六、构建工具链
+
+- **GNU 工具链不认非 ASCII 路径**：`scripts/activate-local.ps1` 现在自动把 `RUSTUP_HOME` 镜像到纯 ASCII 盘（优先复用已存在的 `D:\ddrust`，否则 `robocopy` 到 `D:\DeepDark_Oracle-toolchain\rustup`），并把 `CARGO_TARGET_DIR` 指到 `D:\DeepDark_Oracle-build\target`。**sysroot 和 target 目录都必须是 ASCII**，否则 `ld.exe` 把中文按 GBK 解析成乱码，报 `cannot find ...libcore-....rlib`。
+- **PATH 顺序**：MSYS2 UCRT64 必须排在 Rust toolchain 之前，否则 gcc 会加载错版本的 `libgcc_s_seh-1.dll` 而静默失败（表现为 `libsqlite3-sys` 报 `Compiler family detection failed` 且 stderr 为空）。
+- **MSYS2 自动探测**：依次找 `tools\msys64`、`$env:MSYS2_ROOT`、`D:\dsh-tools\msys64`、`C:\msys64` 等位置，找不到才回退。
+- **`patch-llama-embeddinggemma2.ps1` 判定失效**：脚本原先用 `build_inp_embd(model.tok_embd);` 判断上游是否已支持 gemma-embedding2，但新版 llama.cpp 把该调用改成了 `build_inp_embd(model.tok_embd, sqrtf(n_embd));`，条件恒假导致走进 `git apply` 分支（本项目不是 git 仓库）而报错。改为前缀匹配后恢复正常。
+- **llama_shim 跟进 llama.cpp 0.7 的 mtmd API**：`mtmd_context_params.backend_device`（字符串）改成 `device`（`ggml_backend_dev_t` 句柄）；`mtmd_set_image_max_tokens()` 在新版已被移除，图像 token 预算改为只在 `mtmd_context_params.image_max_tokens` 初始化时设定。
+
+### 七、清理
+
+- 删除 `release/` 下 682 MB 的 v0.22 旧安装包与本轮开发过程中的临时脚本 / 日志。
+- `src-tauri/target/` 的 debug 产物不再参与打包。
+
+---

@@ -1,6 +1,0 @@
-# 启动器必须逐字节保留（.ps1 是 UTF-8 with BOM + CRLF，.cmd/.bat 是纯 ASCII + CRLF）
-*.ps1 -text
-*.cmd -text
-*.bat -text
-*.exe binary
-*.dll binary

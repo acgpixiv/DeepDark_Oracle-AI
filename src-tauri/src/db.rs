@@ -2,6 +2,7 @@
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub const FTS_SCHEMA_VERSION: i64 = 3;
@@ -104,6 +105,12 @@ pub struct IndexKindStat {
 
 pub struct Db {
     conn: Mutex<Connection>,
+    /// 全库目录聚合的短 TTL 缓存。
+    ///
+    /// 一条 `GROUP BY dir` 在 28 万行库上要约 220~275 ms（线上库比热副本慢），
+    /// 而目录树面板 / 星系图在用户连续点开几层时会连着调好几次。缓存 3 秒
+    /// 既能让连点几乎零成本，索引在后台跑时也只是最多滞后 3 秒。
+    dir_rollup_cache: Mutex<Option<(std::time::Instant, std::sync::Arc<Vec<(String, i64, i64)>>)>>,
 }
 
 impl Db {
@@ -116,7 +123,7 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "cache_size", -32768)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let db = Self { conn: Mutex::new(conn) };
+        let db = Self { conn: Mutex::new(conn), dir_rollup_cache: Mutex::new(None) };
         db.migrate()?;
         Ok(db)
     }
@@ -153,6 +160,11 @@ impl Db {
             CREATE INDEX IF NOT EXISTS ix_files_embed ON files(embed_state);
             CREATE INDEX IF NOT EXISTS ix_files_cat ON files(category);
             CREATE INDEX IF NOT EXISTS ix_files_missing ON files(missing);
+            -- 星图展开用：按类别统计并列出目录时走 (kind,dir)，避免把整类文件行拉回内存。
+            CREATE INDEX IF NOT EXISTS ix_files_kind_dir ON files(kind, dir);
+            -- 目录树逐层展开用的覆盖索引：dir 区间扫描 + COUNT/SUM(size) 不回表。
+            -- 1TB 库（千万行）上这条能把「展开一个目录」从秒级压到毫秒级。
+            CREATE INDEX IF NOT EXISTS ix_files_dir_size ON files(dir, size) WHERE missing=0;
 
             CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
             CREATE TABLE IF NOT EXISTS rules(
@@ -205,6 +217,21 @@ impl Db {
             );
             "#,
         )?;
+        // 盘符是 `dir` 的纯函数（前两个字符 "E:"）。早期版本想用虚拟生成列
+        // `drive` 来承载它，但 `ALTER TABLE ... ADD COLUMN` 在某些 SQLite 构建
+        // 上会失败，而失败被 `let _ =` 吞掉 —— 结果是 `drive_kind_stats()` 里
+        // 的 `SELECT drive ...` 直接报 "no such column: drive"，又被调用方的
+        // `unwrap_or_default()` 吃成空 Vec，星图首屏因此没有任何恒星（点什么都
+        // 是空的）。这里改成**表达式索引**：不依赖表结构，任何库都能建成功。
+        let _ = c.execute("DROP INDEX IF EXISTS ix_files_drive_kind", []);
+        if let Err(error) = c.execute(
+            "CREATE INDEX IF NOT EXISTS ix_files_drive_kind \
+             ON files(substr(dir, 1, 2), kind, size) WHERE missing=0",
+            [],
+        ) {
+            // 建索引失败不致命（只是慢），但必须留下痕迹，别再静默。
+            eprintln!("[db] 盘符聚合索引创建失败（不影响功能，仅影响星图首屏速度）：{error}");
+        }
         let _ = c.execute("ALTER TABLE index_roots ADD COLUMN last_error TEXT NOT NULL DEFAULT ''", []);
         let _ = c.execute("ALTER TABLE index_roots ADD COLUMN discovered_files INTEGER NOT NULL DEFAULT 0", []);
         let _ = c.execute("ALTER TABLE index_roots ADD COLUMN discovered_bytes INTEGER NOT NULL DEFAULT 0", []);
@@ -327,6 +354,35 @@ impl Db {
             row_to_file,
         )
         .optional()
+    }
+
+    /// 批量取 (kind, ext)，供入队时判定工作类型。
+    ///
+    /// 早先 `Indexer::enqueue` 对每个 id 调一次 `get_by_id`：十万条待办就是
+    /// 十万次 SQLite 查询加十万次连接锁竞争，光入队就要几秒。这里一次
+    /// `json_each` 就够（同样规避 SQLite 999 个绑定变量的上限）。
+    pub fn file_categories(&self, ids: &[i64]) -> rusqlite::Result<std::collections::HashMap<i64, (String, String)>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let payload = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT id, kind, ext FROM files WHERE id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = st.query_map(params![payload], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, kind, ext) = row?;
+            out.insert(id, (kind, ext));
+        }
+        Ok(out)
     }
 
     pub fn count(&self) -> rusqlite::Result<i64> {
@@ -678,14 +734,7 @@ impl Db {
     }
 
     pub fn pending_ids(&self, what: &str, limit: usize) -> rusqlite::Result<Vec<i64>> {
-        // "auto" 必须同时看两列：只看 embed_state 的话，一个文件正文没抽、
-        // 但向量已经建好，它就永远不会被排进全文队列 —— 这正是修复
-        // `kind=="doc"` 那个判定 bug 之后文章仍然搜不到的原因。
-        let cond = match what {
-            "text" => "text_state IN ('pending','fail')",
-            "embed" => "embed_state IN ('pending','fail')",
-            _ => "text_state IN ('pending','fail') OR embed_state IN ('pending','fail')",
-        };
+        let cond = pending_cond(what);
         let c = self.conn.lock();
         let mut st = c.prepare(&format!(
             "SELECT id FROM files WHERE missing=0 AND ({cond}) LIMIT ?1"
@@ -703,11 +752,7 @@ impl Db {
         if roots.is_empty() {
             return Ok(Vec::new());
         }
-        let cond = match what {
-            "text" => "text_state IN ('pending','fail')",
-            "embed" => "embed_state IN ('pending','fail')",
-            _ => "text_state IN ('pending','fail') OR embed_state IN ('pending','fail')",
-        };
+        let cond = pending_cond(what);
         let mut sql = format!("SELECT id FROM files WHERE missing=0 AND ({cond}) AND (");
         let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(roots.len() * 3 + 1);
         for (i, root) in roots.iter().enumerate() {
@@ -778,15 +823,17 @@ impl Db {
     /// toward visible progress, but remain eligible for retry. This lets a
     /// newly-created Indexer restore its progress after an application restart
     /// without relying on in-memory counters.
+    ///
+    /// The denominator uses the same kind scope as `pending_cond`: files that
+    /// are structurally unprocessable (archives, executables, unclassified)
+    /// are never queued, so counting them would pin the bar below 100% forever.
     pub fn index_progress(&self, what: &str) -> rusqlite::Result<(i64, i64)> {
-        let (total_cond, done_cond) = match what {
-            "text" => ("missing=0", "missing=0 AND text_state!='pending'"),
-            "embed" => ("missing=0", "missing=0 AND embed_state!='pending'"),
-            // A combined auto task is complete for a file only after both
-            // stages have been attempted. `skip` and `fail` are terminal for
-            // progress purposes, while pending remains resumable.
-            _ => ("missing=0", "missing=0 AND text_state!='pending' AND embed_state!='pending'"),
-        };
+        let (kind_cond, done_cond) = progress_conds(what);
+        let total_cond = format!("missing=0 AND {kind_cond}");
+        // A combined auto task is complete for a file only after both stages
+        // have been attempted. `skip` and `fail` are terminal for progress
+        // purposes, while pending remains resumable.
+        let done_cond = format!("{total_cond} AND ({done_cond})");
         let c = self.conn.lock();
         let total: i64 = c.query_row(
             &format!("SELECT COUNT(*) FROM files WHERE {total_cond}"),
@@ -810,12 +857,10 @@ impl Db {
         if roots.is_empty() {
             return Ok((0, 0));
         }
-        let done_expr = match what {
-            "text" => "text_state!='pending'",
-            "embed" => "embed_state!='pending'",
-            _ => "text_state!='pending' AND embed_state!='pending'",
-        };
-        let mut scope = String::from("missing=0 AND (");
+        let (kind_cond, done_expr) = progress_conds(what);
+        let mut scope = String::from("missing=0 AND ");
+        scope.push_str(kind_cond);
+        scope.push_str(" AND (");
         let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(roots.len() * 3);
         for (index, root) in roots.iter().enumerate() {
             if index > 0 {
@@ -1150,6 +1195,281 @@ impl Db {
     ///
     /// 面板的叶子节点与「当前目录包含 N 个文件」都用它，避免把 14 万行
     /// 的文件级数据整表拉进内存。
+    /// 只要「直接子目录」的聚合，不把全部后代目录拉回内存。
+    ///
+    /// 旧路径 `dir_rollup_under` 会把前缀下**每一层**目录都返回（1TB 库可达
+    /// 数十万行），再在 Rust 侧建 HashMap 反推父聚合 —— 内存与哈希开销都在
+    /// 用户点开目录这一瞬间一次性付清，目录一多就卡住界面。
+    ///
+    /// 这里用 SQL 的字符串切片算出「相对 prefix 后第一个反斜杠之前」的部分，
+    /// 一次 GROUP BY 只回传直接子目录（通常 < 100 行），且 COUNT/SUM 天然是
+    /// 该子目录的递归统计。配合 ix_files_dir_size 覆盖索引不回表。
+    pub fn dir_child_rollup(&self, prefix: &str) -> rusqlite::Result<Vec<(String, i64, i64)>> {
+        let (lo, hi) = dir_prefix_bounds(prefix);
+        if lo.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lo_len = lo.chars().count() as i64;
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            r#"SELECT CASE WHEN instr(substr(dir, ?4 + 1), ?3) = 0 THEN dir
+                              ELSE substr(dir, 1, ?4 + instr(substr(dir, ?4 + 1), ?3) - 1) END AS child,
+                         COUNT(*), COALESCE(SUM(size),0)
+                  FROM files WHERE missing=0 AND dir >= ?1 AND dir < ?2
+                  GROUP BY child ORDER BY 3 DESC"#
+        )?;
+        let rows = st.query_map(params![lo, hi, "\\", lo_len], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect()
+    }
+
+    /// 全库目录聚合：`dir -> (文件数, 总字节)`，供 graph_data 在内存里折叠层级。
+    ///
+    /// 为什么不是「按前缀查每个目录」：`dir_child_rollup` 单条要 270~295 ms
+    /// （它的执行计划是 `SEARCH files USING INDEX ix_files_missing` + 
+    /// `USE TEMP B-TREE FOR GROUP BY`，等于全表扫一遍再分组）。graph_data
+    /// 首屏第 1 层 19 个目录 = 5.5 秒，第 3 层 242 个目录直接爆掉 —— 这就是
+    /// 首屏 17 秒的来源。
+    ///
+    /// 一次性 `GROUP BY dir` 实测只要 63~66 ms（33,608 行），之后在调用方
+    /// 内存里按前缀折叠，19 个子目录耗时 24 ms。目录树越深，这个方案越赚。
+    ///
+    /// 注意：返回的是**全库**结果，调用方自己按 root 前缀筛。
+    pub fn all_dir_rollup(&self) -> rusqlite::Result<Vec<(String, i64, i64)>> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(3);
+        {
+            let cache = self.dir_rollup_cache.lock();
+            if let Some((at, rows)) = cache.as_ref() {
+                if at.elapsed() < TTL {
+                    return Ok(rows.as_ref().clone());
+                }
+            }
+        }
+        let rows: Vec<(String, i64, i64)> = {
+            let c = self.conn.lock();
+            let mut st = c.prepare(
+                "SELECT dir, COUNT(*), COALESCE(SUM(size),0) FROM files WHERE missing=0 GROUP BY dir",
+            )?;
+            let mapped = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        *self.dir_rollup_cache.lock() =
+            Some((std::time::Instant::now(), std::sync::Arc::new(rows.clone())));
+        Ok(rows)
+    }
+
+    /// 让目录聚合缓存立刻失效（扫描/写入后调用，避免面板看到过期数字）。
+    pub fn invalidate_dir_rollup(&self) {
+        *self.dir_rollup_cache.lock() = None;
+    }
+
+    /// 目录 × 类型聚合：`(dir, kind, 文件数, 总字节)`。
+    ///
+    /// 树状图（`tree_data`）要给每个节点标「这一类占多少」，原来是把
+    /// `files` 表**整表** 28 万行拉进内存再逐行 reduce —— 1 TB 库是几百万行，
+    /// 光搬运就要几秒。改成库里先按 (dir, kind) 聚合：28 万行库上 37,264 行
+    /// / 约 310 ms，与文件总数无关地只跟目录数走。
+    pub fn all_dir_kind_rollup(&self) -> rusqlite::Result<Vec<(String, String, i64, i64)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT dir, kind, COUNT(*), COALESCE(SUM(size),0) FROM files WHERE missing=0 GROUP BY dir, kind",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect()
+    }
+
+    /// 一批目录的**直属**统计：dir → (文件数, 总字节)。
+    ///
+    /// 目录树每展开一层都要给每个子目录标「直属 N 个文件」。逐个调
+    /// `dir_file_stats` 是 N 次 prepare/查询；这里用一条 IN 查询走
+    /// `ix_files_dir`，子目录上百个也只有一次往返。
+    pub fn dir_direct_counts(
+        &self,
+        dirs: &[String],
+    ) -> rusqlite::Result<HashMap<String, (i64, i64)>> {
+        let mut out = HashMap::with_capacity(dirs.len());
+        if dirs.is_empty() {
+            return Ok(out);
+        }
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT dir, COUNT(*), COALESCE(SUM(size),0) FROM files WHERE missing=0 \
+             AND dir IN (SELECT value FROM json_each(?1)) GROUP BY dir",
+        )?;
+        // json_each 需要 JSON 数组；sqlite3 自带 JSON1，不必逐项展开占位符，
+        // 也就避开了 SQLite 999 个变量的上限（子目录上千个时同样安全）。
+        let payload = serde_json::to_string(dirs).unwrap_or_else(|_| "[]".to_string());
+        let rows = st.query_map(params![payload], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        for row in rows {
+            let (dir, count, bytes) = row?;
+            out.insert(dir, (count, bytes));
+        }
+        Ok(out)
+    }
+
+    /// 把一个目录串对齐到库里真实写入的大小写。
+    ///
+    /// `files.dir` 保留的是扫描时的原始大小写，而 SQLite 的 `dir = ?1` 是 BINARY
+    /// 比较。用户在面板里手输小写路径、或从旧配置读到大小写变体的根时，直接等值
+    /// 查询会一条都不命中，表现为「明明有数据却显示 0 个文件」。这里用 NOCASE
+    /// 找一次真身；只在递归统计为 0 的异常路径上才会被调用，正常展开不付这份代价。
+    pub fn canonical_dir(&self, dir: &str) -> Option<String> {
+        let dir = crate::util::norm_path(dir);
+        let dir = dir.trim_end_matches('\\').to_string();
+        let c = self.conn.lock();
+        let mut st = c
+            .prepare("SELECT dir FROM files WHERE dir = ?1 COLLATE NOCASE LIMIT 1")
+            .ok()?;
+        st.query_row(params![dir], |r| r.get::<_, String>(0)).ok()
+    }
+
+    /// 目录名搜索：按「最后一段名字」包含 `needle` 匹配目录，返回
+    /// (dir, 文件数, 总大小)，最多 `limit` 行。
+    ///
+    /// 旧实现在面板里用 `dir_rollup()` 把**全库** 3 万多个目录整表拉进内存再
+    /// 逐行 `name.contains()`（28 万文件库 244ms，1TB 库可达秒级 + 数十万行内存）。
+    /// 这里把过滤下推到 SQLite：`dir LIKE '%\needle%'` 命中的是「名字段」而不是
+    /// 任意父目录，且 GROUP BY dir 可以顺着 ix_files_dir 索引流式聚合，不必建临时表。
+    pub fn dir_name_search(
+        &self,
+        needle: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(String, i64, i64)>> {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        // LIKE 的通配符必须转义，否则用户搜「100%」会把 % 当成任意串。
+        let escaped = needle
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%\\{escaped}%");
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT dir, COUNT(*), COALESCE(SUM(size),0) FROM files \
+             WHERE missing=0 AND dir LIKE ?1 ESCAPE '\\' GROUP BY dir LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![pattern, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect()
+    }
+
+    /// 有向量、未缺失文件的 (id, dir) 列表 —— 语义星图做分层取样用。
+    ///
+    /// 只取两列：10 万条大约 3MB，比"分批 IN 查询 10 万次"快一个数量级；
+    /// 真正要展示的那 900 条再单独按 id 查完整元数据。
+    pub fn embedded_id_dirs(&self) -> rusqlite::Result<Vec<(i64, String)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT id, COALESCE(dir,'') FROM files
+             WHERE missing=0 AND embed_state='ok'",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// 按 id 批量取语义星图节点的完整元数据。
+    pub fn files_by_ids(&self, ids: &[i64]) -> Vec<FileRow> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(400) {
+            let mut sql = String::from(
+                "SELECT id,path,dir,name,ext,kind,size,mtime,ctime,text_len,text_state,embed_state,thumb_key,category,tags                  FROM files WHERE id IN (",
+            );
+            for (i, id) in batch.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&id.to_string());
+            }
+            sql.push(')');
+            out.extend(self.query_rows(&sql, Vec::new()));
+        }
+        out
+    }
+
+    /// 盘符聚合：磁盘盘符 → (文件数, 总字节)。星图的恒星层用它。
+    ///
+    /// 直接用表达式 `substr(dir,1,2)` 而不是生成列，配合
+    /// ix_files_drive_kind(substr(dir,1,2), kind, size) 覆盖索引，无需回表。
+    pub fn drive_stats(&self) -> rusqlite::Result<Vec<(String, i64, i64)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            r#"SELECT substr(dir, 1, 2) AS drive, COUNT(*), COALESCE(SUM(size),0)
+                  FROM files WHERE missing=0 AND length(dir) >= 2
+                  GROUP BY drive ORDER BY 3 DESC"#,
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// 「盘 × 类别」一次聚合：星图首屏用它，一条 SQL 出全部恒星的规模。
+    pub fn drive_kind_stats(&self) -> rusqlite::Result<Vec<(String, String, i64, i64)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            r#"SELECT substr(dir, 1, 2) AS drive, kind, COUNT(*), COALESCE(SUM(size),0)
+                  FROM files WHERE missing=0 AND length(dir) >= 2
+                  GROUP BY drive, kind ORDER BY drive"#,
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect()
+    }
+
+    /// 某个目录前缀的**递归**统计（含自身与所有后代），只回一行。
+    pub fn dir_recursive_stats(&self, prefix: &str) -> rusqlite::Result<(i64, i64)> {
+        let (lo, hi) = dir_prefix_bounds(prefix);
+        if lo.is_empty() {
+            return Ok((0, 0));
+        }
+        let self_dir = crate::util::norm_path(prefix);
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            r#"SELECT COUNT(*), COALESCE(SUM(size),0) FROM files
+                  WHERE missing=0 AND (dir = ?3 OR (dir >= ?1 AND dir < ?2))"#,
+        )?;
+        st.query_row(params![lo, hi, self_dir], |r| Ok((r.get(0)?, r.get(1)?)))
+    }
+
+    /// 某个盘 + 某个类别下的**一级目录**聚合（星图「类别行星」展开成卫星用）。
+    ///
+    /// `E:\111\pixiv\x` 会折叠成 `E:\111`，只回一级目录，行数受顶层目录数限制。
+    pub fn kind_dir_rollup(
+        &self,
+        drive: &str,
+        kind: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(String, i64, i64)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            r#"SELECT CASE WHEN instr(substr(dir, 4), ?4) = 0 THEN dir
+                              ELSE substr(dir, 1, 3 + instr(substr(dir, 4), ?4) - 1) END AS top,
+                         COUNT(*), COALESCE(SUM(size),0)
+                  FROM files WHERE missing=0 AND kind = ?1 AND substr(dir, 1, 2) = ?2 AND length(dir) > 3
+                  GROUP BY top ORDER BY 3 DESC LIMIT ?3"#,
+        )?;
+        let rows = st.query_map(params![kind, drive, limit as i64, "\\"], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect()
+    }
+
+    /// 某个类别在某个路径前缀下的聚合，只回一行，不把整类文件拉进内存。
+    pub fn kind_prefix_stats(&self, kind: &str, lo: &str, hi: &str) -> rusqlite::Result<(i64, i64)> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            r#"SELECT COUNT(*), COALESCE(SUM(size),0) FROM files
+                  WHERE missing=0 AND kind = ?1 AND path >= ?2 AND path < ?3"#,
+        )?;
+        st.query_row(params![kind, lo, hi], |r| Ok((r.get(0)?, r.get(1)?)))
+    }
+
     pub fn dir_file_stats(&self, dir: &str) -> rusqlite::Result<(i64, i64, i64, i64)> {
         let c = self.conn.lock();
         let mut st = c.prepare(
@@ -1163,6 +1483,128 @@ impl Db {
         })?;
         Ok(row)
     }
+}
+
+/// 把「全库目录聚合」折叠成「目录 → 其直接子目录 + 子树合计」。
+///
+/// 输入是 `all_dir_rollup()` 的 `(dir, count, bytes)` 全量行（28 万行库上
+/// 33,608 行），输出覆盖 `root` 子树内的**每一层**：每个目录都能拿到自己的
+/// 直接子目录列表，以及每个子目录**整棵子树**的文件数与字节数 —— 这正是
+/// `dir_child_rollup` 单查时 `GROUP BY child` 给出的语义。
+///
+/// 做法：对每一条 `(dir, n, sz)`，沿着 dir 的祖先链（从 root 的直接子目录
+/// 一直到 dir 自己）逐级累加。这样 root 下每个子目录拿到的就是它子树里所有
+/// dir 行的合计，不用为每个目录各跑一次全表扫描。
+///
+/// 复杂度：行数 × 目录深度（实测 33,608 × ~10），全程只做 HashMap 累加，
+/// 一次构建供 graph_data 的所有层级复用。
+pub fn fold_dir_children(
+    rows: &[(String, i64, i64)],
+    root: &str,
+) -> (HashMap<String, Vec<(String, i64, i64)>>, (i64, i64)) {
+    // 全部 key 统一成「无尾反斜杠」的形式（D: / D:\wx），与 graph_data 里
+    // 由 split_path_parts().join("\\") 得到的 dir id 完全一致。
+    let root_key = dir_lookup_key(root);
+    // root 为空表示「全库」视图：此时不设前缀，直接按盘符（第一段）分桶。
+    let prefix = if root_key.is_empty() { String::new() } else { format!("{root_key}\\") };
+    // root 自己的直属统计：顺手从同一批行里挑出来，省掉一次
+    // dir_recursive_stats 的区间扫描（28 万行库上 142 ms）。
+    let mut root_own: (i64, i64) = (0, 0);
+    // 先攒 (父目录, 子目录) -> (count, bytes)，最后再按父目录分桶排序。
+    let mut agg: HashMap<(String, String), (i64, i64)> = HashMap::new();
+    for (dir, count, bytes) in rows {
+        let dir = dir_lookup_key(dir);
+        if !root_key.is_empty() && dir.eq_ignore_ascii_case(&root_key) {
+            root_own.0 += count;
+            root_own.1 += bytes;
+            continue;
+        }
+        // 【必须用 get 而不是切片】目录名里有中文，`prefix.len()` 是字节数，
+        // 直接 `&dir[..len]` 会切在多字节字符中间 → panic。而且这是
+        // Tauri 命令线程里的 panic，非 unwinding 直接 abort 整个进程
+        // （实测点开一个中文目录就整个窗口消失）。
+        let Some(head) = dir.get(..prefix.len()) else { continue };
+        if !prefix.is_empty() && !head.eq_ignore_ascii_case(&prefix) {
+            continue;
+        }
+        // 从 root 的直接子目录开始，逐级往下，把这条 dir 行的数字加到
+        // 「每一级祖先 → 它的那个直接子目录」上。
+        let rest = dir.get(prefix.len()..).unwrap_or("");
+        let mut parent = root_key.clone();
+        for part in rest.split('\\') {
+            if part.is_empty() {
+                continue;
+            }
+            // 全库视图下 parent 从空串起，第一段就是盘符（D:），不能拼出 "D:"。
+            let child = if parent.is_empty() {
+                part.to_string()
+            } else {
+                format!("{parent}\\{part}")
+            };
+            let slot = agg.entry((parent.clone(), child.clone())).or_insert((0, 0));
+            slot.0 += count;
+            slot.1 += bytes;
+            parent = child;
+        }
+    }
+    let mut out: HashMap<String, Vec<(String, i64, i64)>> = HashMap::new();
+    for ((parent, child), (count, bytes)) in agg {
+        out.entry(parent).or_default().push((child, count, bytes));
+    }
+    // 与原实现一致：文件数降序（决定 max_nodes 预算先保谁），同数按大小、再按名字。
+    for list in out.values_mut() {
+        list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)).then_with(|| a.0.cmp(&b.0)));
+    }
+    (out, root_own)
+}
+
+/// 统一目录 key 的形式：正斜杠转反斜杠、丢尾反斜杠。`D:\` 与 `D:` 都变成 `D:`。
+///
+/// graph_data 里的目录 id 是 `split_path_parts(p).join("\\")` 的产物，
+/// 盘符根就长成 `D:`（`:` 后没有反斜杠）。折叠表必须用同一套 key，
+/// 否则 `dir_children.get(&dir_norm)` 永远取不到子目录、图上一片空白。
+pub fn dir_lookup_key(p: &str) -> String {
+    crate::util::norm_path(p)
+        .trim_end_matches('\\')
+        .to_string()
+}
+
+/// 增量索引队列与进度统计共用的 kind 范围。
+///
+/// 早先的 `pending_ids` 只看状态列、不看 kind，于是 `E:\111\pixiv` 下
+/// 47,691 张图片全被排进 "text" 队列：`process_one` 对图片不做正文抽取，
+/// 直接标 `text=skip`，只顺手做了缩略图。结果是跑满 140 秒推进 749 条，
+/// 正文 0 条、向量 0 条，GPU 只有 10% 占用 —— 用户看到的就是"索引不动"。
+///
+/// 现在两边用同一个判定：没有对应能力的文件根本不入队，也不计入进度分母。
+fn kind_scope(what: &str) -> &'static str {
+    match what {
+        "text" => "kind IN ('text','document')",
+        "embed" => "kind IN ('image','audio','video','text','document')",
+        _ => "kind IN ('text','document','image','audio','video')",
+    }
+}
+
+/// 待处理条件：状态列 + kind 能力范围。
+fn pending_cond(what: &str) -> String {
+    let scope = kind_scope(what);
+    let state = match what {
+        "text" => "text_state IN ('pending','fail')",
+        "embed" => "embed_state IN ('pending','fail')",
+        _ => "(text_state IN ('pending','fail') OR embed_state IN ('pending','fail'))",
+    };
+    format!("{scope} AND {state}")
+}
+
+/// 进度统计：返回 (分母条件, 已完成条件)。
+fn progress_conds(what: &str) -> (&'static str, &'static str) {
+    let scope = kind_scope(what);
+    let done = match what {
+        "text" => "text_state!='pending'",
+        "embed" => "embed_state!='pending'",
+        _ => "text_state!='pending' AND embed_state!='pending'",
+    };
+    (scope, done)
 }
 
 /// 把一个目录前缀换算成 SQLite 的字符串区间 `[lo, hi)`。
@@ -1244,8 +1686,15 @@ mod index_progress_tests {
     #[test]
     fn progress_counts_attempted_files_once_and_persists_task_kind() {
         let db = Db::open(Path::new(":memory:")).unwrap();
-        let first = db.upsert_file(&FileRow::new("C:\\docs\\first.pdf")).unwrap();
-        let second = db.upsert_file(&FileRow::new("C:\\docs\\second.pdf")).unwrap();
+        // FileRow::new leaves kind at "other"; scanning is what assigns a real
+        // kind. The progress denominator now skips unprocessable kinds, so the
+        // fixture has to declare one.
+        let mut first_row = FileRow::new("C:\\docs\\first.pdf");
+        first_row.kind = "document".into();
+        let mut second_row = FileRow::new("C:\\docs\\second.pdf");
+        second_row.kind = "document".into();
+        let first = db.upsert_file(&first_row).unwrap();
+        let second = db.upsert_file(&second_row).unwrap();
 
         assert_eq!(db.index_progress("auto").unwrap(), (2, 0));
         db.set_state(first, "text", "ok").unwrap();
@@ -1275,6 +1724,7 @@ mod index_progress_tests {
     fn changed_file_is_marked_pending_for_incremental_reindex() {
         let db = Db::open(Path::new(":memory:")).unwrap();
         let mut file = FileRow::new("C:\\docs\\changed.txt");
+        file.kind = "text".into();
         let id = db.upsert_file(&file).unwrap();
         db.set_doc(id, "changed.txt", "old body", "old body").unwrap();
         db.set_state(id, "embed", "ok").unwrap();
@@ -1289,6 +1739,37 @@ mod index_progress_tests {
         assert_eq!(saved.text_len, 0);
         assert!(db.get_doc_raw(id).unwrap().is_none());
         assert_eq!(db.index_progress("auto").unwrap(), (1, 0));
+    }
+
+    #[test]
+    fn pending_queue_skips_kinds_that_can_never_be_processed() {
+        // Regression: the queue used to filter on state columns alone, so
+        // E:\111\pixiv's 47k images were dequeued as "text" work, marked
+        // text=skip one by one, and never advanced the bar. Those kinds must
+        // not enter the queue at all.
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut image = FileRow::new("C:\\docs\\cover.png");
+        image.kind = "image".into();
+        let mut archive = FileRow::new("C:\\docs\\bundle.zip");
+        archive.kind = "archive".into();
+        let mut text = FileRow::new("C:\\docs\\notes.md");
+        text.kind = "text".into();
+        let image_id = db.upsert_file(&image).unwrap();
+        let archive_id = db.upsert_file(&archive).unwrap();
+        let text_id = db.upsert_file(&text).unwrap();
+
+        let text_queue = db.pending_ids("text", 100).unwrap();
+        assert_eq!(text_queue, vec![text_id]);
+        // archives have neither text nor a vector representation
+        let embed_queue = db.pending_ids("embed", 100).unwrap();
+        assert_eq!(embed_queue.len(), 2);
+        assert!(embed_queue.contains(&image_id));
+        assert!(embed_queue.contains(&text_id));
+        assert!(!embed_queue.contains(&archive_id));
+        // the bar must not count the archive either
+        assert_eq!(db.index_progress("text").unwrap(), (1, 0));
+        assert_eq!(db.index_progress("embed").unwrap(), (2, 0));
+        assert_eq!(db.index_progress("auto").unwrap(), (2, 0));
     }
 
     #[test]

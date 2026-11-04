@@ -59,8 +59,7 @@ fn main() {
             );
             cfg.define("Vulkan_ROOT", sdk.to_string_lossy().to_string())
                 .define("VULKAN_SDK", sdk.to_string_lossy().to_string());
-            let spirv_headers = sdk.join("Lib/cmake/SPIRV-Headers");
-            if spirv_headers.join("SPIRV-HeadersConfig.cmake").exists() {
+            if let Some(spirv_headers) = spirv_headers_dir(&sdk) {
                 cfg.define(
                     "SPIRV-Headers_DIR",
                     spirv_headers.to_string_lossy().to_string(),
@@ -241,9 +240,53 @@ fn main() {
                 println!("cargo:rustc-link-lib=dylib={lib}");
             }
         }
-        // GNU toolchains need libstdc++; MSVC supplies its own C++ runtime.
+        // GNU 工具链需要 libstdc++，MSVC 自带 C++ 运行时。
+        //
+        // 这里刻意用**静态**方式链入 GNU 运行时：否则最终 exe 会依赖
+        // libstdc++-6.dll / libgcc_s_seh-1.dll / libwinpthread-1.dll 三个
+        // MinGW DLL，安装包里少任何一个都会让程序双击后直接弹「系统错误」
+        // 退出（退出码 0xC0000135），而这些 DLL 又是"构建机本地"的版本，
+        // 打包分发时极易漏拷或版本错配。静态链入后 exe 自带运行时，
+        // 安装目录里不再需要这三个文件。
+        //
+        // 注意：这里**不能**用 `cargo:rustc-link-lib=dylib=stdc++`。那样 rustc 会
+        // 直接生成 `-lstdc++`，而 GNU ld 在默认的 -Bdynamic 状态下会命中
+        // `libstdc++.dll.a`（导入库），最终 exe 依然写着 DLL Name: libstdc++-6.dll。
+        // 必须在链接参数里显式切换成 -Bstatic 再取 -lstdc++，ld 才会挑 `libstdc++.a`。
+        // -lwinpthread 同理（否则会带 libwinpthread-1.dll）。
+        //
+        // 还有个坑：rustc 会传 `-nodefaultlibs`，默认的 msvcrt / mingwex / mingw32
+        // 在 `-lstdc++` **之前**就已经出现在链接行里，而 ld 是单遍的——
+        // 静态库 libstdc++.a 里对 `fileno` / `fdopen` / `__imp__wstat64` 的引用
+        // 没人再解析，报一屏 `undefined reference`。所以静态库之后必须把这几轮
+        // 默认库再补一遍。
+        // 而且系统导入库之间也有互相依赖（libmingwex 的 dirent 用 ucrt 的
+        // `_findclose`，libstdc++ 的 filesystem 用 kernel32 的
+        // `__imp_GetDiskFreeSpaceExW`），单遍扫描怎么排都有落下。所以用
+        // `--start-group/--end-group` 让 ld 在这组库里反复扫描到收敛。
+        // -static-libgcc 用 GCC 驱动自己的开关，静态拿下 libgcc_s_seh-1.dll。
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
-            println!("cargo:rustc-link-lib=dylib=stdc++");
+            println!("cargo:rustc-link-arg=-static-libgcc");
+            println!("cargo:rustc-link-arg=-Wl,-Bstatic");
+            println!("cargo:rustc-link-arg=-lstdc++");
+            println!("cargo:rustc-link-arg=-lwinpthread");
+            println!("cargo:rustc-link-arg=-Wl,-Bdynamic");
+            println!("cargo:rustc-link-arg=-Wl,--start-group");
+            for lib in [
+                "ucrt",
+                "mingwex",
+                "mingw32",
+                "ssp",
+                "kernel32",
+                "user32",
+                "advapi32",
+                "shell32",
+                "ole32",
+                "ws2_32",
+            ] {
+                println!("cargo:rustc-link-arg=-l{lib}");
+            }
+            println!("cargo:rustc-link-arg=-Wl,--end-group");
         }
         println!("cargo:rerun-if-changed=native/llama_shim.cpp");
         println!("cargo:rerun-if-changed=native/CMakeLists.txt");
@@ -315,26 +358,60 @@ fn cuda_toolkit_root() -> Option<std::path::PathBuf> {
 }
 
 fn vulkan_sdk_root() -> Option<std::path::PathBuf> {
-    ["VULKAN_SDK", "DEEPAISEE_VULKAN_ROOT"]
-        .iter()
-        .filter_map(|name| std::env::var_os(name))
-        .map(std::path::PathBuf::from)
-        .chain(
-            std::env::var_os("CARGO_MANIFEST_DIR")
-                .into_iter()
-                .flat_map(|manifest| {
-                    let repo = std::path::PathBuf::from(manifest).join("..");
-                    [repo.join(".tools/vulkan"), repo.join(".tools/vulkan-sdk")]
-                }),
-        )
-        .find(|root| {
-            root.join("Include")
+    [
+        "VULKAN_SDK",
+        "DEEPAISEE_VULKAN_ROOT",
+        // MSYS2 的 vulkan-devel 装在 ucrt64 下，没有独立 SDK 目录（REQ-093）。
+        "MSYS2_ROOT",
+    ]
+    .iter()
+    .filter_map(|name| std::env::var_os(name))
+    .map(std::path::PathBuf::from)
+    .chain(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .into_iter()
+            .flat_map(|manifest| {
+                let repo = std::path::PathBuf::from(manifest).join("..");
+                [
+                    repo.join(".tools/vulkan"),
+                    repo.join(".tools/vulkan-sdk"),
+                    // 常见外部工具链位置：有就自动启用 Vulkan，不需要手动设环境变量。
+                    std::path::PathBuf::from(r"D:\dsh-tools\msys64\ucrt64"),
+                    std::path::PathBuf::from(r"C:\msys64\ucrt64"),
+                    std::path::PathBuf::from(r"D:\msys64\ucrt64"),
+                ]
+            }),
+    )
+    .find(|root| {
+        let header = root.join("include").join("vulkan").join("vulkan.h").exists()
+            || root
+                .join("Include")
                 .join("vulkan")
                 .join("vulkan.h")
-                .exists()
-                && (root.join("Bin").join("glslc.exe").exists()
-                    || root.join("bin").join("glslc.exe").exists())
-        })
+                .exists();
+        header
+            && (root.join("bin").join("glslc.exe").exists()
+                || root.join("Bin").join("glslc.exe").exists())
+    })
+}
+
+/// Locate the CMake config for SPIRV-Headers.
+///
+/// llama.cpp's Vulkan backend does `find_package(SPIRV-Headers CONFIG REQUIRED)`
+/// and appends `$ENV{VULKAN_SDK}` to `CMAKE_PREFIX_PATH`, so a config under
+/// `$VULKAN_SDK/share/cmake` resolves on its own. The Khronos SDK ships it in
+/// `Lib/cmake/SPIRV-Headers` while MSYS2 puts it in `share/cmake/SPIRV-Headers`
+/// and `lib/cmake/...` — check every layout and pass the directory explicitly
+/// so neither package needs a hand-edited environment.
+fn spirv_headers_dir(sdk: &std::path::Path) -> Option<std::path::PathBuf> {
+    let candidates = [
+        sdk.join("Lib/cmake/SPIRV-Headers"),
+        sdk.join("share/cmake/SPIRV-Headers"),
+        sdk.join("lib/cmake/SPIRV-Headers"),
+    ];
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("SPIRV-HeadersConfig.cmake").exists())
 }
 
 /// Return a unique ASCII-only CMake output directory on the Cargo target volume.

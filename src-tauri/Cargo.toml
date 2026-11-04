@@ -1,6 +1,6 @@
 [package]
 name = "DeepDark_Oracle"
-version = "0.0.23"
+version = "0.0.28"
 description = "DeepDark_Oracle - AI disk search (Tauri 2 + Vue 3 + llama.cpp)"
 authors = ["DeepDark_Oracle"]
 edition = "2021"

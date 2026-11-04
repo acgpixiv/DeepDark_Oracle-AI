@@ -4,6 +4,7 @@ pub mod cli;
 pub mod cmd;
 pub mod config;
 pub mod db;
+pub mod disk;
 pub mod fileops;
 pub mod index;
 pub mod media;
@@ -13,6 +14,7 @@ pub mod scan;
 pub mod search;
 pub mod selftest;
 pub mod server;
+pub mod star;
 pub mod state;
 pub mod textract;
 pub mod util;
@@ -21,8 +23,8 @@ pub mod vision;
 pub mod watch;
 pub mod workspace;
 
-pub const APP_VERSION: &str = "0.0.23";
-pub const APP_DISPLAY_VERSION: &str = "0.23";
+pub const APP_VERSION: &str = "0.0.28";
+pub const APP_DISPLAY_VERSION: &str = "0.28";
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -44,6 +46,36 @@ pub fn run() {
     };
     let _ = state.db.log("app", &format!("DeepDark_Oracle {} 启动", APP_DISPLAY_VERSION));
     let _ = state.rebuild_indexer();
+    // GPU 能力探测（REQ-093）：报告写进数据目录的 gpu_report.log，同时把结论
+    // 记到活动日志。必须在后台线程里做 —— 探测会起 nvidia-smi 子进程，
+    // 冷启动时这段可能耗到几百毫秒，放在主线程会让窗口白屏更久。
+    {
+        let dir = state.data_dir.clone();
+        // REQ-094：显卡驱动/工具包环境炸掉时用户要有一条"先让我进得去"的路。
+        // 探测本身已经是失败即降级的，这个开关额外把结论写成"已跳过"。
+        let skip_cuda_check = std::env::args().any(|a| a == "--skip-cuda-check");
+        std::thread::spawn(move || {
+            let report = crate::ai::gpu::probe();
+            let _ = std::fs::create_dir_all(&dir);
+            if skip_cuda_check {
+                let mut report = report;
+                report.notes.push(
+                    "启动参数 --skip-cuda-check 生效：本次未做 CUDA 工具包校验。".to_string(),
+                );
+                if let Err(e) = crate::ai::gpu::write_report_of(&dir, &report) {
+                    eprintln!("写入 gpu_report.log 失败：{e}");
+                }
+                return;
+            }
+            if let Err(e) = crate::ai::gpu::write_report(&dir) {
+                eprintln!("写入 gpu_report.log 失败：{e}");
+            }
+            eprintln!(
+                "GPU: backend={} status={} tier={} — {}",
+                report.backend, report.status, report.tier, report.reason
+            );
+        });
+    }
     let shared = Arc::new(state);
 
     // Model loading is explicit: opening the app must not initialize a model.
@@ -169,6 +201,8 @@ pub fn run() {
             cmd::index_stats,
             cmd::model_info,
             cmd::gpu_devices,
+            cmd::gpu_report,
+            cmd::gpu_refresh_report,
             cmd::model_load,
             cmd::model_deactivate,
             cmd::model_list,
@@ -187,9 +221,17 @@ pub fn run() {
             cmd::rules_save,
             cmd::rules_apply,
             cmd::activity_list,
+            cmd::graph_data,
+            cmd::mind_map_data,
             cmd::tree_data,
             cmd::tree_browse,
             cmd::tree_search,
+            star::star_drives,
+            star::star_overview,
+            star::star_children,
+            star::star_semantic,
+            star::star_layout_get,
+            star::star_layout_put,
             cmd::workspace_add,
             cmd::workspace_state,
             cmd::workspace_remember,

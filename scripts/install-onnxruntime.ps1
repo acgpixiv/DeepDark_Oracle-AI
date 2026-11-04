@@ -1,4 +1,4 @@
-param([switch]$Update)
+﻿param([switch]$Update)
 
 $ErrorActionPreference = "Stop"
 

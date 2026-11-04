@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
-import { ArrowDownUp, Check, ChevronDown, ChevronRight, Download, FolderOpen, Search, X } from "lucide-vue-next";
+import { ArrowDownUp, Check, ChevronDown, ChevronRight, Download, FolderOpen, LayoutGrid, Network, Search, Sparkles, X } from "lucide-vue-next";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { api, type Hit, type SearchQuery } from "../api";
+import { api, type Hit, type MindMapOut, type SearchQuery } from "../api";
 import { langState, t } from "../i18n";
 import { toast } from "../store";
 import ResultGallery from "../components/ResultGallery.vue";
+import GalaxyCanvas from "../galaxy/GalaxyCanvas.vue";
+import MindMap from "../components/MindMap.vue";
 
 const props = defineProps<{ thumbDir: string }>();
 
@@ -43,6 +45,50 @@ const scopeOpen = ref(false);
 const scopeValue = ref("all");
 const scopeConfig = ref<Record<string, any>>({});
 const driveRoots = ref<string[]>([]);
+
+// ---- 视图切换（REQ-065 混合视图 / REQ-053~061 思维模型图）
+type ViewMode = "list" | "galaxy" | "mind";
+const viewMode = ref<ViewMode>("list");
+/** 思维模型图的模型选择：八种之一。 */
+const MIND_MODELS = [
+  { v: "definition", label: "界定图" },
+  { v: "description", label: "描述图" },
+  { v: "comparison", label: "比较图" },
+  { v: "classification", label: "分类图" },
+  { v: "decomposition", label: "拆解图" },
+  { v: "sequence", label: "顺序图" },
+  { v: "causality", label: "因果图" },
+  { v: "analogy", label: "类比图" },
+] as const;
+const mindModel = ref<string>("definition");
+const mindData = ref<MindMapOut | null>(null);
+const mindLoading = ref(false);
+const mindError = ref("");
+
+/** 当前结果里的文件路径（最多 600 条，够画图了）。 */
+const mindPaths = computed(() => hits.value.slice(0, 600).map((h) => h.path));
+
+async function loadMind() {
+  mindLoading.value = true;
+  mindError.value = "";
+  try {
+    mindData.value = await api.mindMapData(mindModel.value, mindPaths.value, text.value);
+  } catch (e) {
+    mindError.value = String(e);
+    mindData.value = null;
+  } finally {
+    mindLoading.value = false;
+  }
+}
+
+function setView(v: ViewMode) {
+  viewMode.value = v;
+  if (v === "mind") void loadMind();
+}
+
+watch([mindModel, () => hits.value.length], () => {
+  if (viewMode.value === "mind") void loadMind();
+});
 type ScopeOption = { value: string; label: string; path?: string; mode: "all" | "indexed" | "path" };
 const driveOptions = computed<ScopeOption[]>(() => {
   const drives = new Map<string, string>();
@@ -542,6 +588,34 @@ defineExpose({ run, enterSimilar });
         <span class="meta-primary">{{ resultLabel }}</span>
         <span v-if="selectedIds.size" class="muted">{{ t("已选") }} {{ selectedIds.size }}</span>
         <span class="toolbar-spacer"></span>
+        <div class="view-switch" role="tablist" :aria-label="t('视图')">
+          <button
+            class="vs-btn"
+            :class="{ active: viewMode === 'list' }"
+            :title="t('列表视图')"
+            @click="setView('list')"
+          ><LayoutGrid :size="13" />{{ t("列表") }}</button>
+          <button
+            class="vs-btn"
+            :class="{ active: viewMode === 'galaxy' }"
+            :title="t('星系图谱视图')"
+            @click="setView('galaxy')"
+          ><Network :size="13" />{{ t("图谱") }}</button>
+          <button
+            class="vs-btn"
+            :class="{ active: viewMode === 'mind' }"
+            :title="t('思维模型图')"
+            @click="setView('mind')"
+          ><Sparkles :size="13" />{{ t("思维图") }}</button>
+        </div>
+        <select
+          v-if="viewMode === 'mind'"
+          v-model="mindModel"
+          class="sort-select"
+          :aria-label="t('思维模型')"
+        >
+          <option v-for="m in MIND_MODELS" :key="m.v" :value="m.v">{{ t(m.label) }}</option>
+        </select>
           <button class="meta-button" @click="toggleAll">
           <Check :size="14" /> {{ visibleSelectedCount === displayHits.length && displayHits.length ? t("取消全选") : t("全选") }}
         </button>
@@ -550,8 +624,8 @@ defineExpose({ run, enterSimilar });
         </button>
       </div>
 
-      <div class="results-layout">
-        <section class="gallery-panel">
+      <div class="results-layout" :class="{ 'graph-mode': viewMode !== 'list' }">
+        <section v-if="viewMode === 'list'" class="gallery-panel">
           <div v-if="similarMode" class="similar-note">{{ t("相似于") }}：{{ similarSource?.name }}</div>
           <ResultGallery
             :hits="renderedHits"
@@ -566,6 +640,29 @@ defineExpose({ run, enterSimilar });
             @reveal="reveal"
             @rename="rename"
             @reach-end="revealMoreResults"
+          />
+        </section>
+
+        <section v-else-if="viewMode === 'galaxy'" class="graph-panel">
+          <GalaxyCanvas
+            :depth="3"
+            :file-limit="60"
+            :max-nodes="1400"
+            @open-path="(p) => api.openPath(p).catch((e) => toast(String(e), 'error'))"
+          />
+        </section>
+
+        <section v-else class="graph-panel">
+          <div v-if="mindLoading" class="graph-mask">{{ t("正在整理思维模型图…") }}</div>
+          <div v-else-if="mindError" class="graph-mask">{{ mindError }}</div>
+          <MindMap
+            v-else-if="mindData"
+            :model="mindData.model"
+            :groups="mindData.groups"
+            :title="mindData.title"
+            :subtitle="mindData.subtitle"
+            @open="(p) => api.openPath(p).catch((e) => toast(String(e), 'error'))"
+            @reveal="(p) => api.revealPath(p).catch((e) => toast(String(e), 'error'))"
           />
         </section>
       </div>
@@ -634,6 +731,22 @@ h1 { min-height: 1.4em; margin: 0; color: #111; font-size: 42px; font-weight: 45
 .sort-select { height: 29px; padding: 0 8px; border-radius: 5px; font-size: 11px; }
 .compact { width: 30px; height: 29px; display: grid; place-items: center; padding: 0; border-radius: 2px; }
 .result-meta { display: flex; align-items: center; gap: 10px; min-height: 34px; padding: 0 clamp(16px, 8vw, 140px) 10px; color: #555; font-size: 11px; }
+.view-switch { display: inline-flex; border: 1px solid #111; border-radius: 2px; overflow: hidden; }
+.vs-btn {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #fff; color: #111; border: 0;
+  font-size: 11px; padding: 4px 9px; cursor: pointer;
+  border-right: 1px solid #111;
+}
+.vs-btn:last-child { border-right: 0; }
+.vs-btn:hover { background: #f1f1f1; }
+.vs-btn.active { background: #111; color: #fff; }
+.results-layout.graph-mode { padding-bottom: 12px; }
+.graph-panel { position: relative; flex: 1; min-height: 320px; height: 100%; border: 1px solid #111; border-radius: 2px; overflow: hidden; }
+.graph-mask {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  font-size: 12px; color: #555; background: #0a0e1a;
+}
 .meta-primary { color: #111; }
 .meta-button { display: inline-flex; align-items: center; gap: 5px; padding-inline: 7px; }
 .results-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 0 clamp(16px, 8vw, 140px) 18px; }

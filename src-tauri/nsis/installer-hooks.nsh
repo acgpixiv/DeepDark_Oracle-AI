@@ -2,8 +2,8 @@
 ; ---------------------------------------------------------------------------
 ; Notes (ASCII only on purpose - NSIS parses .nsh by the ANSI codepage):
 ;  1) bundle.resources uses the map form, so runtime dependencies land directly
-;     in $INSTDIR: libstdc++-6.dll, libgcc_s_seh-1.dll,
-;     libwinpthread-1.dll, WebView2Loader.dll and tools\bin\ffmpeg.exe.
+;     in $INSTDIR: tools\bin\ffmpeg.exe. The Tauri/WebView2 and MinGW runtime
+;     DLLs ship with the exe itself, so no stale copies are bundled here.
 ;     Models are user-provided and are never included in the installer.
 ;  2) The CUDA runtime is large and only needed on NVIDIA machines. It is
 ;     bundled to $INSTDIR\_up_\.tools\cuda-runtime and copied next to the exe

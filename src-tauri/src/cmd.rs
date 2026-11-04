@@ -1,11 +1,13 @@
 //! Tauri 命令层：前端通过 invoke 调用。
 use crate::config::AppConfig;
 use crate::db::{Activity, FileRow, Rule};
+use crate::db::{dir_lookup_key, fold_dir_children};
 use crate::fileops;
 use crate::search::{Hit, SearchQuery};
 use crate::state::AppState;
 use crate::util::human_size;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -721,6 +723,24 @@ pub fn gpu_devices() -> Vec<GpuDeviceOut> {
     Vec::new()
 }
 
+/// 完整的 GPU 能力报告（REQ-093）。前端「显示适配 / 兼容性诊断」页用它。
+#[tauri::command]
+pub fn gpu_report() -> crate::ai::gpu::GpuReport {
+    crate::ai::gpu::probe()
+}
+
+/// 重新探测并落盘 `gpu_report.log`，返回写入路径。
+///
+/// 「重新检测」按钮走这条：用户插拔外置显卡或装完驱动后，不必重启程序。
+#[tauri::command]
+pub fn gpu_refresh_report(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let dir = state.data_dir.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
+    let path =
+        crate::ai::gpu::write_report(&dir).map_err(|e| format!("写入 gpu_report.log 失败：{e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 pub fn model_info(state: State<'_, Arc<AppState>>) -> ModelInfoOut {
     let i = state.embedder.read().info();
@@ -840,18 +860,21 @@ pub fn model_load_inner(state: &Arc<AppState>, backend: String, path: Option<Str
     };
     let info = emb.info();
     let dim = emb.dim();
-    // Candle's multimodal model maps text and media into the same 768-D
-    // space. Keep the legacy 256-D hash media space for llama/hash models so
-    // existing indexes remain compatible with their backend.
-    let shared_media = info.backend == "candle"
-        && info.modalities.iter().any(|m| matches!(m.as_str(), "image" | "audio" | "video"));
+    // 需求 #7（GPU 利用率）：原来这里写死 `info.backend == "candle"`，于是任何
+    // 走 llama.cpp(GGUF) 的多模态模型都会被判成「不支持共享媒体空间」，图片全部
+    // 退回 256 维 HashEmbedder（纯 CPU 哈希），GGUF 自带的视觉塔一次都不跑 ——
+    // 这就是「索引时 GPU 占用几乎为零」的结构性原因之一。
+    // 判据应该是**模型自报有没有 media 模态**，与它跑在哪个后端无关：
+    //   · candle + image  → 共享（原有行为不变）
+    //   · llama  + image  → 共享（本次修复，需模型同目录带 mmproj 且加载成功）
+    //   · 纯文本模型      → 仍走 256 维 hash 媒体空间（保持旧库兼容）
+    let shared_media = info.modalities.iter().any(|m| matches!(m.as_str(), "image" | "audio" | "video"));
     let media_dim = if shared_media { dim } else { 256 };
     let media_embedder: Arc<dyn crate::ai::Embedder> = if shared_media {
         Arc::clone(&emb)
     } else {
         Arc::new(crate::ai::hash::HashEmbedder::new())
     };
-    cfg.model.embedding_dim = dim;
     let _ = cfg.save(&crate::config::config_path(Some(&state.app_dir)));
     *state.cfg.write() = cfg;
     // Cross-modal encoders are opt-in and are loaded only after the user
@@ -1318,11 +1341,6 @@ fn split_path_parts(p: &str) -> Vec<&str> {
     p.split('\\').filter(|s| !s.is_empty()).collect()
 }
 
-/// `parts` 是否以 `prefix` 开头（Windows 路径不区分大小写）。
-fn path_starts_with(parts: &[&str], prefix: &[&str]) -> bool {
-    parts.len() >= prefix.len()
-        && prefix.iter().enumerate().all(|(i, s)| parts[i].eq_ignore_ascii_case(s))
-}
 
 fn path_display_name(path: &str) -> String {
     match split_path_parts(path).last() {
@@ -1333,46 +1351,28 @@ fn path_display_name(path: &str) -> String {
     }
 }
 
-fn join_child(dir: &str, name: &str) -> String {
-    if dir.ends_with('\\') {
-        format!("{dir}{name}")
-    } else {
-        format!("{dir}\\{name}")
-    }
-}
-
 /// 索引根层：每个已添加的盘符 / 根目录一个节点。
 fn tree_roots(db: &crate::db::Db) -> TreeLevel {
     let roots = db.index_roots().unwrap_or_default();
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut total_files = 0i64;
     let mut total_bytes = 0i64;
+    // 需求 #2（1TB 库卡顿）：原来对每个索引根各跑一次全子树 GROUP BY，把该根下
+    // **每一层**目录都拉回内存再手工累加。现在全库目录聚合只跑一条 GROUP BY
+    // （33,608 行 63 ms），每个根在内存里取自己那一份 —— 根再多也只扫一次库。
+    let all_dirs = db.all_dir_rollup().unwrap_or_default();
     for r in roots {
-        let rows = db.dir_rollup_under(&r.root).unwrap_or_default();
-        let prefix_parts = split_path_parts(&r.root);
-        let mut files = 0i64;
-        let mut bytes = 0i64;
-        let mut deep_files = 0i64;
-        let mut deep_bytes = 0i64;
-        // 子目录按「第一段」去重：有些目录只有子目录、自己没有直属文件，
-        // 在 GROUP BY dir 里根本不会出现，逐行数会漏掉它们。
-        let mut child_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (dir, count, size) in &rows {
-            let parts = split_path_parts(dir);
-            if !path_starts_with(&parts, &prefix_parts) {
-                continue;
-            }
-            deep_files += *count;
-            deep_bytes += *size;
-            let rel = &parts[prefix_parts.len()..];
-            if rel.is_empty() {
-                files += *count;
-                bytes += *size;
-            } else {
-                child_names.insert(rel[0].to_lowercase());
-            }
+        let root_key = dir_lookup_key(&r.root);
+        let (folded, own) = fold_dir_children(&all_dirs, &root_key);
+        let mut deep_files = own.0;
+        let mut deep_bytes = own.1;
+        for list in folded.get(&root_key).map(|v| v.as_slice()).unwrap_or(&[]) {
+            deep_files += list.1;
+            deep_bytes += list.2;
         }
-        let dirs = child_names.len() as i64;
+        let files = own.0;
+        let bytes = own.1;
+        let dirs = folded.get(&root_key).map(|v| v.len()).unwrap_or(0) as i64;
         total_files += deep_files;
         total_bytes += deep_bytes;
         entries.push(TreeEntry {
@@ -1409,41 +1409,43 @@ fn tree_roots(db: &crate::db::Db) -> TreeLevel {
 /// 展开某个目录：直属子目录（按名字自然排序）+ 直属文件（按修改时间倒序，最多 200 条）。
 fn tree_level(db: &crate::db::Db, path: &str, file_limit: usize) -> TreeLevel {
     let norm = crate::util::norm_path(path);
-    let prefix_parts = split_path_parts(&norm);
-    let rows = db.dir_rollup_under(&norm).unwrap_or_default();
+    // 需求 #2（1TB 库卡顿）：这里原来走 dir_rollup_under，会把该目录下
+    // **每一层**的目录行全拉回内存再在 Rust 侧反推直接子目录聚合。28 万文件
+    // 时是 33,608 行，1TB 库是数十万行，用户点开一层要付几十毫秒到秒级。
+    // 现在只剩「全库目录聚合 + 内存折叠」一条固定开销的查询，外加一次
+    // 走 ix_files_dir_size 的直属文件查询（实测 0.3 ms）。
+    let (direct_files, _direct_bytes, dir_text_ok, dir_embed_ok) =
+        db.dir_file_stats(&norm).unwrap_or((0, 0, 0, 0));
 
-    let mut direct_files = 0i64;
-    let mut total_files = 0i64;
-    let mut total_bytes = 0i64;
-    // 子目录：key = 小写名，value = (原始名, 完整路径, 递归文件数, 递归字节, 直属文件数)
-    let mut child_map: std::collections::BTreeMap<String, (String, String, i64, i64, i64)> =
-        std::collections::BTreeMap::new();
-    for (dir, count, size) in &rows {
-        total_files += *count;
-        total_bytes += *size;
-        let parts = split_path_parts(dir);
-        if !path_starts_with(&parts, &prefix_parts) {
-            continue;
-        }
-        let rel = &parts[prefix_parts.len()..];
-        if rel.is_empty() {
-            direct_files += *count;
-            continue;
-        }
-        let name = rel[0].to_string();
-        let key = name.to_lowercase();
-        let child_path = join_child(&norm, &name);
-        let e = child_map.entry(key).or_insert((name, child_path, 0, 0, 0));
-        e.2 += *count;
-        e.3 += *size;
-        if rel.len() == 1 {
-            e.4 += *count;
-        }
+    let root_key = dir_lookup_key(&norm);
+    let all_dirs = db.all_dir_rollup().unwrap_or_default();
+    let (folded, own) = fold_dir_children(&all_dirs, &root_key);
+    let children: Vec<(String, i64, i64)> = folded.get(&root_key).cloned().unwrap_or_default();
+    // 递归总量：自己的直属 + 各直接子目录的子树合计。
+    let mut total_files = own.0;
+    let mut total_bytes = own.1;
+    for (_, count, bytes) in &children {
+        total_files += count;
+        total_bytes += bytes;
     }
+    // 各子目录的直属文件数：走一条 IN 查询（ix_files_dir_size 覆盖），
+    // 子目录上百个也只有一次往返。折叠结果给的是子树合计，不是直属。
+    let child_paths: Vec<String> = children.iter().map(|(p, _, _)| p.clone()).collect();
+    let direct_counts = db.dir_direct_counts(&child_paths).unwrap_or_default();
 
-    let child_count = child_map.len() as i64;
-    let mut entries: Vec<TreeEntry> = Vec::with_capacity(child_map.len() + 32);
-    for (_, (name, child_path, files, bytes, direct)) in child_map {
+    // 大小写不敏感去重：Windows 上 E:\A 与 e:\a 是同一个目录，但 files.dir
+    // 保留的是写入时的原始大小写，GROUP BY 会把它分成两行。
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut entries: Vec<TreeEntry> = Vec::with_capacity(children.len() + 32);
+    for (child_path, count, bytes) in children {
+        if child_path.eq_ignore_ascii_case(&norm) {
+            continue;
+        }
+        let name = path_display_name(&child_path);
+        if !seen.insert(name.to_lowercase()) {
+            continue;
+        }
+        let direct = direct_counts.get(&child_path).map(|v| v.0).unwrap_or(0);
         entries.push(TreeEntry {
             name,
             path: child_path,
@@ -1454,13 +1456,16 @@ fn tree_level(db: &crate::db::Db, path: &str, file_limit: usize) -> TreeLevel {
             mtime: 0,
             files: direct,
             dirs: 0,
-            total_files: files,
+            total_files: count,
             total_bytes: bytes,
             indexed: 0,
             pending: 0,
             error: String::new(),
         });
     }
+    // 与原 BTreeMap 一致：按名字升序，面板里的目录顺序不会跳动。
+    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let child_count = entries.len() as i64;
 
     // 直属文件：一次查询，按修改时间倒序，超出上限的部分用 hidden_files 提示。
     let file_rows = db.query_rows(
@@ -1472,7 +1477,7 @@ fn tree_level(db: &crate::db::Db, path: &str, file_limit: usize) -> TreeLevel {
         ],
     );
     // 索引进度按「整个目录」算（含未列出的文件），否则只统计前 200 条会偏低。
-    let (_, _, dir_text_ok, dir_embed_ok) = db.dir_file_stats(&norm).unwrap_or((0, 0, 0, 0));
+    // dir_file_stats 已经在函数开头查过一次，这里直接复用，避免同一条聚合跑两遍。
     let indexed = dir_text_ok.max(dir_embed_ok);
     let pending = (direct_files - indexed).max(0);
     for f in &file_rows {
@@ -1536,12 +1541,19 @@ pub fn tree_search(
         return Vec::new();
     }
     let cap = limit.unwrap_or(200).clamp(1, 500);
-    let rows = match state.db.dir_rollup() {
+    // 需求 #2：原来 `dir_rollup()` 会把全库每一个目录都拉进内存再逐行 contains，
+    // 28 万文件库就是 3.3 万行 + 一次完整 GROUP BY；1TB 库会到数十万行。
+    // 现在把名字过滤下推到 SQLite，只回真正命中的目录行。
+    // 多取一倍：目录名相同、路径不同的几条要按文件数排序后截断。
+    let rows = match state.db.dir_name_search(&q, cap.saturating_mul(4)) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-    let mut hits: Vec<TreeEntry> = Vec::new();
+    let mut hits: Vec<TreeEntry> = Vec::with_capacity(rows.len());
     for (dir, count, size) in rows {
+        // LIKE 只是粗筛：它也会命中「父目录含该词」的路径（E:\pixiv2\x 之于
+        // pixiv）。面板显示的是最后一段名字，所以这里再按名字精确过滤一次，
+        // 语义与旧的 name.contains() 完全一致，只是候选集小了三个数量级。
         let name = path_display_name(&dir);
         if !name.to_lowercase().contains(&q) {
             continue;
@@ -1774,6 +1786,534 @@ pub fn available_drives() -> Vec<String> {
     }
 }
 
+// ---------------------------------------------------------------- 星系图谱
+//
+// 需求（REQ-042~052 / REQ-066~069）：图谱视图与搜索结果列表共享 GraphNode /
+// GraphEdge 数据模型。这里只做「一次取一层」的骨架数据，展开子层由前端用
+// tree_browse 增量追加，避免 14 万文件时把整棵树塞进一次 IPC。
+#[derive(Serialize)]
+pub struct GraphNode {
+    /// 稳定 ID：文件夹用完整路径，文件用 `f:<路径>`，前端据此做去重与增量合并。
+    pub id: String,
+    /// "folder" | "file"
+    pub node_type: String,
+    pub name: String,
+    pub path: String,
+    /// 文件类型：image/video/audio/document/text/archive/app/other；文件夹为空串。
+    pub kind: String,
+    pub size: i64,
+    /// 文件夹的递归文件数；文件恒为 1。
+    pub count: i64,
+    /// 相对根的层级，根为 0。
+    pub depth: i64,
+    pub mtime: i64,
+}
+
+#[derive(Serialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    /// contains | similar
+    pub edge_type: String,
+    pub strength: f64,
+}
+
+#[derive(Serialize)]
+pub struct GraphData {
+    pub root: String,
+    pub name: String,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub total_files: i64,
+    pub total_bytes: i64,
+    /// 因 max_nodes 被折叠掉的目录数（前端显示「+N」）。
+    pub truncated: i64,
+}
+
+/// 图谱骨架：根 + `depth` 层目录 + 每层目录下「按大小取前 N」的文件。
+#[tauri::command]
+pub fn graph_data(
+    state: State<'_, Arc<AppState>>,
+    root: Option<String>,
+    depth: Option<usize>,
+    max_nodes: Option<usize>,
+    file_limit: Option<usize>,
+) -> GraphData {
+    let depth = depth.unwrap_or(2).clamp(1, 6);
+    let max_nodes = max_nodes.unwrap_or(900).clamp(40, 8000);
+    let file_limit = file_limit.unwrap_or(31).clamp(0, 500);
+
+    // 根：显式传入优先，否则取第一个索引根；再不行就用全库。
+    let root = root
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| {
+            state
+                .db
+                .index_roots()
+                .ok()
+                .and_then(|v| v.into_iter().map(|r| r.root).find(|r| !r.trim().is_empty()))
+                .unwrap_or_default()
+        });
+    let root = if root.is_empty() { String::new() } else { crate::util::norm_path(&root) };
+
+    // 需求 #2（1TB 库卡顿）：这里原来调 dir_rollup_under(&root) 把**整棵子树**
+    // 每一层目录一次性拉回内存（1TB 库里可达数十万行），再建 HashMap 反推父聚合。
+    // 现在整棵树只在内存里折叠一次（all_dir_rollup 一条 GROUP BY，33,608 行
+    // 实测 63 ms），root 的递归合计也从这个结果里顺手累加，不再单独跑
+    // dir_recursive_stats（28 万行库上那一条要 142 ms）。
+    // 逐层向下建目录节点，每层最多保留 max_nodes 个（按递归文件数降序）。
+    let mut nodes: Vec<GraphNode> = Vec::new();
+    let mut edges: Vec<GraphEdge> = Vec::new();
+    let mut truncated = 0i64;
+
+    let mut root_key = split_path_parts(&root).join("\\");
+    // 全库目录聚合一次拿回来（63 ms / 33,608 行），在内存里折叠成
+    // 「目录 → 直接子目录 + 子树合计」，同时把 root 自己的直属统计带出来。
+    // 逐层展开时只想拿当前层，但每层重新查 SQL 的代价是 290 ms × 目录数，
+    // 那才是首屏 17 秒的元凶。图里 root 的递归总量也由它给出，
+    // 不再单独跑 dir_recursive_stats。
+    let (dir_children, root_own) = {
+        let rows = state.db.all_dir_rollup().unwrap_or_default();
+        fold_dir_children(&rows, &root_key)
+    };
+    let mut total_files = root_own.0;
+    let mut total_bytes = root_own.1;
+    for list in dir_children.get(&root_key).map(|v| v.as_slice()).unwrap_or(&[]) {
+        total_files += list.1;
+        total_bytes += list.2;
+    }
+    // 用库里的真实大小写：第 0 层的直属文件查询是 `dir = ?1`（BINARY 比较），
+    // 外部传进来的 `d:\foo` 与库里的 `D:\Foo` 对不上就会一片空白。
+    // 只有在真的查不到时才付一次 NOCASE 扫描的代价，正常路径零成本。
+    if total_files == 0 && !root_key.is_empty() {
+        if let Some(canon) = state.db.canonical_dir(&root_key) {
+            root_key = canon;
+        }
+    }
+    let root_count = total_files;
+    let root_bytes = total_bytes;
+    let root_id = if root.is_empty() { ":root".to_string() } else { root_key.clone() };
+    nodes.push(GraphNode {
+        id: root_id.clone(),
+        node_type: "folder".into(),
+        name: path_display_name(&root_key),
+        path: root_key.clone(),
+        kind: String::new(),
+        size: root_bytes,
+        count: root_count,
+        depth: 0,
+        mtime: 0,
+    });
+
+    // level_dirs：当前层的目录 (路径, 深度)。逐层展开，超出预算的折叠计数。
+    let mut level_dirs: Vec<(String, i64)> = vec![(root_key.clone(), 0)];
+    for level in 0..depth {
+        let mut next: Vec<(String, i64)> = Vec::new();
+        for dir in &level_dirs {
+            // 该目录的直属子目录：从内存折叠结果里取，不再进 SQL。
+            // dir_children 是「目录 → 直接子目录聚合」的整棵树（一次构建，
+            // 逐层复用），这里只做预算裁剪。
+            let dir_norm = crate::util::norm_path(&dir.0);
+            let mut children: Vec<(String, i64, i64)> =
+                dir_children.get(&dir_norm).cloned().unwrap_or_default();
+            if children.len() > max_nodes.saturating_sub(nodes.len()) {
+                let keep = max_nodes.saturating_sub(nodes.len());
+                truncated += (children.len() - keep) as i64;
+                children.truncate(keep);
+            }
+            for (child_path, count, bytes) in children {
+                let id = child_path.clone();
+                nodes.push(GraphNode {
+                    id: id.clone(),
+                    node_type: "folder".into(),
+                    name: path_display_name(&child_path),
+                    path: child_path.clone(),
+                    kind: String::new(),
+                    size: bytes,
+                    count,
+                    depth: level as i64 + 1,
+                    mtime: 0,
+                });
+                edges.push(GraphEdge {
+                    source: if dir_norm.is_empty() { ":root".into() } else { dir_norm.clone() },
+                    target: id,
+                    edge_type: "contains".into(),
+                    strength: 1.0,
+                });
+                if level + 1 < depth {
+                    next.push((child_path, level as i64 + 1));
+                }
+            }
+
+            // 直属文件：按大小降序取前 file_limit 个（需求 REQ-035 抽样展示）。
+            if file_limit > 0 {
+                let files = state.db.query_rows(
+                    "SELECT id,path,dir,name,ext,kind,size,mtime,ctime,text_len,text_state,embed_state,thumb_key,category,tags \
+                     FROM files WHERE missing=0 AND dir = ?1 ORDER BY size DESC, mtime DESC LIMIT ?2",
+                    vec![
+                        rusqlite::types::Value::Text(dir_norm.clone()),
+                        rusqlite::types::Value::Integer(file_limit as i64),
+                    ],
+                );
+                let mut wanted: Vec<&FileRow> = files.iter().collect();
+                let room = max_nodes.saturating_sub(nodes.len());
+                if wanted.len() > room {
+                    truncated += (wanted.len() - room) as i64;
+                    wanted.truncate(room);
+                }
+                for f in wanted {
+                    let id = format!("f:{}", f.path);
+                    nodes.push(GraphNode {
+                        id: id.clone(),
+                        node_type: "file".into(),
+                        name: f.name.clone(),
+                        path: f.path.clone(),
+                        kind: f.kind.clone(),
+                        size: f.size,
+                        count: 1,
+                        depth: level as i64 + 1,
+                        mtime: f.mtime,
+                    });
+                    edges.push(GraphEdge {
+                        source: if dir_norm.is_empty() { ":root".into() } else { dir_norm.clone() },
+                        target: id,
+                        edge_type: "contains".into(),
+                        strength: 1.0,
+                    });
+                }
+            }
+            if nodes.len() >= max_nodes {
+                break;
+            }
+        }
+        if next.is_empty() || nodes.len() >= max_nodes {
+            break;
+        }
+        level_dirs = next;
+    }
+
+    GraphData {
+        name: path_display_name(&root_key),
+        // 回传库里的真实大小写与规范分隔符，前端面包屑与「以此为根」才能对上。
+        root: root_key,
+        nodes,
+        edges,
+        total_files,
+        total_bytes,
+        truncated,
+    }
+}
+
+
+// ---------------------------------------------------------------- 思维模型图
+//
+// 需求 REQ-053~061：八种思维模型图（界定 / 描述 / 比较 / 分类 / 拆解 / 顺序 /
+// 因果 / 类比）。八种图共用同一个「分组 + 条目」的数据形状，前端只负责画法差异，
+// 这样后端一次查询就能支撑全部模型，切换模型不需要重新打磁盘。
+#[derive(Serialize)]
+pub struct MindItem {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub ext: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub dir: String,
+}
+
+#[derive(Serialize)]
+pub struct MindGroup {
+    pub key: String,
+    pub label: String,
+    pub count: i64,
+    pub bytes: i64,
+    pub color: String,
+    pub items: Vec<MindItem>,
+}
+
+#[derive(Serialize)]
+pub struct MindMapOut {
+    pub model: String,
+    pub title: String,
+    pub subtitle: String,
+    pub groups: Vec<MindGroup>,
+    pub total_files: i64,
+    pub total_bytes: i64,
+    pub buckets: Vec<String>,
+}
+
+/// 每个分组最多带回多少条目（前端做「显示更多」）。
+const MIND_GROUP_CAP: usize = 120;
+
+fn kind_label_of(kind: &str) -> &'static str {
+    match kind {
+        "image" => "图片",
+        "video" => "视频",
+        "audio" => "音频",
+        "document" => "文档",
+        "text" => "文本",
+        "archive" => "压缩包",
+        "app" => "程序",
+        _ => "其他",
+    }
+}
+
+fn kind_color_of(kind: &str) -> &'static str {
+    match kind {
+        "image" => "#B07AA1",
+        "video" => "#E15759",
+        "audio" => "#76B7B2",
+        "document" => "#59A14F",
+        "text" => "#F28E2B",
+        "archive" => "#EDC948",
+        "app" => "#FF9DA7",
+        _ => "#9C755F",
+    }
+}
+
+/// 时间桶标签：2026-10 / 2026-09 …（顺序图、作用图共用）。
+fn month_bucket(mtime: i64) -> String {
+    if mtime <= 0 {
+        return "未知时间".into();
+    }
+    let days = mtime / 86_400;
+    // 从 1970-01-01 起算的民用历法换算（不需要时区信息，够用即可）
+    let mut year = 1970i64;
+    let mut rest = days;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let len = if leap { 366 } else { 365 };
+        if rest < len {
+            break;
+        }
+        rest -= len;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let lens = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1;
+    for l in lens {
+        if rest < l {
+            break;
+        }
+        rest -= l;
+        month += 1;
+    }
+    format!("{}-{:02}", year, month)
+}
+
+fn mind_item(row: &FileRow) -> MindItem {
+    MindItem {
+        name: row.name.clone(),
+        path: row.path.clone(),
+        kind: row.kind.clone(),
+        ext: row.ext.clone(),
+        size: row.size,
+        mtime: row.mtime,
+        dir: row.dir.clone(),
+    }
+}
+
+/// 按 key 归组的小工具：保持首次出现顺序，超出上限的只计数不返回条目。
+fn push_group(
+    groups: &mut Vec<MindGroup>,
+    key: &str,
+    label: &str,
+    color: &str,
+    item: MindItem,
+) {
+    if let Some(g) = groups.iter_mut().find(|g| g.key == key) {
+        g.count += 1;
+        g.bytes += item.size;
+        if g.items.len() < MIND_GROUP_CAP {
+            g.items.push(item);
+        }
+        return;
+    }
+    let mut g = MindGroup {
+        key: key.to_string(),
+        label: label.to_string(),
+        count: 1,
+        bytes: item.size,
+        color: color.to_string(),
+        items: Vec::new(),
+    };
+    g.items.push(item);
+    groups.push(g);
+}
+
+/// 八种思维模型图的数据。paths 为空时退回「最近 400 个已索引文件」。
+#[tauri::command]
+pub fn mind_map_data(
+    state: State<'_, Arc<AppState>>,
+    model: String,
+    paths: Vec<String>,
+    query: Option<String>,
+) -> MindMapOut {
+    // ---- 取数据：按路径 ID 分批查，单批 400 个避免 SQLite 变量上限。
+    let mut rows: Vec<FileRow> = Vec::new();
+    let wanted: Vec<String> = paths
+        .iter()
+        .map(|p| crate::util::norm_path(p))
+        .filter(|p| !p.trim().is_empty())
+        .take(2000)
+        .collect();
+    if wanted.is_empty() {
+        rows = state.db.query_rows(
+            "SELECT id,path,dir,name,ext,kind,size,mtime,ctime,text_len,text_state,embed_state,thumb_key,category,tags \
+             FROM files WHERE missing=0 ORDER BY mtime DESC LIMIT 400",
+            vec![],
+        );
+    } else {
+        for chunk in wanted.chunks(400) {
+            let mut sql = String::from(
+                "SELECT id,path,dir,name,ext,kind,size,mtime,ctime,text_len,text_state,embed_state,thumb_key,category,tags \
+                 FROM files WHERE path IN (",
+            );
+            let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len());
+            for (i, p) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("?{}", i + 1));
+                args.push(rusqlite::types::Value::Text(p.clone()));
+            }
+            sql.push(')');
+            rows.extend(state.db.query_rows(&sql, args));
+        }
+    }
+
+    let mut total_files = 0i64;
+    let mut total_bytes = 0i64;
+    let mut groups: Vec<MindGroup> = Vec::new();
+    let query = query.unwrap_or_default();
+    let query = query.trim().to_string();
+
+    match model.as_str() {
+        // REQ-053 界定图：回答「这是什么」，按文件类型分组。
+        "definition" => {
+            for r in &rows {
+                total_files += 1;
+                total_bytes += r.size;
+                let k = if r.kind.is_empty() { "other" } else { r.kind.as_str() };
+                push_group(&mut groups, k, kind_label_of(k), kind_color_of(k), mind_item(r));
+            }
+        }
+        // REQ-054 描述图：中心辐射 —— 以目录为辐射源。
+        "description" => {
+            for r in &rows {
+                total_files += 1;
+                total_bytes += r.size;
+                let label = path_display_name(&r.dir);
+                push_group(&mut groups, &r.dir, &label, kind_color_of(&r.kind), mind_item(r));
+            }
+        }
+        // REQ-055 比较图：两两比较 —— 按类型分集合，前端画韦恩图。
+        "comparison" => {
+            for r in &rows {
+                total_files += 1;
+                total_bytes += r.size;
+                let k = if r.kind.is_empty() { "other" } else { r.kind.as_str() };
+                push_group(&mut groups, k, kind_label_of(k), kind_color_of(k), mind_item(r));
+            }
+            groups.sort_by(|a, b| b.count.cmp(&a.count));
+        }
+        // REQ-056 分类图：树状分类 —— 按扩展名分层。
+        "classification" => {
+            for r in &rows {
+                total_files += 1;
+                total_bytes += r.size;
+                let ext = if r.ext.is_empty() { "(无扩展名)".to_string() } else { format!(".{}", r.ext) };
+                push_group(&mut groups, &ext, &ext, kind_color_of(&r.kind), mind_item(r));
+            }
+            groups.sort_by(|a, b| b.count.cmp(&a.count));
+        }
+        // REQ-057 拆解图：从整体拆到部分组成 —— 类型 → 扩展名两级。
+        "decomposition" => {
+            for r in &rows {
+                total_files += 1;
+                total_bytes += r.size;
+                let k = if r.kind.is_empty() { "other" } else { r.kind.as_str() };
+                let ext = if r.ext.is_empty() { "无扩展名".to_string() } else { r.ext.clone() };
+                let key = format!("{}/{}", k, ext);
+                let label = format!("{} · {}", kind_label_of(k), ext);
+                push_group(&mut groups, &key, &label, kind_color_of(k), mind_item(r));
+            }
+            groups.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        }
+        // REQ-058 顺序图：时间线 —— 按月分桶。
+        "sequence" => {
+            for r in &rows {
+                total_files += 1;
+                total_bytes += r.size;
+                let bucket = month_bucket(r.mtime);
+                push_group(&mut groups, &bucket, &bucket, kind_color_of(&r.kind), mind_item(r));
+            }
+            groups.sort_by(|a, b| b.key.cmp(&a.key));
+        }
+        // REQ-059 因果图：桑基 —— 「目录 → 类型」的流转关系。
+        "causality" => {
+            for r in &rows {
+                total_files += 1;
+                total_bytes += r.size;
+                let k = if r.kind.is_empty() { "other" } else { r.kind.as_str() };
+                let label = path_display_name(&r.dir);
+                push_group(&mut groups, &format!("{}|{}", r.dir, k), &format!("{} → {}", label, kind_label_of(k)), kind_color_of(k), mind_item(r));
+            }
+            groups.sort_by(|a, b| b.count.cmp(&a.count));
+        }
+        // REQ-060 类比图：平行对照 —— 按「同类同扩展名」配对。
+        "analogy" => {
+            for r in &rows {
+                total_files += 1;
+                total_bytes += r.size;
+                let k = if r.kind.is_empty() { "other" } else { r.kind.as_str() };
+                let ext = if r.ext.is_empty() { "- " } else { r.ext.as_str() };
+                push_group(&mut groups, &format!("{}:{}", k, ext), &format!("{} · {}", kind_label_of(k), ext), kind_color_of(k), mind_item(r));
+            }
+            groups.sort_by(|a, b| b.count.cmp(&a.count));
+        }
+        // REQ-061 默认：按文件类型（与界定图一致，保证未知模型也有输出）。
+        _ => {
+            for r in &rows {
+                total_files += 1;
+                total_bytes += r.size;
+                let k = if r.kind.is_empty() { "other" } else { r.kind.as_str() };
+                push_group(&mut groups, k, kind_label_of(k), kind_color_of(k), mind_item(r));
+            }
+        }
+    }
+
+    let (title, subtitle) = match model.as_str() {
+        "definition" => ("界定图".to_string(), "这批文件「是什么」——按类型界定边界".to_string()),
+        "description" => ("描述图".to_string(), "这批文件「有什么特征」——从目录向外辐射".to_string()),
+        "comparison" => ("比较图".to_string(), "这批文件「有什么不同」——各类型的规模对比".to_string()),
+        "classification" => ("分类图".to_string(), "这批文件「怎么归类」——按扩展名分层".to_string()),
+        "decomposition" => ("拆解图".to_string(), "这批文件「由什么构成」——类型拆到扩展名".to_string()),
+        "sequence" => ("顺序图".to_string(), "这批文件「按时间怎么排」——月份时间线".to_string()),
+        "causality" => ("因果图".to_string(), "这批文件「从哪来到哪去」——目录到类型的流向".to_string()),
+        "analogy" => ("类比图".to_string(), "这批文件「像什么」——同类同格式的平行对照".to_string()),
+        _ => ("思维模型图".to_string(), "按文件类型分组".to_string()),
+    };
+
+    let buckets: Vec<String> = if model == "sequence" {
+        groups.iter().map(|g| g.key.clone()).collect()
+    } else {
+        Vec::new()
+    };
+
+    MindMapOut {
+        model,
+        title: if query.is_empty() { title } else { format!("{} · {}", title, query) },
+        subtitle,
+        groups,
+        total_files,
+        total_bytes,
+        buckets,
+    }
+}
+
 // ---------------------------------------------------------------- 树状图
 #[derive(Serialize)]
 pub struct TreeNode {
@@ -1788,126 +2328,215 @@ pub struct TreeNode {
 #[tauri::command]
 pub fn tree_data(state: State<'_, Arc<AppState>>, root: Option<String>, depth: Option<usize>) -> TreeNode {
     let depth = depth.unwrap_or(3).clamp(1, 8);
-    let rows = state
-        .db
-        .query_rows(
-            "SELECT id,path,dir,name,ext,kind,size,mtime,ctime,text_len,text_state,embed_state,thumb_key,category,tags FROM files WHERE missing=0",
-            vec![],
-        );
-    // 不指定根目录时，从「所有已索引文件的公共父目录」开始，
-    // 而不是从盘符（C:\）开始 —— 否则用户要连点五六层才能看到自己的文件夹。
+    // 需求 #2（1TB 库卡顿）：原来把 files 整表拉进内存（现在 28.1 万行，1 TB 库是
+    // 几百万行）再逐行 reduce。改成先在库里按 (dir, kind) 聚合：28 万行库上只回
+    // 37,264 行 / 约 310 ms，且规模只跟「目录 × 类型」数走，与文件总数脱钩。
+    let rows = state.db.all_dir_kind_rollup().unwrap_or_default();
+    // 不指定根目录时，从「所有已索引文件的公共父目录」开始，而不是从盘符（C:\）
+    // 开始 —— 否则用户要连点五六层才能看到自己的文件夹。
     let root = match root {
         Some(r) if !r.trim().is_empty() => r,
         _ => smart_root(&rows).unwrap_or_default(),
     };
-    let row_refs: Vec<&FileRow> = rows.iter().collect();
-    build_tree(&row_refs, &root, depth)
+    build_tree(&rows, &root, depth)
 }
 
-/// 所有文件所在目录的最长公共前缀（按路径分隔符对齐）。
-fn common_root(rows: &[FileRow]) -> Option<String> {
-    let mut iter = rows.iter().filter(|r| !r.dir.is_empty());
-    let first = iter.next()?.dir.clone();
-    let mut prefix: Vec<String> = first.split('\\').map(|s| s.to_string()).collect();
-    for r in iter {
-        let parts: Vec<&str> = r.dir.split('\\').collect();
-        let mut n = 0;
-        while n < prefix.len()
-            && n < parts.len()
-            && prefix[n].eq_ignore_ascii_case(parts[n])
-        {
-            n += 1;
-        }
-        prefix.truncate(n);
-        if prefix.is_empty() {
-            return None;
-        }
-    }
-    Some(prefix.join("\\"))
+/// 树状图单个节点的子树聚合（文件数、字节数、各类文件数）。
+#[derive(Default, Clone)]
+struct TreeSlice {
+    count: i64,
+    size: i64,
+    kinds: std::collections::HashMap<String, i64>,
 }
 
-/// 如果公共前缀浅到只剩盘符（`C:`），树状图会退化成一整块盘，用户要点五六层
-/// 才能看到自己的目录。这时改取「文件数最多的那条路径分支」作为根。
-fn smart_root(rows: &[FileRow]) -> Option<String> {
-    let common = common_root(rows)?;
-    let parts: Vec<&str> = common.split('\\').filter(|s| !s.is_empty()).collect();
-    if parts.len() > 1 {
-        return Some(common);
-    }
-    let mut tally: std::collections::HashMap<String, (usize, u64)> = std::collections::HashMap::new();
-    for r in rows.iter().filter(|r| !r.dir.is_empty()) {
-        let ps: Vec<&str> = r.dir.split('\\').filter(|s| !s.is_empty()).collect();
-        // 盘符 + 一级目录（`C:\Users`）；没有一级目录就只用盘符
-        let key = if ps.len() >= 2 {
-            format!("{}\\{}", ps[0], ps[1])
-        } else {
-            ps[0].to_string()
-        };
-        let e = tally.entry(key).or_insert((0, 0));
-        e.0 += 1;
-        e.1 += r.size.max(0) as u64;
-    }
-    tally
-        .into_iter()
-        .max_by_key(|(_, (n, bytes))| (*n, *bytes))
-        .map(|(k, _)| k)
-        .or(Some(common))
-}
-
-fn build_tree(rows: &[&FileRow], root: &str, depth: usize) -> TreeNode {
-    let root_norm = root.trim_end_matches('\\').to_lowercase();
-    let mut node = TreeNode {
-        path: root.to_string(),
-        name: if root.is_empty() {
-            "全部".into()
-        } else {
-            Path::new(root)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| root.to_string())
-        },
-        size: 0,
-        count: 0,
-        kinds: std::collections::HashMap::new(),
-        children: vec![],
-    };
-    let mut buckets: std::collections::HashMap<String, Vec<&FileRow>> = std::collections::HashMap::new();
-    for r in rows {
-        if !root_norm.is_empty() && !r.path.to_lowercase().starts_with(&root_norm) {
+/// 全库「文件数最多的那条分支」，给树状图当默认根。
+///
+/// 先取所有目录的最长公共前缀：段数 > 1 就直接用它；只剩盘符时说明数据横跨
+/// 多个一级目录，此时退化成「文件数最多的一级目录」，避免用户从盘符开始连点。
+fn smart_root(rows: &[(String, String, i64, i64)]) -> Option<String> {
+    let mut per_dir: HashMap<String, (i64, i64)> = HashMap::new();
+    for (dir, _kind, count, bytes) in rows {
+        if dir.is_empty() {
             continue;
         }
-        node.size += r.size;
-        node.count += 1;
-        *node.kinds.entry(r.kind.clone()).or_insert(0) += 1;
-        if depth > 1 {
-            // 取 root 之后的第一层目录
-            let rest = if root_norm.is_empty() {
-                r.path.as_str()
-            } else {
-                &r.path[root_norm.len().min(r.path.len())..]
-            };
-            let rest = rest.trim_start_matches('\\');
-            if let Some(pos) = rest.find('\\') {
-                let seg = &rest[..pos];
-                let key = if root_norm.is_empty() {
-                    seg.to_string()
-                } else {
-                    format!("{}\\{}", root.trim_end_matches('\\'), seg)
-                };
-                buckets.entry(key).or_default().push(*r);
+        let e = per_dir.entry(dir.clone()).or_insert((0, 0));
+        e.0 += count;
+        e.1 += bytes;
+    }
+    if per_dir.is_empty() {
+        return None;
+    }
+    // 公共父目录：逐条求前缀交集（大小写不敏感，保留第一次见到的写法）。
+    let mut common: Option<Vec<String>> = None;
+    for dir in per_dir.keys() {
+        let parts: Vec<String> = dir
+            .split('\\')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        common = Some(match common {
+            None => parts,
+            Some(prev) => {
+                let mut n = 0;
+                while n < prev.len() && n < parts.len() && prev[n].eq_ignore_ascii_case(&parts[n]) {
+                    n += 1;
+                }
+                prev[..n].to_vec()
             }
+        });
+    }
+    let common = common.unwrap_or_default();
+    if common.len() > 1 {
+        return Some(common.join("\\"));
+    }
+    // 退化成盘符级：按「盘符 + 一级目录」计票，取文件数最多的那条。
+    let mut tally: HashMap<String, (String, i64, i64)> = HashMap::new();
+    for (dir, (count, bytes)) in &per_dir {
+        let ps: Vec<&str> = dir.split('\\').filter(|s| !s.is_empty()).collect();
+        if ps.is_empty() {
+            continue;
+        }
+        let (key, shown) = if ps.len() >= 2 {
+            (
+                format!("{}\\{}", ps[0].to_lowercase(), ps[1].to_lowercase()),
+                format!("{}\\{}", ps[0], ps[1]),
+            )
+        } else {
+            (ps[0].to_lowercase(), ps[0].to_string())
+        };
+        let e = tally.entry(key).or_insert((shown, 0, 0));
+        e.1 += count;
+        e.2 += bytes;
+    }
+    let best = tally
+        .into_iter()
+        .max_by_key(|(_, (_, n, b))| (*n, *b))
+        .map(|(_, (shown, _, _))| shown);
+    Some(best.unwrap_or_else(|| common.join("\\")))
+}
+
+/// 用 (dir, kind, count, bytes) 聚合行建树。
+///
+/// 一条 dir 行代表「某个目录里某一类文件的合计」。对每条行沿祖先链逐级累加，
+/// 就能得到每一层目录的子树合计 —— 每个节点只被遍历一次，不做重复扫描。
+/// 目录 key 统一小写（Windows 路径大小写不敏感），显示名保留原始写法。
+fn build_tree(rows: &[(String, String, i64, i64)], root: &str, depth: usize) -> TreeNode {
+    let root_parts: Vec<String> = split_path_parts(root)
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    let root_len = root_parts.len();
+    // 能累加到的最深层：root 是第 1 层，所以第 depth 层是 root_len + depth - 1。
+    let max_level = root_len + depth.saturating_sub(1);
+    let mut agg: HashMap<String, TreeSlice> = HashMap::new();
+    // 小写 key -> 原始大小写路径（第一次出现为准，用于显示与下钻）。
+    let mut display: HashMap<String, String> = HashMap::new();
+    // 父节点 key -> 直接子节点 key（BTreeSet 保证字典序，与原 keys.sort() 一致）。
+    let mut children: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    let mut total = TreeSlice::default();
+
+    for (dir, kind, count, bytes) in rows {
+        let parts: Vec<&str> = dir.split('\\').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let low: Vec<String> = parts.iter().map(|s| s.to_lowercase()).collect();
+        // 只统计 root 子树内的目录（按段比较，D:\wx 不会误吞 D:\wxy）。
+        if low.len() < root_len || low[..root_len] != root_parts[..] {
+            continue;
+        }
+        total.count += count;
+        total.size += bytes;
+        *total.kinds.entry(kind.clone()).or_insert(0) += count;
+
+        let limit = low.len().min(max_level);
+        let mut key = String::new();
+        let mut prev: Option<String> = None;
+        for k in 0..limit {
+            if k > 0 {
+                key.push('\\');
+            }
+            key.push_str(&low[k]);
+            let slot = agg.entry(key.clone()).or_default();
+            slot.count += count;
+            slot.size += bytes;
+            *slot.kinds.entry(kind.clone()).or_insert(0) += count;
+            display
+                .entry(key.clone())
+                .or_insert_with(|| parts[..=k].join("\\"));
+            // 从 root 的下一层开始登记父子边（parent 是 root 时 k == root_len）。
+            if let Some(parent) = &prev {
+                if k >= root_len {
+                    children
+                        .entry(parent.clone())
+                        .or_default()
+                        .insert(key.clone());
+                }
+            } else if root_len == 0 {
+                // root 为空 = 「全部」视图，第一段（盘符）直接挂在根节点下。
+                children
+                    .entry(String::new())
+                    .or_default()
+                    .insert(key.clone());
+            }
+            prev = Some(key.clone());
         }
     }
-    if depth > 1 {
-        let mut keys: Vec<String> = buckets.keys().cloned().collect();
-        keys.sort();
-        for k in keys {
-            if let Some(children) = buckets.get(&k) {
-                node.children.push(build_tree(children, &k, depth - 1));
-            }
-        }
-    }
+
+    let root_name = if root.is_empty() {
+        "全部".to_string()
+    } else {
+        Path::new(root)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| root.to_string())
+    };
+    let root_key: String = root_parts.join("\\");
+    let mut node = TreeNode {
+        path: root.to_string(),
+        name: root_name,
+        size: total.size,
+        count: total.count,
+        kinds: total.kinds,
+        children: Vec::new(),
+    };
+    node.children = tree_children(&root_key, depth, &agg, &display, &children);
     node
+}
+
+fn tree_children(
+    parent: &str,
+    depth_left: usize,
+    agg: &HashMap<String, TreeSlice>,
+    display: &HashMap<String, String>,
+    children: &HashMap<String, std::collections::BTreeSet<String>>,
+) -> Vec<TreeNode> {
+    if depth_left <= 1 {
+        return Vec::new();
+    }
+    let Some(keys) = children.get(parent) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(slice) = agg.get(key) else {
+            continue;
+        };
+        let path = display.get(key).cloned().unwrap_or_else(|| key.clone());
+        let name = Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        out.push(TreeNode {
+            path,
+            name,
+            size: slice.size,
+            count: slice.count,
+            kinds: slice.kinds.clone(),
+            children: tree_children(key, depth_left - 1, agg, display, children),
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------- 监控

@@ -19,8 +19,27 @@ const ACTIVE_FILE_DISPLAY_LIMIT: usize = 16;
 // Keep enough decoded images in flight to overlap disk/CPU work with the
 // single model forward pass. The channel is bounded so a large index cannot
 // retain an unbounded number of full-resolution rasters.
-const IMAGE_PREFETCH_CAPACITY: usize = 16;
-const IMAGE_GPU_BATCH_LIMIT: usize = 16;
+const IMAGE_PREFETCH_CAPACITY: usize = 32;
+/// 单次送进模型的图片上限。
+///
+/// 原来是 16，而 `ai::effective_batch_size` 在 7 GiB 空闲显存上会给出 32 ——
+/// 这里一刀砍半，等于让 GPU 每批只干一半的活就等下一轮 CPU 解码。
+/// 提高到 64 之后，真正的上限由 `ai::image_batch_ceiling`（按显存分档）
+/// 与 `effective_batch_size` 共同决定，索引时 GPU 不再空转。
+const IMAGE_GPU_BATCH_LIMIT: usize = 64;
+/// 文本抽取流水线的在途条数。
+///
+/// 文本路径原来是「整批抽取 → 整批编码」，抽取阶段 GPU 完全空转。
+/// 允许几条文本提前抽好排在通道里，GPU 编完一批立刻能拿到下一批，
+/// 同时把内存占用限制在几十 MB 量级（每条约 max_text_chars 字符）。
+const TEXT_PREFETCH_CAPACITY: usize = 64;
+
+/// 抽取完成、等待送进模型编码的文本。
+struct ExtractedText {
+    id: i64,
+    name: String,
+    text: String,
+}
 
 fn is_unsupported_backend_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
@@ -183,16 +202,18 @@ pub struct Indexer {
     last_checkpoint_error_log: AtomicU64,
     index_started_at: Mutex<Option<std::time::Instant>>,
     index_elapsed_millis: AtomicU64,
+    /// 上次把进度写回 `stats` 的时刻。见 `refresh_progress_throttled`。
+    last_progress_refresh: Mutex<Option<std::time::Instant>>,
 }
 
 impl Indexer {
     #[inline]
-    fn work_kind(row: &crate::db::FileRow) -> WorkKind {
-        if row.ext.eq_ignore_ascii_case("pdf") {
+    fn work_kind_of(kind: &str, ext: &str) -> WorkKind {
+        if ext.eq_ignore_ascii_case("pdf") {
             WorkKind::Pdf
-        } else if row.kind == "image" {
+        } else if kind == "image" {
             WorkKind::Image
-        } else if matches!(row.kind.as_str(), "text" | "document") {
+        } else if matches!(kind, "text" | "document") {
             WorkKind::Text
         } else {
             WorkKind::Other
@@ -256,6 +277,7 @@ impl Indexer {
             last_checkpoint_error_log: AtomicU64::new(0),
             index_started_at: Mutex::new(None),
             index_elapsed_millis: AtomicU64::new(0),
+            last_progress_refresh: Mutex::new(None),
         }
     }
 
@@ -319,6 +341,48 @@ impl Indexer {
         match roots {
             Some(roots) => self.db.index_progress_in_roots(what, &roots),
             None => self.db.index_progress(what),
+        }
+    }
+
+    /// 把数据库里的真实进度写回 `stats`，但最多每 `PROGRESS_REFRESH_INTERVAL` 一次。
+    ///
+    /// `index_progress` 是两条全表 `COUNT(*)`：28 万行的库上各要 30~70 ms，
+    /// 1 TB 的库上会涨到秒级。原实现在 `run_loop` 里**每处理完一批**就调一次，
+    /// 于是 GPU 刚要开始下一批就被两次全表扫描卡住 —— 这是"索引时 GPU 占用
+    /// 只有 10%"的直接元凶之一。
+    ///
+    /// 运行中的界面进度本来就靠内存计数器，数据库只在空闲/降频时才需要校准。
+    fn refresh_progress_throttled(&self, what: &str) {
+        self.refresh_progress(what, false);
+    }
+
+    /// `force = true` 时跳过节流（队列刚跑空、索引刚停止）。
+    fn refresh_progress(&self, what: &str, force: bool) {
+        const PROGRESS_REFRESH_INTERVAL: std::time::Duration =
+            std::time::Duration::from_secs(2);
+        let mut last = self.last_progress_refresh.lock();
+        let now = std::time::Instant::now();
+        if !force {
+            if let Some(previous) = *last {
+                if now.duration_since(previous) < PROGRESS_REFRESH_INTERVAL {
+                    return;
+                }
+            }
+        }
+        *last = Some(now);
+        drop(last);
+        if let Ok((total, completed)) = self.progress(what) {
+            let mut stats = self.stats.lock();
+            stats.total = total.max(0) as u64;
+            let in_memory = if what == "text" {
+                0
+            } else {
+                self.pending_states.lock().len() as i64
+            };
+            stats.completed = completed
+                .saturating_add(in_memory)
+                .max(0)
+                .min(total.max(0)) as u64;
         }
     }
 
@@ -389,15 +453,13 @@ impl Indexer {
         // Resolve the category once at enqueue time.  The worker can then
         // select a homogeneous batch without issuing a SQLite query for each
         // candidate on every pass through the queue.
+        let categories = self.db.file_categories(&ids).unwrap_or_default();
         let queued: Vec<QueuedWork> = ids
             .into_iter()
             .map(|id| {
-                let kind = self
-                    .db
-                    .get_by_id(id)
-                    .ok()
-                    .flatten()
-                    .map(|row| Self::work_kind(&row))
+                let kind = categories
+                    .get(&id)
+                    .map(|(kind, ext)| Self::work_kind_of(kind, ext))
                     .unwrap_or(WorkKind::Other);
                 QueuedWork { id, what: what.to_string(), kind }
             })
@@ -424,10 +486,11 @@ impl Indexer {
             stats.cross_done = 0;
             stats.cross_fail = 0;
         }
-        if let Ok((total, completed)) = self.progress(what) {
-            stats.total = total.max(0) as u64;
-            stats.completed = completed.max(0).min(total.max(0)) as u64;
-        }
+        // 入队时把分母校准成数据库里的真实值（例如"这次只排了 5000 条，
+        // 但库里还有 4 万条没做"）。用 force 绕过 run_loop 的节流。
+        drop(stats);
+        self.refresh_progress(what, true);
+        let mut stats = self.stats.lock();
         stats.last_error = None;
     }
 
@@ -501,9 +564,11 @@ impl Indexer {
                 q.pop_front()
             };
             let Some(first) = item else {
-                // 队列空了：把攒着的向量落盘
+                // 队列空了：把攒着的向量落盘，并把真实进度写回去
                 self.flush();
                 self.finish_elapsed();
+                let progress_what = self.progress_what.lock().clone();
+                self.refresh_progress(&progress_what, true);
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 continue;
             };
@@ -512,8 +577,14 @@ impl Indexer {
             let mut batch = vec![first];
             let first_pdf = first_kind == WorkKind::Pdf;
             let first_text_like = first_kind == WorkKind::Text;
-            let first_image = first_kind == WorkKind::Image
-                && self.embedder.info().modalities.iter().any(|m| m == "image");
+            // 图片能不能进批量路径，不该取决于主嵌入模型有没有视觉塔。
+            // 纯文本 GGUF（没有 mmproj）时图片本来就该走 media_embedder，
+            // 但它同样是"批量更快"的活：解码 + 缩略图 + CLIP 都能并行，
+            // 而旧的 first_image 判定为 false 时，整批图片会退化成一条
+            // 一条 process_one——既吃不满 CPU 池，也让 GPU 上前向之间
+            // 全是空隙。真正的 embedder/store 选择挪到 process_image_batch
+            // 内部按主模型的模态决定。
+            let first_image = first_kind == WorkKind::Image;
             let batchable = first_text_like || first_image || first_pdf;
             let configured_limit = self.batch_size.load(Ordering::Relaxed).clamp(1, 128) as usize;
             // A PDF can contribute several decoded 1024px page images. Keep
@@ -576,19 +647,7 @@ impl Indexer {
                 }
             }
             let progress_what = self.progress_what.lock().clone();
-            if let Ok((total, completed)) = self.progress(&progress_what) {
-                let mut stats = self.stats.lock();
-                stats.total = total.max(0) as u64;
-                let in_memory = if progress_what == "text" {
-                    0
-                } else {
-                    self.pending_states.lock().len() as i64
-                };
-                stats.completed = completed
-                    .saturating_add(in_memory)
-                    .max(0)
-                    .min(total.max(0)) as u64;
-            }
+            self.refresh_progress_throttled(&progress_what);
             // 每处理 200 条记一次心跳，发布版崩溃时能靠它判断「死在哪一步」。
             let done = self.dirty.load(Ordering::Relaxed);
             if done > 0 && done % 200 == 0 {
@@ -843,7 +902,7 @@ impl Indexer {
         // 4. 跨模态（CLIP / CLAP）：把图片和音频编码到「和文字同一空间」，
         //    这样「一句话描述找图片」才成立。hash 向量只描述颜色/能量分布，
         //    跟文字八竿子打不着，不能拿来给文字查询用。
-        self.embed_cross_modal(&row, if is_pdf { Some(&pdf_images) } else { None });
+        self.embed_cross_modal(&row, if is_pdf { Some(&pdf_images) } else { None }, None);
 
         Ok(())
     }
@@ -1046,13 +1105,13 @@ impl Indexer {
                         self.dirty.fetch_add(1, Ordering::Relaxed);
                         self.stats.lock().emb_done += 1;
                         if let Ok(Some(row)) = self.db.get_by_id(item.id) {
-                            self.embed_cross_modal(&row, Some(&item.images));
+                            self.embed_cross_modal(&row, Some(&item.images), None);
                         }
                     }
                     Err(error) if error.contains("PDF") => {
                         let _ = self.db.set_state(item.id, "embed", "skip");
                         if let Ok(Some(row)) = self.db.get_by_id(item.id) {
-                            self.embed_cross_modal(&row, Some(&item.images));
+                            self.embed_cross_modal(&row, Some(&item.images), None);
                         }
                     }
                     Err(error) => {
@@ -1186,6 +1245,12 @@ impl Indexer {
         struct PreparedImage {
             row: crate::db::FileRow,
             image: Result<image::DynamicImage, String>,
+            /// CLIP 的 224×224 CHW 像素输入，已在生产者线程里算好。
+            ///
+            /// 放进生产者是因为这一步（缩放+归一化）单张要 40~80 ms，
+            /// 32 条解码线程本来就闲着，让消费者一个人做等于把并行度
+            /// 从 32 压回 1。
+            clip_pixels: Option<Result<Vec<f32>, String>>,
         }
 
         let mut items = Vec::with_capacity(batch.len());
@@ -1215,6 +1280,16 @@ impl Indexer {
             return if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) };
         }
 
+        // 谁来编码这批图：主模型有视觉塔就进共享向量空间，否则用媒体
+        // 嵌入器（无 mmproj 时是 256 维 hash）。选择写在这里而不是
+        // run_loop 里，是因为批量路径本身对两者都成立——区别只是
+        // 目标向量库不同。
+        let primary_supports_image = self.embedder.info().modalities.iter().any(|m| m == "image");
+        let (embedder, store) = if primary_supports_image {
+            (Arc::clone(&self.embedder), Arc::clone(&self.vectors))
+        } else {
+            (Arc::clone(&self.media_embedder), Arc::clone(&self.media_vectors))
+        };
         let names: Vec<String> = items.iter().map(|item| item.row.name.clone()).collect();
         self.set_current_items(&names, IMAGE_GPU_BATCH_LIMIT);
         let pool = self.cpu_pool.read().clone();
@@ -1225,6 +1300,10 @@ impl Indexer {
             .load(Ordering::Relaxed)
             .clamp(1, IMAGE_GPU_BATCH_LIMIT as u64) as usize;
         let (sender, receiver) = std::sync::mpsc::sync_channel(prefetch_capacity);
+        // 生产者线程要在解码之后顺手把 CLIP 的 224×224 像素备好。
+        // 这里先在 scope 外取一次，避免每张图都去抢 RwLock。
+        let clip_model = self.clip.read().clone();
+        let want_clip = clip_model.is_some();
 
         // A bounded producer keeps decoded images ahead of the one model
         // consumer, while the capacity cap keeps large directories bounded.
@@ -1240,7 +1319,7 @@ impl Indexer {
                             let _ = self.db.set_state(row.id, "text", "skip");
                         }
                         let image = image::open(&row.path).map_err(|error| {
-                            format!("鍥剧墖璇诲彇澶辫触: {}: {error}", row.path)
+                            format!("图片读取失败: {}: {error}", row.path)
                         });
                         if let Ok(image) = &image {
                             let thumb_path = self.thumb_dir.join(format!("{}.jpg", row.id));
@@ -1269,9 +1348,21 @@ impl Indexer {
                                 }
                             }
                         }
+                        // CLIP 的像素准备也留在这里：它是纯 CPU 的
+                        // 缩放/归一化，和上面的解码、缩略图、视觉标签
+                        // 属于同一份「可以完全并行」的活。留给消费者
+                        // 就会退化成单线程流水线。
+                        let clip_pixels = if want_clip && image.is_ok() {
+                            Some(image.as_ref().map_err(|e| e.clone()).and_then(|img| {
+                                crate::ai::clip::prepare_image_pixels(img)
+                            }))
+                        } else {
+                            None
+                        };
                         let _ = sender.send(PreparedImage {
                             row: row.clone(),
                             image,
+                            clip_pixels,
                         });
                     });
                 });
@@ -1309,7 +1400,7 @@ impl Indexer {
                 let mut valid = Vec::with_capacity(prepared.len());
                 for item in prepared {
                     match item.image {
-                        Ok(image) => valid.push((item.row, image)),
+                        Ok(image) => valid.push((item.row, image, item.clip_pixels)),
                         Err(error) => {
                             let _ = self.db.set_state(item.row.id, "embed", "fail");
                             self.stats.lock().emb_fail += 1;
@@ -1321,19 +1412,19 @@ impl Indexer {
                     continue;
                 }
                 let current_names: Vec<String> =
-                    valid.iter().map(|(row, _)| row.name.clone()).collect();
+                    valid.iter().map(|(row, _, _)| row.name.clone()).collect();
                 self.set_current_items(&current_names, IMAGE_GPU_BATCH_LIMIT);
                 let image_refs: Vec<&image::DynamicImage> =
-                    valid.iter().map(|(_, image)| image).collect();
+                    valid.iter().map(|(_, image, _)| image).collect();
                 let vectors: Vec<Result<Vec<f32>, String>> =
-                    match self.embedder.embed_image_data_batch(&image_refs) {
+                    match embedder.embed_image_data_batch(&image_refs) {
                         Ok(vectors) if vectors.len() == valid.len() => {
                             vectors.into_iter().map(Ok).collect()
                         }
                         batch_result => {
                             let reason = match batch_result {
                                 Ok(vectors) => format!(
-                                    "鎵归噺鍥剧墖鍚戦噺鏁伴噺涓嶅尮閰嶏細{} / {}",
+                                    "批量图片向量数量不匹配：{} / {}",
                                     vectors.len(),
                                     valid.len()
                                 ),
@@ -1345,7 +1436,7 @@ impl Indexer {
                             );
                             valid
                                 .iter()
-                                .map(|(_, image)| self.embedder.embed_image_data(image))
+                                .map(|(_, image, _)| embedder.embed_image_data(image))
                                 .collect()
                         }
                     };
@@ -1354,10 +1445,77 @@ impl Indexer {
                     while receiver.recv().is_ok() {}
                     break;
                 }
-                for ((row, _), vector) in valid.into_iter().zip(vectors) {
+                // CLIP 跨模态：整批一次前向。
+                //
+                // 逐条调 image_data_vec 时，每张图都要重新提交一次
+                // 190 MB 权重的推理请求；DirectML 上这部分启动开销比
+                // 计算本身还大（实测吞吐被压在 2~3 张/秒）。整批塞进
+                // 一次前向，单张的摊销成本降到 1/N。
+                //
+                // 像素准备（缩放 + 归一化）已经在生产者线程里做完了，
+                // 这里只提交前向。之前这段是整个索引链的瓶颈：它让
+                // 32 条解码线程干等单线程消费者做 80~100 ms/张的缩放。
+                let clip_batch: Vec<Option<Result<Vec<f32>, String>>> = {
+                    match clip_model.clone() {
+                        Some(clip) => {
+                            let mut slots: Vec<Option<Result<Vec<f32>, String>>> =
+                                (0..valid.len()).map(|_| None).collect();
+                            let mut pending_index: Vec<usize> = Vec::new();
+                            let mut pixel_rows: Vec<&Vec<f32>> = Vec::new();
+                            for (index, (row, _, clip_pixels)) in valid.iter().enumerate() {
+                                if row.ext.eq_ignore_ascii_case("pdf")
+                                    || self.clip_vectors.has(row.id)
+                                {
+                                    continue;
+                                }
+                                match clip_pixels {
+                                    Some(Ok(pixels)) => {
+                                        pending_index.push(index);
+                                        pixel_rows.push(pixels);
+                                    }
+                                    Some(Err(error)) => {
+                                        slots[index] = Some(Err(error.clone()));
+                                    }
+                                    None => {}
+                                }
+                            }
+                            if !pixel_rows.is_empty() {
+                                match clip.embed_pixels(&pixel_rows) {
+                                    Ok(vectors) if vectors.len() == pending_index.len() => {
+                                        for (index, vector) in
+                                            pending_index.iter().copied().zip(vectors)
+                                        {
+                                            slots[index] = Some(Ok(vector));
+                                        }
+                                    }
+                                    Ok(vectors) => {
+                                        let reason = format!(
+                                            "CLIP 批量向量数量不匹配：{} / {}",
+                                            vectors.len(),
+                                            pending_index.len()
+                                        );
+                                        for index in pending_index {
+                                            slots[index] = Some(Err(reason.clone()));
+                                        }
+                                    }
+                                    Err(error) => {
+                                        for index in pending_index {
+                                            slots[index] = Some(Err(error.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                            slots
+                        }
+                        None => (0..valid.len()).map(|_| None).collect(),
+                    }
+                };
+                for (((row, image, _), vector), clip_slot) in
+                    valid.into_iter().zip(vectors).zip(clip_batch)
+                {
                     match vector {
                         Ok(vector) => {
-                            self.vectors.add(row.id, &vector);
+                            store.add(row.id, &vector);
                             self.pending_states.lock().push(row.id);
                             self.dirty.fetch_add(1, Ordering::Relaxed);
                             self.stats.lock().emb_done += 1;
@@ -1372,9 +1530,19 @@ impl Indexer {
                             }
                         }
                     }
-                    // Keep CLIP/CLAP processing in the same stage as before,
-                    // after the primary image vector has been persisted.
-                    self.embed_cross_modal(&row, None);
+                    // 跨模态向量在同一个阶段写入，位置与旧实现一致：
+                    // 主向量落库之后。命中批量结果的直接写，没赶上的
+                    // （例如本来就已经有向量）走原来的逐条路径做兜底。
+                    match clip_slot {
+                        Some(Ok(vector)) => {
+                            self.clip_vectors.add(row.id, &vector);
+                            self.stats.lock().cross_done += 1;
+                        }
+                        Some(Err(error)) => {
+                            self.record_error(format!("CLIP {}: {error}", row.name));
+                        }
+                        None => self.embed_cross_modal(&row, None, Some(&image)),
+                    }
                 }
             }
             if producer.join().is_err() {
@@ -1523,12 +1691,6 @@ impl Indexer {
             needs_extract: bool,
             cached_text: Option<String>,
         }
-        struct Item {
-            id: i64,
-            name: String,
-            text: String,
-        }
-
         let mut candidates = Vec::with_capacity(batch.len());
         let mut errors = Vec::new();
         let max_chars = self.cfg.max_text_chars;
@@ -1566,162 +1728,200 @@ impl Indexer {
             });
         }
 
+        // 抽取与编码流水线化：原来这里是「整批 CPU 抽取（阻塞 collect）
+        // → 整批 GPU 编码」，抽取几十篇文档要几百毫秒到几秒，这段时间
+        // GPU 完全空闲（实测 7 GiB 显存的卡利用率长期只有 5~8%）。
+        // 改成有界生产者/消费者之后，GPU 编码这一批时后台线程已在抽下一批。
         let pool = self.cpu_pool.read().clone();
-        let texts: Vec<Option<String>> = pool.install(|| {
-            candidates
-                .par_iter()
-                .map(|candidate| {
-                    if candidate.needs_extract {
-                        crate::textract::extract_text(&candidate.path, max_chars)
-                            .or_else(|| candidate.cached_text.clone())
-                    } else {
-                        candidate.cached_text.clone()
+        let prefetch_capacity = TEXT_PREFETCH_CAPACITY.min(candidates.len()).max(1);
+        let gpu_batch_limit = self.batch_size.load(Ordering::Relaxed).clamp(1, 128) as usize;
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<ExtractedText>(prefetch_capacity);
+
+        let pipeline_result = std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                pool.install(|| {
+                    candidates.par_iter().for_each_with(sender, |sender, candidate| {
+                        if self.is_cancelled() {
+                            return;
+                        }
+                        let extracted = if candidate.needs_extract {
+                            crate::textract::extract_text(&candidate.path, max_chars)
+                                .or_else(|| candidate.cached_text.clone())
+                        } else {
+                            candidate.cached_text.clone()
+                        };
+                        let text: String = extracted
+                            .unwrap_or_default()
+                            .chars()
+                            .take(max_chars)
+                            .collect();
+                        if text.trim().is_empty() {
+                            if candidate.needs_extract {
+                                let _ = self.db.set_state(candidate.id, "text", "skip");
+                            }
+                            // Empty/scan-only documents are valid files but
+                            // carry no text for the model. Keep them out of
+                            // retry/error counts; a later scan can requeue
+                            // them if contents or backend capability change.
+                            let _ = self.db.set_state(candidate.id, "embed", "skip");
+                            return;
+                        }
+                        if candidate.needs_extract {
+                            let body = crate::util::index_text(&text);
+                            let _ = self.db.set_doc(
+                                candidate.id,
+                                &crate::util::index_text(&candidate.name),
+                                &body,
+                                &text,
+                            );
+                            self.stats.lock().text_done += 1;
+                        }
+                        let _ = sender.send(ExtractedText {
+                            id: candidate.id,
+                            name: candidate.name.clone(),
+                            text,
+                        });
+                    });
+                });
+            });
+
+            let mut pipeline_errors = errors;
+            let mut cancelled = false;
+            loop {
+                let first = match receiver.recv() {
+                    Ok(item) => item,
+                    Err(_) => break,
+                };
+                if self.is_cancelled() {
+                    // Drain the bounded channel until the producer notices the
+                    // cancellation; dropping the receiver early would leave a
+                    // producer blocked in send() and make cancel look hung.
+                    cancelled = true;
+                    while receiver.recv().is_ok() {}
+                    break;
+                }
+                let mut group = vec![first];
+                while group.len() < gpu_batch_limit {
+                    match receiver.recv() {
+                        Ok(item) => group.push(item),
+                        Err(_) => break,
                     }
-                })
-                .collect()
+                }
+                if self.is_cancelled() {
+                    cancelled = true;
+                    while receiver.recv().is_ok() {}
+                    break;
+                }
+                // Split by approximate sequence length so short texts are not
+                // padded to the longest document in the batch.
+                let lengths: Vec<usize> = group.iter().map(|item| item.text.chars().count()).collect();
+                let buckets = text_batch_groups(&lengths, gpu_batch_limit);
+                let mut vectors: Vec<Option<Result<Vec<f32>, String>>> =
+                    (0..group.len()).map(|_| None).collect();
+                for bucket in buckets {
+                    if self.is_cancelled() {
+                        cancelled = true;
+                        break;
+                    }
+                    let current_names: Vec<String> =
+                        bucket.iter().map(|&index| group[index].name.clone()).collect();
+                    self.set_current_items(&current_names, current_names.len());
+                    let input: Vec<String> =
+                        bucket.iter().map(|&index| group[index].text.clone()).collect();
+                    match self.embedder.embed_text_batch(&input) {
+                        Ok(encoded) if encoded.len() == bucket.len() => {
+                            for (index, vector) in bucket.into_iter().zip(encoded) {
+                                vectors[index] = Some(Ok(vector));
+                            }
+                        }
+                        Ok(encoded) => {
+                            // A malformed batch result is recoverable. Fall
+                            // back to one-item encoding and only report an
+                            // error when the fallback also fails.
+                            let returned = encoded.len().min(bucket.len());
+                            for (offset, vector) in encoded.into_iter().take(returned).enumerate() {
+                                vectors[bucket[offset]] = Some(Ok(vector));
+                            }
+                            for &index in bucket.iter().skip(returned) {
+                                if self.is_cancelled() {
+                                    cancelled = true;
+                                    break;
+                                }
+                                self.set_current_items(std::slice::from_ref(&group[index].name), 1);
+                                vectors[index] = Some(self.embedder.embed_text(&group[index].text, false));
+                            }
+                        }
+                        Err(batch_error) => {
+                            let mut fallback_failed = true;
+                            for index in bucket {
+                                if self.is_cancelled() {
+                                    cancelled = true;
+                                    break;
+                                }
+                                self.set_current_items(std::slice::from_ref(&group[index].name), 1);
+                                let result = self.embedder.embed_text(&group[index].text, false);
+                                fallback_failed &= result.is_err();
+                                vectors[index] = Some(result);
+                            }
+                            if fallback_failed {
+                                pipeline_errors.push(format!("batch embedding failed: {batch_error}"));
+                            }
+                        }
+                    }
+                }
+                if cancelled {
+                    while receiver.recv().is_ok() {}
+                    break;
+                }
+                let vectors: Vec<Result<Vec<f32>, String>> = vectors
+                    .into_iter()
+                    .map(|value| value.unwrap_or_else(|| Err("missing batch embedding result".into())))
+                    .collect();
+                for (item, vector) in group.into_iter().zip(vectors) {
+                    match vector {
+                        Ok(vector) => {
+                            self.vectors.add(item.id, &vector);
+                            self.pending_states.lock().push(item.id);
+                            self.dirty.fetch_add(1, Ordering::Relaxed);
+                            self.stats.lock().emb_done += 1;
+                        }
+                        Err(error) => {
+                            if is_unsupported_backend_error(&error) {
+                                let _ = self.db.set_state(item.id, "embed", "skip");
+                            } else {
+                                let _ = self.db.set_state(item.id, "embed", "fail");
+                                self.stats.lock().emb_fail += 1;
+                                pipeline_errors.push(format!("{}: {error}", item.name));
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = producer.join();
+            (pipeline_errors, cancelled)
         });
-        if self.is_cancelled() {
+        let (pipeline_errors, cancelled) = pipeline_result;
+        if cancelled {
             return Err("index cancellation requested".into());
         }
-
-        let mut items = Vec::with_capacity(texts.len());
-        for (candidate, text) in candidates.into_iter().zip(texts) {
-            let text = text
-                .unwrap_or_default()
-                .chars()
-                .take(max_chars)
-                .collect::<String>();
-            if text.trim().is_empty() {
-                if candidate.needs_extract {
-                    let _ = self.db.set_state(candidate.id, "text", "skip");
-                }
-                // Empty/scan-only documents are valid files but contain no
-                // text for the embedding model. Keep them out of retry/error
-                // counts; a later scan can still requeue them if contents
-                // change or a multimodal backend becomes available.
-                let _ = self.db.set_state(candidate.id, "embed", "skip");
-                continue;
-            }
-            if candidate.needs_extract {
-                let body = crate::util::index_text(&text);
-                let _ = self.db.set_doc(
-                    candidate.id,
-                    &crate::util::index_text(&candidate.name),
-                    &body,
-                    &text,
-                );
-                self.stats.lock().text_done += 1;
-            }
-            items.push(Item {
-                id: candidate.id,
-                name: candidate.name,
-                text,
-            });
+        if pipeline_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(pipeline_errors.join("; "))
         }
-
-        if !items.is_empty() {
-            if self.is_cancelled() {
-                return Err("index cancellation requested".into());
-            }
-            // CPU extraction above is parallel.  Keep the GPU stage on one
-            // model instance, but split by approximate sequence length so
-            // short texts are not padded to the longest document in the
-            // batch. Results are written back in source order below.
-            let lengths: Vec<usize> = items.iter().map(|item| item.text.chars().count()).collect();
-            let groups = text_batch_groups(
-                &lengths,
-                self.batch_size.load(Ordering::Relaxed) as usize,
-            );
-            let mut vectors: Vec<Option<Result<Vec<f32>, String>>> =
-                (0..items.len()).map(|_| None).collect();
-            for group in groups {
-                if self.is_cancelled() {
-                    return Err("index cancellation requested".into());
-                }
-                // One model context consumes this exact batch. Do not show
-                // the full extracted candidate list as simultaneous work.
-                let current_names: Vec<String> = group
-                    .iter()
-                    .map(|&index| items[index].name.clone())
-                    .collect();
-                self.set_current_items(&current_names, current_names.len());
-                let input: Vec<String> = group.iter().map(|&index| items[index].text.clone()).collect();
-                match self.embedder.embed_text_batch(&input) {
-                    Ok(encoded) if encoded.len() == group.len() => {
-                        for (index, vector) in group.into_iter().zip(encoded) {
-                            vectors[index] = Some(Ok(vector));
-                        }
-                    }
-                    Ok(encoded) => {
-                        // A malformed batch result is recoverable.  Fall
-                        // back to one-item encoding and only report an error
-                        // for rows whose fallback also fails; otherwise a
-                        // successful recovery inflated the failure counter.
-                        let returned = encoded.len().min(group.len());
-                        for (offset, vector) in encoded.into_iter().take(returned).enumerate() {
-                            vectors[group[offset]] = Some(Ok(vector));
-                        }
-                        // If the backend returned too few rows, finish the
-                        // missing rows through the scalar path.
-                        for &index in group.iter().skip(returned) {
-                            if self.is_cancelled() {
-                                return Err("index cancellation requested".into());
-                            }
-                            self.set_current_items(std::slice::from_ref(&items[index].name), 1);
-                            vectors[index] = Some(self.embedder.embed_text(&items[index].text, false));
-                        }
-                    }
-                    Err(batch_error) => {
-                        let mut fallback_failed = true;
-                        for index in group {
-                            if self.is_cancelled() {
-                                return Err("index cancellation requested".into());
-                            }
-                            self.set_current_items(std::slice::from_ref(&items[index].name), 1);
-                            let result = self.embedder.embed_text(&items[index].text, false);
-                            fallback_failed &= result.is_err();
-                            vectors[index] = Some(result);
-                        }
-                        if fallback_failed {
-                            errors.push(format!("batch embedding failed: {batch_error}"));
-                        }
-                    }
-                }
-            }
-            let vectors: Vec<Result<Vec<f32>, String>> = vectors
-                .into_iter()
-                .map(|value| value.unwrap_or_else(|| Err("missing batch embedding result".into())))
-                .collect();
-            if self.is_cancelled() {
-                return Err("index cancellation requested".into());
-            }
-            for (item, vector) in items.into_iter().zip(vectors) {
-                match vector {
-                    Ok(vector) => {
-                        self.vectors.add(item.id, &vector);
-                        self.pending_states.lock().push(item.id);
-                        self.dirty.fetch_add(1, Ordering::Relaxed);
-                        self.stats.lock().emb_done += 1;
-                    }
-                    Err(error) => {
-                        if is_unsupported_backend_error(&error) {
-                            let _ = self.db.set_state(item.id, "embed", "skip");
-                        } else {
-                            let _ = self.db.set_state(item.id, "embed", "fail");
-                            self.stats.lock().emb_fail += 1;
-                            errors.push(format!("{}: {error}", item.name));
-                        }
-                    }
-                }
-            }
-        }
-        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
     }
 
+    /// 跨模态向量（CLIP / CLAP）。
+    ///
+    /// `cached_image` 是调用方**已经解码好**的图：主向量那一步解过一次，
+    /// 这里再 `image::open` 一遍等于把整个文件重新解码。pixiv 上动辄
+    /// 2~4 MB 的大图，这一下就是几十上百毫秒——批量索引时它是除了模型
+    /// 前向之外最大的单项开销。
     fn embed_cross_modal(
         &self,
         row: &crate::db::FileRow,
         cached_pdf_images: Option<&[image::DynamicImage]>,
+        cached_image: Option<&image::DynamicImage>,
     ) {
         let path = Path::new(&row.path);
         let mut dirty = 0u64;
@@ -1778,7 +1978,12 @@ impl Indexer {
                 if self.clip_vectors.has(row.id) {
                     return;
                 }
-                match clip.image_vec(path) {
+                // 已经解码过就直接用，省掉一次整图读取 + 解码。
+                let encoded = match cached_image {
+                    Some(image) => clip.image_data_vec(image),
+                    None => clip.image_vec(path),
+                };
+                match encoded {
                     Ok(v) => {
                         self.clip_vectors.add(row.id, &v);
                         self.stats.lock().cross_done += 1;

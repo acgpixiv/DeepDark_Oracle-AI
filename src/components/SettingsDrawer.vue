@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { Cpu, Files, Package, ScrollText, SlidersHorizontal, Wifi } from "lucide-vue-next";
+import { Cpu, Files, MonitorCog, Package, ScrollText, SlidersHorizontal, Wifi } from "lucide-vue-next";
 import { api, type Activity, type AppConfig, type PartialConfig, type Rule, type ServerStatus, type WatchStatus } from "../api";
 import { t } from "../i18n";
 import { refreshStats, toast } from "../store";
@@ -11,6 +11,7 @@ import SettingsModelTab from "./SettingsModelTab.vue";
 import SettingsLanTab from "./SettingsLanTab.vue";
 import SettingsLogTab from "./SettingsLogTab.vue";
 import SettingsExtensionTab from "./SettingsExtensionTab.vue";
+import SettingsGpuTab from "./SettingsGpuTab.vue";
 
 const props = defineProps<{ open: boolean; tab: string }>();
 const emit = defineEmits<{ (event: "tab", tab: string): void }>();
@@ -20,6 +21,7 @@ const TABS = [
   { key: "index", label: "文件索引", icon: Files },
   { key: "model", label: "模型配置", icon: Cpu },
   { key: "lan", label: "局域网配置", icon: Wifi },
+  { key: "render", label: "图形与 GPU", icon: MonitorCog },
   { key: "extensions", label: "可选扩展", icon: Package },
   { key: "log", label: "日志", icon: ScrollText },
 ] as const;
@@ -361,6 +363,7 @@ onMounted(load);
           <p v-else-if="activeTab === 'index'">{{ t("扫描目录、建立全文与向量索引、管理分类规则。") }}</p>
           <p v-else-if="activeTab === 'model'">{{ t("管理嵌入模型、跨模态模型和 GPU 推理参数。") }}</p>
           <p v-else-if="activeTab === 'lan'">{{ t("配置局域网访问和文件变化监控。") }}</p>
+          <p v-else-if="activeTab === 'render'">{{ t("图形渲染后端、画质档位与 GPU 兼容性诊断。") }}</p>
           <p v-else-if="activeTab === 'log'">{{ t("查看应用、扫描、索引和模型活动。") }}</p>
           <p v-else>{{ t("按需安装 ONNX Runtime 和 Python sidecar，扩展文件保存在项目目录。") }}</p>
         </div>
@@ -412,6 +415,7 @@ onMounted(load);
           :refresh-logs="refreshLogs"
           @update-log-kind="logKind = $event"
         />
+        <SettingsGpuTab v-if="activeTab === 'render'" />
         <SettingsExtensionTab v-if="activeTab === 'extensions'" />
       </div>
     </section>

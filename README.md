@@ -2,14 +2,15 @@
 
 本地离线的**磁盘全文 + 语义检索**桌面工具。用一句中文找到硬盘里的文件，不上传任何数据。
 
-- 后端：**Rust + Tauri 2.0**（系统 WebView2，安装包 20MB 级，不是 Electron）
+- 后端：**Rust + Tauri 2.0**（系统 WebView2，安装包约 32.7 MB，不是 Electron）
 - 前端：**Vue 3 + Vite**
 - AI 引擎：**llama.cpp（C++，GGUF）** 跑文本嵌入；跨模态 CLIP/CLAP 使用可选的 **ONNX Runtime** 扩展
 - 检索：SQLite FTS5 全文 + 中文 2-gram + 拼音全拼/首字母 + 模糊匹配 + 向量语义融合 + 跨模态检索
 - 正文抽取：TXT / Markdown / Word（docx + doc）/ Excel（xlsx + xls）/ PPT（pptx + ppt）/ PDF / RTF / EPUB / ODF
-- 界面：搜索 / 相似、树状图、扫描 / 索引、模型管理 四模式
+- 界面：搜索 / 相似、**星系图谱 + 八种思维模型图**、树状图、扫描 / 索引、模型管理
+- 渲染：**WebGL 2 / WebGL 1 / Canvas 2D 三档自动降级**，画质四档，显卡与驱动诊断面板（v0.25）
 
-当前工作区版本 **v0.23**，版本历史见 [CHANGELOG.md](CHANGELOG.md)。安装包不包含任何模型权重；GGUF、safetensors、CLIP/CLAP ONNX 文件均由用户自行导入。
+当前工作区版本 **v0.25**，版本历史见 [CHANGELOG.md](CHANGELOG.md)。安装包不包含任何模型权重；GGUF、safetensors、CLIP/CLAP ONNX 文件均由用户自行导入。
 
 ---
 
@@ -19,41 +20,33 @@
 
 | 内容 | 位置 | 说明 |
 | --- | --- | --- |
-| **安装包** | 不随仓库分发 | 本机产物位于 `src-tauri/target/release/bundle/nsis/DeepDark_Oracle_0.0.23_x64-setup.exe`（约 503.65 MiB），用 `npm run tauri:release` 生成 |
-| **可直接运行的便携版** | 根目录：`DeepDark_Oracle.exe` + 5 个 `.dll` + 启动器 | 缺模型与 ffmpeg，见下节 |
-| **前端源码** | `src/`（23 个文件，Vue 3 + TS） | 约 5,900 行 |
-| **后端源码** | `src-tauri/src/`（30 个 `.rs`） | 约 15,000 行 |
+| **安装包** | 不随仓库分发 | 本机产物位于 `release/DeepDark_Oracle_0.0.25_x64-setup.exe`（34,276,337 字节 / 32.7 MB），用 `npm run tauri:release` 生成（实际输出目录见脚本结尾提示） |
+| **可直接运行的便携版** | 安装目录里的 `DeepDark_Oracle.exe` + `WebView2Loader.dll` | 缺模型与 ffmpeg，见下节 |
+| **前端源码** | `src/`（35 个文件，Vue 3 + TS） | 约 11,400 行 |
+| **后端源码** | `src-tauri/`（31 个 `.rs` + `native/llama_shim.cpp`） | 约 19,400 行 |
 | **构建配置** | `src-tauri/{Cargo.toml,​build.rs,​tauri.conf.json}`、`package.json` 等 | — |
-| **验收截图** | `docs/screenshots/` | 13 张（v0.19 ~ v0.22） |
+| **验收截图** | `docs/screenshots/` | 19 张（v0.19 ~ v0.25） |
 | **依赖源码** | ❌ 不含 `vendor/llama.cpp` | 需按第 2 节 clone |
 
 ### 1. 安装与运行
 
 **方式 A：安装包（推荐给普通用户）**
 
-运行构建好的 `DeepDark_Oracle_0.0.23_x64-setup.exe`。安装向导会让你选择安装目录，**默认落在非系统盘的 `D:\Apps\DeepDark_Oracle`**（D 盘不存在时退到 `E:\Apps`，再不行才用 `%LOCALAPPDATA%\DeepDark_Oracle`），避免把模型文件放进 C 盘。安装包只带程序运行时 DLL、`tools\bin\ffmpeg.exe` 等通用依赖，不包含任何 GGUF、safetensors、CLIP 或 CLAP 权重；ONNX Runtime 需在可选扩展页自行安装；模型由用户在模型配置页导入。安装包会创建开始菜单与桌面快捷方式；卸载入口在「设置 → 应用」里。
+运行构建好的 `DeepDark_Oracle_0.0.25_x64-setup.exe`。安装向导会让你选择安装目录，**默认落在非系统盘的 `D:\Apps\DeepDark_Oracle`**（D 盘不存在时退到 `E:\Apps`，再不行才用 `%LOCALAPPDATA%\DeepDark_Oracle`），避免把模型文件放进 C 盘。安装包只带程序运行时 DLL、`tools\bin\ffmpeg.exe` 等通用依赖，不包含任何 GGUF、safetensors、CLIP 或 CLAP 权重；ONNX Runtime 需在可选扩展页自行安装；模型由用户在模型配置页导入。安装包会创建开始菜单与桌面快捷方式；卸载入口在「设置 → 应用」里。
 
 **方式 B：便携版（解压即用）**
 
+把安装目录整个拷走即可，需要的最小文件是 `DeepDark_Oracle.exe` + `WebView2Loader.dll`（其余都是可选的 FFmpeg 与扩展脚本）：
+
 ```
-DeepDark_Oracle 启动器.cmd     ← 带菜单的启动器
-DeepDark_Oracle.exe            ← 直接运行，跳过菜单
+DeepDark_Oracle.exe        ← 双击即用
+WebView2Loader.dll         ← WebView2 装载器，缺了会 0xC0000135
+tools\bin\ffmpeg.exe       ← 可选，视频抽帧 / 音频解码
 ```
 
-**启动器**（`DeepDark_Oracle 启动器.cmd` + `launcher.ps1`）提供六个入口：
+v0.23 之前根目录那个 `DeepDark_Oracle 启动器.cmd` + `launcher.ps1` 菜单启动器在 v0.24 已删除：六大入口在 GUI 与 `--cli` 里都能直接找到（自检 `--selftest`、重建索引 `--cli index --wait`、扫描目录 `--cli scan <目录>`、命令行 `--cli`、数据目录「设置 → 文件索引」），多维护一份启动器只会多一处版本漂移。
 
-| 选项 | 作用 |
-| --- | --- |
-| `[1]` 正常启动 | 打开主界面，使用轻量哈希基线，不自动加载用户模型 |
-| `[2]` 自检 | 跑一遍端到端检查（配置/库/模型/向量化/全文/拼音/文件名/语义/找相似/目录/标签），结果带颜色回显 |
-| `[3]` 重建索引 | 全量重抽正文 + 重算向量 + 重打画面标签 |
-| `[4]` 扫描目录 | 输入一个目录，命令行方式扫描入库（带进度） |
-| `[5]` 命令行 | 查看 `--cli` 全部子命令 |
-| `[6]` 打开数据目录 | 索引库、向量库、缩略图、日志 |
-
-启动器用 PowerShell 写（`launcher.ps1`），因为 **.bat 里放中文会被 cmd 按 GBK 解析坏**。`launcher.ps1` 必须保持 **UTF-8 with BOM + CRLF**，否则 Windows PowerShell 5.1 会报解析错误。
-
-如果已导入或配置模型，启动时会自动尝试加载；安装包本身不含模型。用户可在模型配置页导入 GGUF 或 safetensors 模型。**便携版**的数据写在 exe 同级的 `data\`，整个文件夹可以拷走；**安装版**如果 exe 所在目录不可写（例如装在 `D:\Apps`、`Program Files` 且当前用户没有写权限），程序会自动回退到 `%LOCALAPPDATA%\DeepDark_Oracle\data`，启动器的「打开数据目录」会跟着指向实际位置。
+如果已导入或配置模型，启动时会自动尝试加载；安装包本身不含模型。用户可在模型配置页导入 GGUF 或 safetensors 模型。**便携版**的数据写在 exe 同级的 `data\`，整个文件夹可以拷走；**安装版**如果 exe 所在目录不可写（例如装在 `D:\Apps`、`Program Files` 且当前用户没有写权限），程序会自动回退到 `%LOCALAPPDATA%\DeepDark_Oracle\data`，「设置 → 文件索引」里的数据目录路径会跟着指向实际位置。
 
 运行时必须一起带的文件（少一个就起不来或功能缺失）：
 
@@ -61,10 +54,10 @@ DeepDark_Oracle.exe            ← 直接运行，跳过菜单
 | --- | --- | --- |
 | `DeepDark_Oracle.exe` | 主程序 | — |
 | `WebView2Loader.dll` | WebView2 装载器 | **双击无反应、退出码 `0xC0000135`** |
-| `libstdc++-6.dll` / `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` | gnu 运行时（llama.cpp 是 C++） | 弹「系统错误」窗后退出 |
-| `onnxruntime.dll`（可选扩展） | ONNX 推理引擎（约 13.5MB） | 不影响应用启动；未安装时 ONNX 图文/音文扩展能力不可用 |
 | `tools\bin\ffmpeg.exe` | 抽帧 / 音频解码 | 视频缩略图与音频/视频向量失败 |
-| `launcher.ps1` / `DeepDark_Oracle 启动器.cmd` | 启动器（可选） | 不影响主程序，只是少了菜单 |
+| `onnxruntime.dll`（可选扩展） | ONNX 推理引擎（约 13.5MB），仅在「设置 → 可选扩展」里装过才有 | 不影响应用启动；未安装时 ONNX 图文/音文扩展能力不可用 |
+
+> GNU 运行时（`libstdc++-6.dll` / `libgcc_s_seh-1.dll` / `libwinpthread-1.dll`）从 v0.24 起已**静态链入 exe**（`src-tauri/build.rs` 里 `-Wl,-Bstatic -lstdc++ -lwinpthread`），安装目录里不再需要这三个文件。
 
 > 安装包只包含程序和运行依赖，不包含 GGUF、safetensors、CLIP 或 CLAP 权重。模型由用户自行导入；不配置模型时仍可使用文件名和全文等非语义检索。
 
@@ -174,7 +167,7 @@ npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
 
 ## 二、界面结构
 
-首页默认显示打字机标题和胶囊搜索框；输入后搜索栏收缩到顶部，结果以按相关度排序的图库卡片显示，并保留类型筛选、全文/拼音/模糊/语义/跨模态开关、相似检索、预览、定位和导出。顶栏右侧显示索引文件数与占用大小，**点击它从按钮下方弹出「索引目录结构」面板**（见下节），再往右的齿轮进入设置。
+首页默认显示打字机标题和胶囊搜索框；输入后搜索栏收缩到顶部，结果以按相关度排序的图库卡片显示，并保留类型筛选、全文/拼音/模糊/语义/跨模态开关、相似检索、预览、定位和导出。结果工具栏右侧还有**「列表 / 图谱 / 思维图」三档视图切换**（v0.24 新增，见「星系图谱」一节）。顶栏右侧显示索引文件数与占用大小，**点击它从按钮下方弹出「索引目录结构」面板**（见下节），面板里同样是「目录树 / 星系图」双 Tab；再往右是星系图按钮（`Ctrl+G`）与齿轮设置。
 
 设置页的左栏分为六个标签：**通用配置**（语言、主题、启动行为、工作区目录）、**文件索引**（扫描、索引参数、规则和数据库维护）、**模型配置**（GGUF、GPU 设备、上下文、CLIP/CLAP）、**局域网配置**（服务与实时监控）、**可选扩展**和**日志**（活动记录）。每个标签只提交自身的配置片段，避免修改一项覆盖其它设置。
 
@@ -208,9 +201,160 @@ npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
 - 视觉：白底 `#FFFFFF`、主文字 `#333333`、次要 `#999999`、边框 `#CCCCCC`、选中 `#F5F5F5`、搜索命中 `#E6F7FF`；暗色主题有独立的一套变量。
 - 后端：`tree_browse` / `tree_search` / `workspace_add` 三个 Tauri 命令；数据层用 `dir >= lo AND dir < hi` 的字符串区间做前缀裁剪，14 万文件的库上全量聚合 140ms、单层展开 40~50ms。
 
+### 星系图谱与思维模型图（v0.24 新增）
+
+> 需求来源：《DeepDark_Oracle_需求明细汇总表》「双模态可视化引擎」+「发散建议」。把索引库从「一堆卡片」变成「一张能看的星图」。
+
+**四个入口**：
+
+| 入口 | 位置 | 用途 |
+| --- | --- | --- |
+| 全屏星系图 | 顶栏 `Network` 按钮 / `Ctrl+G` | 从索引根开始逐层展开整个磁盘 |
+| 搜索结果图谱 | 结果工具栏「图谱」 | 把当前这批命中渲染成簇，看它们聚在哪 |
+| 索引面板星系图 | 顶栏统计按钮 → 「星系图」Tab | 边浏览目录边看结构，宽 400px 的紧凑版 |
+| 思维模型图 | 结果工具栏「思维图」+ 模型下拉 | 同一批结果换八种视角 |
+
+**画布引擎**（`src/galaxy/engine.ts`，789 行）刻意不用 D3 的 SVG 选择器，而是 `<canvas>` + `d3-force` 自己画：
+
+| 特性 | 实现 |
+| --- | --- |
+| 节点半径 | `r = 8 + 3*log(子项数+1)` |
+| 节点配色 | 文件夹 `#4E79A7`、文档 `#59A14F`、图片 `#B07AA1`、代码 `#F28E2B`、视频 `#E15759`、其他 `#9C755F` |
+| 三级 LOD | <0.3x 只画文件夹 / 0.3~1x 加重要文件（r≥9）/ >1x 全画；标签按屏幕像素 ≥15px 才画 |
+| 视口裁剪 | 只绘制视口外扩 50px 内的节点与连线 |
+| 连线 | contains 关系用二次贝塞尔，透明度 0.3~0.5、线宽 1~2px |
+| 力导向 | `alpha 1.0` / `alphaDecay 0.0228` / `velocityDecay 0.4`，与需求表参数一致 |
+| 交互 | 滚轮锚点缩放（0.1x~5x）、拖拽 0.85 阻尼、双击展开折叠、右键菜单、相机缓动 260ms |
+| 鱼眼透镜 | 半径 150px、中心 1.5x，工具栏一键开关 |
+| 捏合建边 | `Ctrl` + 从节点 A 拖到节点 B，松开预览黄色虚线关系边 |
+
+**八种思维模型图**（`src/components/MindMap.vue`，纯 SVG）：
+
+| 模型 | 图形 | 看什么 |
+| --- | --- | --- |
+| 界定图 `definition` | 嵌套圆 packing | 按类型分层，圆面积 = 体积占比 |
+| 描述图 `description` | 中心辐射 | 中心是检索词，一圈是所在目录 |
+| 比较图 `comparison` | 韦恩图 | 三种主要类型的两两交集 |
+| 分类图 `classification` | 树状 dendrogram | 按扩展名逐级展开 |
+| 拆解图 `decomposition` | 旭日图 sunburst | 类型 → 扩展名两级下钻 |
+| 顺序图 `sequence` | 时间线 | 按修改月份排布，带时间轴 |
+| 因果图 `causality` | 桑基图 | 目录 → 类型的流向与权重 |
+| 类比图 `analogy` | 平行对照 | 类型 / 扩展名两组并排 |
+
+点任一图形里的条目，右下角弹出详情卡，可直接打开文件或在文件夹中显示。
+
+**后端两条命令**：
+
+```rust
+// src-tauri/src/cmd.rs:1823
+graph_data(root?: String, depth?: usize, max_nodes?: usize, file_limit?: usize) -> GraphData
+// src-tauri/src/cmd.rs:2149
+mind_map_data(model: String, paths: Vec<String>, query?: Option<String>) -> MindMapOut
+```
+
+`graph_data` 的数据全部来自 SQLite 的 `dir_rollup_under()` 前缀聚合，**点开图谱不触发任何磁盘遍历**；逐层按递归文件数降序展开，超过 `max_nodes`（默认 900、上限 8000）时截断并把 `truncated` 置真，前端会提示「已截断」。
+
+### GPU 兼容性与渲染后端（v0.25 新增）
+
+> 需求来源：《需求明细汇总表》第三组「GPU 加速兼容性」REQ-093~108。原表按 Python + PyTorch 写（`torch.cuda.is_available()`、`pip install onnxruntime-directml`），本项目是 Tauri + Rust + llama.cpp，没有 Python 运行时，加速后端在**编译期**就固定了，所以全部按现有架构做等价改写。
+
+**设置 → 图形与 GPU** 是这一版的主入口，五张卡：
+
+| 卡片 | 内容 |
+| --- | --- |
+| GPU 能力报告 | 显卡型号 / 推理后端 / 显存占用条 / 驱动版本 / CUDA 工具包（没装会给按型号的建议版本）/ 显存档位 / ONNX EP |
+| 画质档位 | 低 / 中 / 高 / 极高，控制光晕、贝塞尔连线、背景星点、DPR 上限、节点上限（5k / 12k / 40k / 120k） |
+| 渲染后端 | 自动检测 / 强制 WebGL / 强制 Canvas 2D；渲染分辨率 自动 / 1x / 2x / 3x |
+| 渲染能力 | 探测到的渲染器串、着色器精度、最大纹理、顶点属性、浮点混合、屏幕像素比，以及命中的驱动兼容补丁 |
+| 兼容性诊断 | 上下文丢失 / 着色器失败 / 初始化失败 / 连续掉帧 四类事件，可一键复制给开发者 |
+
+**推理侧**（`src-tauri/src/ai/gpu.rs`）：
+
+- 后端不是猜的，是遍历 GGML 后端注册表拿到的（`ds_llama_backend_count` / `ds_llama_backend_info` 两个新增 C 导出）。所以报告里写的 `vulkan` / `cuda` / `cpu` 是**这个 exe 真的编进去了什么**。
+- 显存分档 `Tier0 ≥8 GiB / Tier1 4~8 GiB / Tier2 1~4 GiB / Tier3 <1 GiB`，与 `llama_shim.cpp` 的 `ds_llama_device_tier()` 阈值逐字一致。模型加载真的按分档走：没指定设备 → `n_gpu_layers = 0`（纯 CPU）；指定设备但显存 <1 GiB → 直接退回 CPU；否则 `-1` 全量下放。
+- 启动即在数据目录写 `gpu_report.log`（JSON），后台线程执行，不拖慢首屏。
+- `--skip-cuda-check`：环境炸了时的紧急逃生门。
+- `--cli gpu [--json]`：命令行看同一份报告。
+
+**渲染侧**（`src/galaxy/`）：
+
+| 文件 | 职责 |
+| --- | --- |
+| `capability.ts` | WebGL 探测（webgl2 → webgl → none）、驱动问题库、画质预设、`effectiveDpr` |
+| `glRenderer.ts` | 自绘 WebGL 点精灵：节点 1 顶点 / 连线 2 顶点，鱼眼位移做进顶点着色器 |
+| `engine.ts` | 双管线分发、三级 LOD、视口裁剪、相机、命中测试（GL 与 2D 共用一套交互） |
+| `renderSettings.ts` | 画质 / 后端 / DPR 三项偏好，存 localStorage，跨画布共享 |
+| `telemetry.ts` | 渲染异常留证（**不记文件名、路径或任何文件内容**） |
+
+- **降级路径**：`webgl2` → `webgl1` → `canvas2d`，每一跳都有理由记录；WebGL 初始化失败、着色器编译失败、绘制期抛错（驱动重置 / 休眠唤醒）都会自动落到 Canvas 2D，并在画布上方弹一条黄色提示说明为什么降级。
+- **为什么不用 PixiJS**：离线桌面程序，图谱只需要「圆 + 线」两种图元，自绘 400KB 依赖不值当，也更容易精确控制降级点。
+- **一块 canvas 只能绑一种上下文**：切换后端时组件用 `:key` 换一块新 DOM 画布重建引擎，否则拿不到新上下文。
+
+**`scripts/gpu-check.ps1`**（REQ-107 的等价实现，原方案是 GitHub Actions 多浏览器 × 多 GPU 矩阵）：
+
+```powershell
+# 基线自检：生成 JSON + HTML 报告
+powershell -ExecutionPolicy Bypass -File scripts/gpu-check.ps1
+# 与上一次报告比对，退化就返回 1（可挂发布前检查）
+powershell -ExecutionPolicy Bypass -File scripts/gpu-check.ps1 -Baseline docs/gpu-report/gpu-report-20261101-090000.json -Strict
+```
+
+比对三类退化：显存档位下降、后端变化、单设备可用显存下降超过 20%。
+
+### 3D 星图（v0.26 新增）
+
+> 需求来源：`2D转3D与星图需求明细.xlsx` 的 33 条。星图不是另一套数据，而是**同一份索引的第二种看法**：把 14 万个文件铺成一片星云，用距离和亮度表达层级与规模。
+
+**进入**：顶栏 `Network` 图标或 `Ctrl+G`，左上角 / 设置 → 图形与 GPU 里切 `2D / 3D`（记住上次选择）。
+
+**引擎**（`src/galaxy/star/`，共 2588 行）：
+
+| 文件 | 行数 | 职责 |
+| --- | --- | --- |
+| `engine3d.ts` | 1043 | `ForceGraph3D` 只出力学与相机；节点/连线/星尘三套 Instanced 几何 |
+| `StarCanvas.vue` | 901 | Vue 外壳：钻取、HUD、图例、右键菜单、慢帧降级 |
+| `nebula.ts` | 297 | 3000 粒星尘 + 空间哈希就近连线 + 球壳背景 + `FogExp2` |
+| `shaders.ts` | 174 | glow / dot / cloud 三张程序化贴图 + 节点与粒子着色器 |
+| `sketch.ts` | 173 | 铅绘滤镜 ShaderPass（Sobel 边缘 + fbm 等值线 + 纸纹） |
+
+**视觉参数**：
+
+| 项 | 值 |
+| --- | --- |
+| 背景 / 雾 | `#050510`，`FogExp2` 密度 0.002 |
+| 节点 | `ShaderMaterial` + 加色混合 + 512px 程序化 glow 贴图 |
+| 星尘 | 3000 粒、半径 900、球内均匀分布，自转 0.08 |
+| Bloom | `UnrealBloomPass` strength 0.85 / radius 0.35 / **threshold 0.62** |
+| 实例化 | 节点 1 次 draw call、连线 1 次、星尘 1 次 |
+
+> **Bloom 的 threshold 为什么是 0.62 而不是需求表的 0.1**：照抄 0.1 的实测结果是整屏过曝（亮像素 51.2%），因为深空底色 `#050510` 的亮度本身就贴着 0.1，加上星云球壳整片参与泛光就饱和成白。抬到 0.62 后亮像素降到 4.65%，辉光仍在但只落在真正的发光体上。
+
+**渐进式探索**：Level 0 是 9 个类型节点 → 点开进目录/文件 → 可继续下钻。左下角面包屑逐级可点，工具栏 `←`/`→` 走历史栈；图例条点一下按类型过滤节点；右键菜单四项（打开文件 / 展开这一层 / 聚焦 / 复制路径）。
+
+**性能**：
+
+- 拖拽超过 4px 立刻关 Bloom 与铅绘，**停手 500ms** 再恢复（一松手就恢复会在顿挫间隙闪）。
+- `aLod` 实例属性按相机距离每 200ms 重写：远处压暗压小，近处高精度。
+- 连续掉帧自动关 Bloom → 再关深空，弹「帧率偏低，已自动关闭部分特效」并可一键恢复。
+- 拾取用 CPU 屏幕投影，不是 `Raycaster`（一万个球做射线检测是性能陷阱）。
+
+**这三条没照需求表做**（理由见 `docs/DeepDark_Oracle_v0.26_交付说明.md`）：KTX2 压缩纹理（全程序化贴图，无资产可压）、Mesh BVH（改 CPU 投影更快）、SpriteMaterial（改 Instanced 广告牌，1 draw call 顶掉 N 个）。
+
 ### 界面截图
 
 <table>
+<tr>
+<td width="50%"><img src="docs/screenshots/v0.25-gpu.png" alt="图形与 GPU"><br><sub>图形与 GPU（v0.25）：能力报告 / 画质档位 / 渲染后端 / 渲染能力四张卡</sub></td>
+<td width="50%"><img src="docs/screenshots/v0.25-gpu-render.png" alt="已编入后端与诊断"><br><sub>已编入后端与诊断（v0.25）：这台机器真的编进了 Vulkan 与 CPU，兼容性事件留证</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/v0.24-galaxy.png" alt="全局星系图"><br><sub>全局星系图（v0.24）：<code>Ctrl+G</code> 打开，1140 个节点、6 色 Legend、右上角实时 FPS</sub></td>
+<td width="50%"><img src="docs/screenshots/v0.24-result-galaxy.png" alt="搜索结果图谱"><br><sub>搜索结果图谱（v0.24）：搜「png」的 27,149 条命中渲染成簇，看它们聚在哪</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/v0.24-mindmap.png" alt="思维模型图"><br><sub>思维模型图（v0.24）：描述图中心辐射，同一批结果换八种视角</sub></td>
+<td width="50%"><img src="docs/screenshots/v0.24-panel-tabs.png" alt="索引面板星系图"><br><sub>索引面板星系图（v0.24）：顶栏统计按钮 → 「星系图」Tab 的 400px 紧凑版</sub></td>
+</tr>
 <tr>
 <td width="50%"><img src="docs/screenshots/v0.21-general.png" alt="通用配置"><br><sub>通用配置：语言 / 主题（含跟随系统）/ 启动行为 / 工作区目录</sub></td>
 <td width="50%"><img src="docs/screenshots/v0.21-english.png" alt="English UI"><br><sub>English 界面：语言切换即时生效，六个设置标签与搜索页全部英文</sub></td>
@@ -480,7 +624,7 @@ cd src-tauri && cargo run --example smoke --features llama
 A：debug 版会连 `http://localhost:1420`，必须先 `npm run dev`；或者直接用 `release` 构建的 exe。
 
 **Q：报「系统错误」窗口一闪而过？**
-A：缺 `libstdc++-6.dll`。把 `tools\msys64\ucrt64\bin\` 下的 `libstdc++-6.dll`、`libgcc_s_seh-1.dll`、`libwinpthread-1.dll` 拷到 exe 旁边。
+A：v0.24 起 GNU 运行时已静态链入，不再需要 `libstdc++-6.dll`。若仍遇到，先确认 exe 旁边的 `WebView2Loader.dll` 在（缺它会 `0xC0000135`），再看「设置 → 应用」里是否装过旧版残留的 exe。需要排查时可用 `objdump -p DeepDark_Oracle.exe | grep "DLL Name"` 看真实依赖。
 
 **Q：搜索结果全是 0 条？**
 A：先看底部状态栏的文件数。若为 0，去「扫描 / 索引」页添加目录再扫描；扫描完还要等索引进度跑完（底部会显示 `向量 N`）。
@@ -498,7 +642,7 @@ A：CLAP 是英文音效语料训练的，只能理解**具体声音**（钢琴�
 A：视频要靠 `tools\bin\ffmpeg.exe` 抽首帧。缺 ffmpeg、或 `%TEMP%` 不可写时程序会改用 `data\tmp\` 并在失败时明确提示。确认 `tools\bin\ffmpeg.exe` 在发布目录里即可。
 
 **Q：安装版装到 D:\Apps 后，索引库在哪？**
-A：程序启动时会先试 exe 同级的 `data\`，写不进去（`Program Files`、`D:\Apps` 这类目录需要管理员权限）就自动回退到 `%LOCALAPPDATA%\DeepDark_Oracle\data`。启动器的「打开数据目录」按同一顺序探测，不会打开错地方。想确认实际路径：设置 → 文件索引 → 索引数据库里显示的就是真实路径。
+A：程序启动时会先试 exe 同级的 `data\`，写不进去（`Program Files`、`D:\Apps` 这类目录需要管理员权限）就自动回退到 `%LOCALAPPDATA%\DeepDark_Oracle\data`。程序按同一顺序探测，不会打开错地方。想确认实际路径：设置 → 文件索引 → 索引数据库里显示的就是真实路径。
 
 **Q：视频抽帧是怎么做的？会不会很占空间？**
 A：按 `index.video_frame_interval`（默认 4 秒）的间隔切成时间窗，每个窗口按「**场景切换点 → I 帧 → 窗口中心**」的优先级挑一帧（场景切换由 ffmpeg 的 `scene` 分数检测，I 帧由 `-skip_frame nokey` 探测），再用 64 位 dHash 指纹**加平均颜色**去重（结构汉明距离 ≤ `index.video_dedup_distance` 且颜色也接近的相邻帧才丢弃 —— 只比结构的话，纯色/黑屏/幻灯片白底这些低对比画面指纹几乎一样，「红底切绿底」会被误丢）。采样间隔还会按镜头切换密度自适应：几乎不换镜头的 PPT / 网课放稀到 1.5 倍省空间，动作片 / 体育加密到 0.5 倍，但任何情况下都不低于 4 秒。抽出来的帧只用于即时计算 CLIP/媒体向量，算完就删临时文件；库里只留**特征向量和压缩缩略图**，所以索引体积不会随视频时长线性膨胀。要更细的采样就调小间隔（下限 4 秒），要控制上限就调 `index.video_max_frames`。

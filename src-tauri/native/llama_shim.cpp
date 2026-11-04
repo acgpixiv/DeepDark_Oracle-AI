@@ -631,9 +631,17 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
     llama_log_set(capture_model_log, nullptr);
 
     llama_model_params mparams = llama_model_default_params();
-    // CPU model-layer execution is intentionally disabled. `-1` means all
-    // layers are assigned to the selected GGML accelerator.
-    mparams.n_gpu_layers = -1;
+    // 显存自适应降级（REQ-097）。
+    //
+    // 旧写法无条件 `n_gpu_layers = -1`（全量下放），有两个问题：
+    //   1. 用户显式选择 CPU（上层传 nullptr）时，-1 仍会让 llama.cpp 自己
+    //      挑一块 GPU 用，等于无视了「这台机器别用显卡」的选择；
+    //   2. 集显/小显存机器上整模型下放会直接 OOM，模型加载失败而不是降级。
+    //
+    // 现在的策略是：没指定设备 → 0 层（纯 CPU）；指定了设备 → 按该设备
+    // 的总显存分档，< 1 GiB 视为 Tier 3 退回 CPU，其余仍全量下放（嵌入模型
+    // 是几百 MB 量级，量化后 4 GiB 以上显存足够）。
+    mparams.n_gpu_layers = 0;
     ggml_backend_dev_t selected_devices[2] = { nullptr, nullptr };
     ggml_backend_dev_t selected_device = nullptr;
     if (device_name && *device_name) {
@@ -648,19 +656,35 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
             }
         }
         if (!selected) {
-            set_err(err, err_len, "璇烽€夋嫨鐨勬樉鍗′笉鍦ㄥ綋鍓嶅悗绔敮鎸佺殑璁惧鍒楄〃涓�");
+            set_err(err, err_len, "所选显卡不在当前后端支持的设备列表中，请重新选择设备");
             return nullptr;
         }
         const auto type = ggml_backend_dev_type(selected);
         if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            set_err(err, err_len, "鎸囧畾璁惧涓嶆槸 GPU 鎴栭泦鎴愭樉鍗�");
+            set_err(err, err_len, "指定设备不是 GPU 或集成显卡");
             return nullptr;
         }
-        selected_device = selected;
-        selected_devices[0] = selected;
-        mparams.devices = selected_devices;
-        mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
-        mparams.main_gpu = 0;
+        // 显存分档（REQ-097）：Tier 0~2 全量下放，Tier 3（<1 GiB）退回 CPU。
+        //
+        // 嵌入模型只有几百 MB，真正吃显存的是 KV cache 与视觉塔。1 GiB 是
+        // 「连权重都放不下」的经验阈值，低于它强行下放只会让
+        // llama_model_load_from_file 直接失败，而失败信息又长得像模型损坏，
+        // 用户根本猜不到是显存不够。宁可先跑 CPU，也不要报假错。
+        ggml_backend_dev_props selected_props{};
+        ggml_backend_dev_get_props(selected, &selected_props);
+        constexpr size_t kTier3Vram = 1ull * 1024ull * 1024ull * 1024ull;
+        if (selected_props.memory_total > 0 && selected_props.memory_total < kTier3Vram) {
+            // Tier 3：显存不足 1 GiB，等于没有可用的加速器，走 CPU。
+            selected_device = nullptr;
+        } else {
+            selected_device = selected;
+            // -1 = 把全部模型层交给选中的加速器（llama.cpp 的约定）。
+            mparams.n_gpu_layers = -1;
+            selected_devices[0] = selected;
+            mparams.devices = selected_devices;
+            mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+            mparams.main_gpu = 0;
+        }
     }
 
     llama_model *model = llama_model_load_from_file(model_path, mparams);
@@ -715,7 +739,9 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
     if (mmproj_path) {
         mtmd_context_params mmparams = mtmd_context_params_default();
         mmparams.use_gpu = selected_device != nullptr;
-        mmparams.backend_device = selected_device ? ggml_backend_dev_name(selected_device) : nullptr;
+        // llama.cpp 0.7 把 mtmd_context_params::backend_device（设备名字符串）
+        // 换成了 ggml_backend_dev_t device 句柄；传 nullptr 表示使用默认设备。
+        mmparams.device = selected_device;
         mmparams.print_timings = false;
         mmparams.warmup = false;
         mmparams.n_threads = threads;
@@ -839,7 +865,7 @@ void *ds_llama_duplicate_context(void *source, int n_ctx, int n_threads,
         if (mmproj_path) {
             mtmd_context_params mmparams = mtmd_context_params_default();
             mmparams.use_gpu = selected_device != nullptr;
-            mmparams.backend_device = selected_device ? ggml_backend_dev_name(selected_device) : nullptr;
+            mmparams.device = selected_device;
             mmparams.print_timings = false;
             mmparams.warmup = false;
             mmparams.n_threads = threads;
@@ -989,9 +1015,12 @@ int ds_llama_embed_media(void *handle, const ds_llama_media_item *items, int cou
         prompt += mtmd_get_marker(h->mtmd);
         prompt.push_back('\n');
     }
-    if (image_budget > 0) {
-        mtmd_set_image_max_tokens(h->mtmd, image_budget);
-    }
+    // llama.cpp 0.7 移除了 mtmd_set_image_max_tokens()：图像 token 预算现在
+    // 只能在 mtmd_context_params.image_max_tokens 里于初始化时确定。这里保留
+    // image_budget 的聚合校验（同一请求不允许混用不同预算），但不再在运行期
+    // 改写上下文；视觉编码器的实际 token 数由 mmproj 自身的分辨率与 merge
+    // 因子决定，越界仍由下面的 h->n_batch 检查兜底。
+    (void) image_budget;
     mtmd_input_chunks *chunks = mtmd_input_chunks_init();
     if (!chunks) {
         free_bitmaps();
@@ -1071,7 +1100,9 @@ int ds_llama_embed_media_batch(void *handle, const ds_llama_media_item *items, i
             set_err(err, err_len, "independent media batching currently accepts RGB images only");
             return -1;
         }
-        mtmd_set_image_max_tokens(h->mtmd, items[i].token_budget > 0 ? items[i].token_budget : 1120);
+        // 同 ds_llama_embed_media：新版 mtmd 取消了运行期的图像 token 上限设置，
+        // 每张图的 token_budget 由调用方通过分批数量控制（见 llama.rs 的 per_image），
+        // 这里只需保证单张序列仍在 h->n_batch 之内。
         if (!prepare_media_sequence(h, items[i], sequences[static_cast<size_t>(i)], err, err_len)) {
             return -1;
         }
@@ -1325,6 +1356,122 @@ int ds_llama_embed_batch(void *handle, const char **texts, int count,
     llama_batch_free(batch);
     clear_context();
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// 后端能力枚举（REQ-093 / REQ-096 / REQ-098 / REQ-100 / REQ-101）
+//
+// 需求表是按 PyTorch 写的（torch.cuda.is_available 之类）。本项目没有
+// PyTorch，等价物就是「这个 exe 里到底编进了哪些 GGML 后端」—— 因为后端是
+// 编译期决定的，运行时装不了，所以「检测」只需要问已链接进来的后端注册表。
+// ---------------------------------------------------------------------------
+
+int ds_llama_backend_count() {
+    ensure_backend_initialized();
+    return static_cast<int>(ggml_backend_reg_count());
+}
+
+int ds_llama_backend_info(int wanted, char *name, int name_len, char *features,
+                          int features_len, int *device_count, int *has_accelerator) {
+    ensure_backend_initialized();
+    if (wanted < 0 || !name || name_len <= 0) {
+        return -1;
+    }
+    if (static_cast<size_t>(wanted) >= ggml_backend_reg_count()) {
+        return -1;
+    }
+    const auto reg = ggml_backend_reg_get(static_cast<size_t>(wanted));
+    if (!reg) {
+        return -1;
+    }
+    const char *reg_name = ggml_backend_reg_name(reg);
+    std::snprintf(name, static_cast<size_t>(name_len), "%s", reg_name ? reg_name : "");
+
+    // 后端的编译期特性（例如 Vulkan 的 device count、CUDA 的 compute cap）。
+    // 这是判断「后端是否真的可用」与「它是加速器还是纯 CPU」的正路。
+    std::string collected;
+    if (features && features_len > 0) {
+        const auto get_features = reinterpret_cast<ggml_backend_get_features_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features"));
+        if (get_features) {
+            for (const ggml_backend_feature *f = get_features(reg); f && f->name; ++f) {
+                if (f->name[0] == '\0') {
+                    break;
+                }
+                if (!collected.empty()) {
+                    collected += ';';
+                }
+                collected += f->name;
+                collected += '=';
+                collected += f->value ? f->value : "";
+            }
+        }
+    }
+
+    // 加速器判定：该后端至少注册了一个 GPU / IGPU 设备。
+    int accel = 0;
+    const size_t devs = ggml_backend_reg_dev_count(reg);
+    for (size_t i = 0; i < devs; ++i) {
+        const auto dev = ggml_backend_reg_dev_get(reg, i);
+        if (!dev) {
+            continue;
+        }
+        const auto t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            accel = 1;
+            break;
+        }
+    }
+    if (device_count) {
+        *device_count = static_cast<int>(devs);
+    }
+    if (has_accelerator) {
+        *has_accelerator = accel;
+    }
+    if (features && features_len > 0) {
+        std::snprintf(features, static_cast<size_t>(features_len), "%s", collected.c_str());
+    }
+    return 0;
+}
+
+// 按设备 id 探测显存分档（REQ-097）。返回 0..3，-1 表示设备不存在。
+//
+// 分档规则直接写在 C 侧，是因为 llama.cpp 的显存配额就是在这里被消费的，
+// Rust 侧再算一遍容易和「实际下放策略」漂移。
+int ds_llama_device_tier(const char *device_key_in) {
+    ensure_backend_initialized();
+    if (!device_key_in || !*device_key_in) {
+        return -1;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        const auto dev = ggml_backend_dev_get(i);
+        const auto t = ggml_backend_dev_type(dev);
+        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        if (device_key(dev) != device_key_in) {
+            continue;
+        }
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(dev, &props);
+        const size_t total = props.memory_total;
+        if (total == 0) {
+            // 未知显存：按集显处理，保守给 Tier 2。
+            return 2;
+        }
+        constexpr size_t gib = 1024ull * 1024ull * 1024ull;
+        if (total >= 8ull * gib) {
+            return 0;
+        }
+        if (total >= 4ull * gib) {
+            return 1;
+        }
+        if (total >= 1ull * gib) {
+            return 2;
+        }
+        return 3;
+    }
+    return -1;
 }
 
 void ds_llama_free(void *handle) {

@@ -48,6 +48,21 @@ impl Ord for ScoredVector {
     }
 }
 
+/// 读某个向量目录里**已落盘**的维度（meta.json 的 `dim`）。
+///
+/// CLI 启动时只需要这个数字来判断按什么步长解析 vectors.bin，不应该为此
+/// 加载整个 embedding 模型。文件不存在 / 损坏时返回 None。
+pub fn saved_dim_of(dir: &Path) -> Option<usize> {
+    let s = std::fs::read_to_string(dir.join("meta.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let dim = v.get("dim")?.as_u64()? as usize;
+    if dim == 0 {
+        None
+    } else {
+        Some(dim)
+    }
+}
+
 impl VectorStore {
     pub fn open(dir: &Path, dim: usize) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
@@ -109,6 +124,13 @@ impl VectorStore {
         // 旧向量全部作废，直接清空重建，否则数据会按错误步长错位。
         if let Some(d) = self.saved_dim() {
             if d != self.dim {
+                // 必须留下痕迹：这条静默 return 会让「向量库一直是空的」变得
+                // 完全不可诊断（用户只看到语义检索永远 0 条、GPU 从不吃显存）。
+                eprintln!(
+                    "[vector] {} 的维度是 {d}，当前后端需要 {}，旧向量作废并按新维度重建",
+                    self.dir.display(),
+                    self.dim
+                );
                 return Ok(());
             }
         }
@@ -125,7 +147,15 @@ impl VectorStore {
             .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
             .collect();
         if self.dim > 0 && data.len() != ids.len() * self.dim {
-            // 文件损坏或维度记录缺失：保守起见清空，避免越界
+            // 文件损坏或维度记录缺失：保守起见清空，避免越界。
+            // 同样必须留痕，否则向量直接消失且没有任何线索。
+            eprintln!(
+                "[vector] {} 数据长度 {} 与 ids {} × dim {} 不匹配，按损坏处理并清空",
+                self.dir.display(),
+                data.len(),
+                ids.len(),
+                self.dim
+            );
             return Ok(());
         }
         let slots = ids.len();
@@ -205,6 +235,32 @@ impl VectorStore {
 
     pub fn has(&self, file_id: i64) -> bool {
         self.index.read().contains_key(&file_id)
+    }
+
+    /// 取出一批 id 的向量（缺失的跳过），按传入顺序返回。
+    ///
+    /// 为什么不是逐个 `get()`：每次 get 都要拿两把锁并复制一份 Vec，
+    /// 语义星图一次要取几百条，逐个调用等于反复抢锁 + 几百次堆分配。
+    /// 这里一次读锁内把整批复制进一块连续内存。
+    pub fn get_many(&self, ids: &[i64]) -> Vec<(i64, Vec<f32>)> {
+        let index = self.index.read();
+        let data = self.data.read();
+        let mut out = Vec::with_capacity(ids.len());
+        for &fid in ids {
+            if let Some(&slot) = index.get(&fid) {
+                let base = slot * self.dim;
+                out.push((fid, data[base..base + self.dim].to_vec()));
+            }
+        }
+        out
+    }
+
+    /// 全部已落盘向量的 id（顺序不保证）。
+    ///
+    /// 语义星图需要"先决定取样哪些文件，再取它们的向量"：取样要结合目录、
+    /// 大小等元数据，光看向量本身做不了分层抽样。
+    pub fn all_ids(&self) -> Vec<i64> {
+        self.index.read().keys().copied().collect()
     }
 
     pub fn get(&self, file_id: i64) -> Option<Vec<f32>> {

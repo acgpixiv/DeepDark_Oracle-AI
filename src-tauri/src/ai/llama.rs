@@ -100,6 +100,108 @@ extern "C" {
         err_len: c_int,
     ) -> c_int;
     fn ds_llama_free(handle: *mut c_void);
+
+    // ---- 后端能力枚举（REQ-093 / REQ-097 / REQ-098 / REQ-100）
+    //
+    // 需求表里这些能力是按 PyTorch 的 torch.cuda.is_available() 之类写的。
+    // 本项目没有 PyTorch：能用的加速后端在编译期就已确定并链进 exe，
+    // 所以"检测"= 问已链接的 GGML 后端注册表，而不是在运行时装驱动。
+    fn ds_llama_backend_count() -> c_int;
+    fn ds_llama_backend_info(
+        index: c_int,
+        name: *mut c_char,
+        name_len: c_int,
+        features: *mut c_char,
+        features_len: c_int,
+        device_count: *mut c_int,
+        has_accelerator: *mut c_int,
+    ) -> c_int;
+    fn ds_llama_device_tier(device_key: *const c_char) -> c_int;
+}
+
+/// 一个编译期链入的 GGML 后端（CUDA / Vulkan / Metal / CPU ...）。
+///
+/// 需求表（REQ-093）把它叫"推理后端"，并按 PyTorch 的写法去探测
+/// `torch.cuda.is_available()`。本项目没有 PyTorch：后端是编译期决定的，
+/// 运行时装不进来，所以"检测"就是问已链接的后端注册表。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GpuBackend {
+    /// 后端名，例如 `CUDA` / `Vulkan` / `CPU`。
+    pub name: String,
+    /// 该后端注册的设备数（含 CPU 设备）。
+    pub device_count: i32,
+    /// 是否至少带一块 GPU / 集成显卡设备。
+    pub accelerator: bool,
+    /// 编译期特性键值对，例如 `VRAM=8188`。
+    pub features: Vec<(String, String)>,
+}
+
+/// 枚举链进当前二进制的全部 GGML 后端。
+///
+/// 纯 CPU 的后端（CPU/BLAS）也会返回：上层要靠它回答"这个安装包到底能不能
+/// 用显卡"。若只列出带显卡的后端，纯 CPU 构建会得到空列表，和"枚举失败"
+/// 长得一模一样，反而让诊断无从下手。
+pub fn gpu_backends() -> Vec<GpuBackend> {
+    let count = unsafe { ds_llama_backend_count() };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let mut name = [0u8; 128];
+        let mut features = [0u8; 1024];
+        let mut device_count: c_int = 0;
+        let mut accelerator: c_int = 0;
+        let ok = unsafe {
+            ds_llama_backend_info(
+                i,
+                name.as_mut_ptr() as *mut c_char,
+                name.len() as c_int,
+                features.as_mut_ptr() as *mut c_char,
+                features.len() as c_int,
+                &mut device_count,
+                &mut accelerator,
+            )
+        };
+        if ok != 0 {
+            continue;
+        }
+        let name = c_buf_string(&name);
+        if name.is_empty() {
+            continue;
+        }
+        let raw_features = c_buf_string(&features);
+        let features = raw_features
+            .split(';')
+            .filter(|item| !item.is_empty())
+            .map(|item| match item.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (item.to_string(), String::new()),
+            })
+            .collect();
+        out.push(GpuBackend {
+            name,
+            device_count,
+            accelerator: accelerator != 0,
+            features,
+        });
+    }
+    out
+}
+
+/// 按显存给设备分档（REQ-097）：0 = 8 GiB 及以上，1 = 4~8 GiB，
+/// 2 = 1~4 GiB，3 = 小于 1 GiB（等同纯 CPU）。设备不存在时返回 None。
+///
+/// 分档阈值与 llama_shim.cpp 里的下放策略必须一致，否则界面报"够用"、
+/// 实际却退回 CPU，用户会觉得检测结果是假的。
+pub fn device_tier(device_id: &str) -> Option<u8> {
+    let key = CString::new(device_id).ok()?;
+    let tier = unsafe { ds_llama_device_tier(key.as_ptr()) };
+    if tier < 0 {
+        None
+    } else {
+        Some(tier as u8)
+    }
 }
 
 fn create_handle(

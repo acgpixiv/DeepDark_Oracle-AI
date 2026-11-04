@@ -36,6 +36,7 @@ src-tauri/target-cuda-ninja/
 src-tauri/cmake-check/
 target-candle-check/
 .tools/
+.tmpbuild/
 
 # ───────── 交付产物（体积大，不入库） ─────────
 release/
@@ -61,3 +62,18 @@ __pycache__/
 *.pyc
 _tmp/
 _tmp_*/
+
+# ───────── 二进制与运行产物（不入库）─────────
+# WebView2Loader.dll 是构建产物，由 cargo 生成后手动复制；每个用户
+# 自己构建时都会拿到，不该进仓库（160KB 二进制，且随环境版本变化）。
+WebView2Loader.dll
+# 前端构建临时目录（esbuild 的 %TEMP% 被拒时改到项目内）
+build-tmp/
+
+# ───────── 需求表（含个人业务信息，按需上传）─────────
+# 三张 xlsx 是需求来源，内容与项目强相关，保留在仓库里便于追溯。
+# 若将来含客户隐私，取消注释即可排除。
+# 今日需求汇总明细表.xlsx
+# 2D转3D与星图需求明细.xlsx
+# DeepDark_Oracle_GPU兼容性需求明细表.xlsx
+# 清晰平面与蓝图风格需求明细表.xlsx

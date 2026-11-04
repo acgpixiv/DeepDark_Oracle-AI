@@ -1,17 +1,20 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { Database, Search, Settings2 } from "lucide-vue-next";
+import { Database, Network, Search, Settings2 } from "lucide-vue-next";
 import { api, type ScanProgress } from "./api";
 import { refreshInfo, refreshStats, store, toast } from "./store";
 import { applyAppearance } from "./theme";
 import { langState, t } from "./i18n";
 import SearchView from "./views/SearchView.vue";
 import TreeView from "./views/TreeView.vue";
+import GalaxyView from "./views/GalaxyView.vue";
 import SettingsDrawer from "./components/SettingsDrawer.vue";
 import IndexTreePanel from "./components/IndexTreePanel.vue";
 
-type Page = "home" | "tree" | "settings";
+type Page = "home" | "tree" | "graph" | "settings";
 const page = ref<Page>("home");
+/** 星系图谱的根目录（从目录树点进来时带路径，否则空串=所有索引根）。 */
+const graphRoot = ref("");
 const settingsTab = ref("general");
 /** 右上角「索引目录结构」下拉面板是否展开。 */
 const treePanelOpen = ref(false);
@@ -31,6 +34,26 @@ function openFullTree() {
 function showSettings(tab = "general") {
   settingsTab.value = tab;
   page.value = "settings";
+}
+
+/** 打开全屏星系图谱（REQ-002：快捷键 Ctrl+G / 顶栏图标）。 */
+function openGalaxy(root = "") {
+  treePanelOpen.value = false;
+  graphRoot.value = root;
+  page.value = "graph";
+}
+
+/** 全局快捷键：Ctrl+G 切星系图谱，Ctrl+F 回搜索。 */
+function onGlobalKey(e: KeyboardEvent) {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const key = e.key.toLowerCase();
+  if (key === "g") {
+    e.preventDefault();
+    page.value === "graph" ? (page.value = "home") : openGalaxy();
+  } else if (key === "f" && page.value === "graph") {
+    e.preventDefault();
+    page.value = "home";
+  }
 }
 
 /** 读取配置并应用外观（主题 / 字号 / 语言）。 */
@@ -73,12 +96,14 @@ onMounted(async () => {
   } catch {}
   statsTimer = window.setInterval(refreshStats, 5000);
   scanTimer = window.setInterval(pollScan, 3000);
+  window.addEventListener("keydown", onGlobalKey);
   void pollScan();
 });
 
 onBeforeUnmount(() => {
   if (statsTimer) window.clearInterval(statsTimer);
   if (scanTimer) window.clearInterval(scanTimer);
+  window.removeEventListener("keydown", onGlobalKey);
 });
 
 // 从设置页返回时重新同步一次外观（用户可能刚改过主题）
@@ -120,6 +145,15 @@ watch(page, (next) => {
           @open-full="openFullTree"
         />
       </div>
+      <button
+        class="icon-button graph-button"
+        :class="{ current: page === 'graph' }"
+        :title="t('星系图谱（Ctrl+G）')"
+        :aria-label="t('星系图谱')"
+        @click="page === 'graph' ? (page = 'home') : openGalaxy()"
+      >
+        <Network :size="19" aria-hidden="true" />
+      </button>
       <button class="icon-button settings-button" :title="t('设置')" :aria-label="t('设置')" @click="page === 'settings' ? (page = 'home') : showSettings()">
         <Settings2 :size="19" aria-hidden="true" />
       </button>
@@ -129,6 +163,7 @@ watch(page, (next) => {
       <Transition name="page" mode="out-in">
         <SearchView v-if="page === 'home'" key="home" :thumb-dir="thumbDir" />
         <TreeView v-else-if="page === 'tree'" key="tree" />
+        <GalaxyView v-else-if="page === 'graph'" key="graph" :root="graphRoot" @back="page = 'home'" />
         <SettingsDrawer
           v-else
           key="settings"
@@ -217,6 +252,8 @@ watch(page, (next) => {
 .icon-button:hover { background: var(--panel); border-color: var(--border); color: var(--text); }
 .icon-button:active { transform: scale(.94); }
 .settings-button { margin-left: 4px; }
+.graph-button { margin-left: 2px; }
+.graph-button.current { background: var(--panel); border-color: var(--border); color: var(--text); }
 .app-content { flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
 
 /* 页面切换：淡入 + 轻微上移，避免整块界面硬切。 */

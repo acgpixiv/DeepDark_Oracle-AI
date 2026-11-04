@@ -5,6 +5,9 @@
 pub mod bpe;
 pub mod clap;
 pub mod clip;
+/// GPU 能力探测与后端选择（REQ-093 ~ REQ-102）。无 GPU 时全部降级为 CPU，
+/// 不返回错误 —— GPU 检测失败绝不能让主程序起不来。
+pub mod gpu;
 pub mod hash;
 #[cfg(feature = "candle")]
 pub mod candle_backend;

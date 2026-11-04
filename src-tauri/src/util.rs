@@ -63,6 +63,20 @@ pub fn ext_kind(ext: &str) -> &'static str {
     }
 }
 
+/// 能抽出正文的 kind。其余类型在 `index.rs::process_one` 里必然被标成
+/// `text=skip`，把它们排进全文队列只会白白消耗一次路径检查 + 缩略图。
+/// 注意 PDF 属于 `document`，走 `extract_text` 的 pdf 分支。
+pub fn kind_has_text(kind: &str) -> bool {
+    matches!(kind, "text" | "document")
+}
+
+/// 能生成向量（正文或图像特征）的 kind。`archive` / `app` / `other`
+/// 既不能抽正文也没有视觉语义，`process_one` 会直接标 `embed=skip`，
+/// 因此不进入向量队列 —— 否则它们永远显示为"待处理"，进度条永远不动。
+pub fn kind_has_embedding(kind: &str) -> bool {
+    matches!(kind, "image" | "audio" | "video" | "text" | "document")
+}
+
 pub fn kind_label(kind: &str) -> &'static str {
     match kind {
         "image" => "图片",

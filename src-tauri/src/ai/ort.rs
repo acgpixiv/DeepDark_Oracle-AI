@@ -45,6 +45,20 @@ const IDX_RELEASE_VALUE: usize = 96;
 const IDX_RELEASE_TENSOR_SHAPE: usize = 99;
 const IDX_RELEASE_SESSION_OPTIONS: usize = 100;
 
+// ---------------------------------------------------------------- 执行提供器
+//
+// 需求 #3/#7「GPU 调用能力太弱」在 ONNX 这一侧的正解：把 CLIP/CLAP 从 CPU
+// 换到 DirectML（Windows 全平台通用，NVIDIA/AMD/Intel 都能用）或 CUDA。
+//
+// 这两个 EP 都不在 `OrtApi` 函数表里，而是 dll 的**独立导出函数**：
+//   OrtSessionOptionsAppendExecutionProvider_DML (options, device_id)
+//   OrtSessionOptionsAppendExecutionProvider_CUDA(options, device_id)
+// 用 GetProcAddress 直接取，取不到就保持 CPU —— 缺 EP 是正常降级，不是故障。
+
+/// 优先尝试的后端，按顺序。onxruntime 的 DirectML 包会导出 DML，
+/// CUDA 包（Microsoft.ML.OnnxRuntime.Gpu）会导出 CUDA。
+const EP_CANDIDATES: [&str; 2] = ["CUDA", "DML"];
+
 macro_rules! api_fn {
     ($api:expr, $idx:expr, $ty:ty) => {{
         let p = *(($api) as *const usize).add($idx);
@@ -54,6 +68,19 @@ macro_rules! api_fn {
 
 fn wide(s: &Path) -> Vec<u16> {
     s.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+/// 探测 dll 里实际导出的 EP，返回第一个可用的名字。
+///
+/// 只看符号是否存在，不真的初始化（初始化要 device_id，放到建 Session 时做）。
+unsafe fn detect_ep(dll: *mut c_void) -> &'static str {
+    for name in EP_CANDIDATES {
+        let sym = format!("OrtSessionOptionsAppendExecutionProvider_{name}\0");
+        if !GetProcAddress(dll, sym.as_ptr()).is_null() {
+            return name;
+        }
+    }
+    ""
 }
 
 unsafe fn check(api: OrtPtr, st: Status) -> Result<(), String> {
@@ -105,6 +132,8 @@ struct Inner {
     env: OrtPtr,
     mem: OrtPtr,
     threads: i32,
+    /// 实际挂上的 EP 名字（"CUDA" / "DML"），空串表示纯 CPU。
+    ep: &'static str,
     // 保持 DLL 句柄存活：最后一个引用释放前不能被卸载。
     _dll: *mut c_void,
 }
@@ -171,12 +200,19 @@ impl Ort {
             } else {
                 std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4).min(8) as i32
             };
-            Ok(Ort { inner: Arc::new(Inner { api, env, mem, threads: n, _dll: h }) })
+            // EP 的可用性要在这里探一次：Session 创建时要据此决定是否追加。
+            let ep = detect_ep(h);
+            Ok(Ort { inner: Arc::new(Inner { api, env, mem, threads: n, ep, _dll: h }) })
         }
     }
 
     pub fn threads(&self) -> i32 {
         self.inner.threads
+    }
+
+    /// 实际生效的执行提供器（"" 表示纯 CPU）。给「模型」页与诊断日志用。
+    pub fn execution_provider(&self) -> &'static str {
+        self.inner.ep
     }
 
     /// 打开一个模型文件。
@@ -198,6 +234,13 @@ impl Ort {
             if r.is_ok() {
                 r = check(api, set_graph(opts, 99));
             }
+            // 有 GPU 就挂上去。EP 追加失败（驱动版本不符、显存不足、算子不支持）
+            // 绝不能连累整个模型：退回 CPU 仍然能跑，只是慢。
+            if r.is_ok() && !self.inner.ep.is_empty() {
+                if let Err(e) = attach_ep(self.inner._dll, opts, self.inner.ep) {
+                    eprintln!("[ort] {} 执行提供器挂载失败，退回 CPU：{e}", self.inner.ep);
+                }
+            }
             let mut sess: OrtPtr = ptr::null_mut();
             if r.is_ok() {
                 let mp = wide(model);
@@ -208,6 +251,24 @@ impl Ort {
             Ok(Session { inner: Arc::clone(&self.inner), sess })
         }
     }
+}
+
+/// 把 EP 挂到 SessionOptions 上。
+///
+/// DML 用 device_id=0（系统默认适配器，也就是主显卡）；CUDA 同理。
+unsafe fn attach_ep(dll: *mut c_void, opts: OrtPtr, ep: &str) -> Result<(), String> {
+    let sym = format!("OrtSessionOptionsAppendExecutionProvider_{ep}\0");
+    let p = GetProcAddress(dll, sym.as_ptr());
+    if p.is_null() {
+        return Err(format!("dll 没有导出 {sym}"));
+    }
+    let f: unsafe extern "system" fn(OrtPtr, i32) -> Status = std::mem::transmute(p);
+    let st = f(opts, 0);
+    if st.is_null() {
+        return Ok(());
+    }
+    // 这里拿不到 api 表（attach_ep 是自由函数），只能报状态码。
+    Err(format!("EP 返回非零状态（{st:p}）"))
 }
 
 /// 一个已加载的 ONNX 模型。

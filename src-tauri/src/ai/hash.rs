@@ -65,7 +65,15 @@ impl HashEmbedder {
         Ok(self.image_vec_from(&img))
     }
 
+    /// 图片 → 256 维特征（8×8 缩略图颜色 + RGB 直方图 + 亮度均值/方差）。
     fn image_vec_from(&self, img: &image::DynamicImage) -> Vec<f32> {
+        // 先缩到 64×64 再做统计：这里的每一次像素遍历都在**单线程消费者**
+        // 里跑，而 pixiv 原图解码后动辄 4000×6000（7200 万像素、RGB 副本
+        // 200 MB+）。原来 `to_rgb8()` 会先复制一整份全尺寸图像，再对每个
+        // 像素遍历两遍 —— 单张图 0.3 秒起跳，这正是索引只有 3 张/秒、CPU
+        // 却只跑 1.2 核的元凶（消费者被这一件事卡住，32 条解码线程干等）。
+        // 缩到 64×64 后统计结果几乎不变（直方图/均值都是比例量），
+        // 单张耗时从百毫秒级降到 1 毫秒级。
         let small = img.resize_exact(8, 8, image::imageops::FilterType::Triangle).to_rgb8();
         let mut v = vec![0.0f32; DIM];
         let mut i = 0;
@@ -76,11 +84,11 @@ impl HashEmbedder {
             v[(i + 2) % DIM] += b as f32 / 255.0 * 0.5;
             i += 3;
         }
-        // RGB 直方图（每通道 16 桶）
-        let full = img.to_rgb8();
+        // RGB 直方图（每通道 16 桶）与亮度统计都基于这张 64×64 的工作图。
+        let work = img.resize_exact(64, 64, image::imageops::FilterType::Triangle).to_rgb8();
         let mut hist = [[0.0f32; 16]; 3];
-        let total = (full.width() * full.height()).max(1) as f32;
-        for px in full.pixels() {
+        let total = (work.width() * work.height()).max(1) as f32;
+        for px in work.pixels() {
             let [r, g, b] = px.0;
             hist[0][(r >> 4) as usize] += 1.0;
             hist[1][(g >> 4) as usize] += 1.0;
@@ -94,7 +102,7 @@ impl HashEmbedder {
         // 亮度均值/方差
         let mut mean = 0.0f32;
         let mut sq = 0.0f32;
-        for px in full.pixels() {
+        for px in work.pixels() {
             let l = (px.0[0] as f32 + px.0[1] as f32 + px.0[2] as f32) / 765.0;
             mean += l;
             sq += l * l;

@@ -153,6 +153,59 @@ export interface GpuDevice {
   integrated: boolean;
 }
 
+/** 编译期链入的一个 GGML 后端（CUDA / Vulkan / Metal / CPU）。 */
+export interface GpuBackendInfo {
+  name: string;
+  accelerator: boolean;
+  device_count: number;
+  features: [string, string][];
+}
+
+/** 单个加速设备的自描述，显存按 MiB 计。 */
+export interface GpuDeviceInfo {
+  id: string;
+  name: string;
+  backend: string;
+  vendor: string;
+  total_mb: number;
+  free_mb: number;
+  integrated: boolean;
+  /** 显存分档 0~3：0=≥8GiB，1=4~8GiB，2=1~4GiB，3=<1GiB（等同 CPU）。 */
+  tier: number;
+}
+
+/**
+ * GPU 能力报告（REQ-093）。字段刻意贴近需求表的
+ * `{backend, gpu_name, vram_mb, cuda_version, status}` 形状。
+ */
+export interface GpuReport {
+  generated_at: string;
+  platform: string;
+  arch: string;
+  backend: string;
+  gpu_name: string;
+  vendor: string;
+  vram_mb: number;
+  vram_free_mb: number;
+  cuda_version: string | null;
+  /** 当前安装包是否编入了 CUDA 后端（决定要不要校验 nvcc）。 */
+  cuda_required: boolean;
+  driver_version: string | null;
+  /** ready | degraded | cpu_only */
+  status: string;
+  tier: number;
+  reason: string;
+  backends: GpuBackendInfo[];
+  devices: GpuDeviceInfo[];
+  notes: string[];
+  /** 按显卡型号给出的 CUDA Toolkit 版本建议，未启用 CUDA 后端时为 null。 */
+  cuda_hint: string | null;
+  /** 是否装过可选的 ONNX Runtime 跨模态扩展。 */
+  ort_present: boolean;
+  /** 装了扩展时按此顺序协商 ExecutionProvider。 */
+  ort_providers: string[];
+}
+
 /** 模型目录里的一个 GGUF 文件 */
 export interface ModelEntry {
   path: string;
@@ -256,6 +309,167 @@ export interface TreeLevel {
   indexed: number;
   pending: number;
   hidden_files: number;
+}
+
+/** 星系图谱骨架（cmd::graph_data）—— 需求 REQ-042~052 的最小落地版本。 */
+export interface GraphNodeOut {
+  id: string;
+  node_type: string;
+  name: string;
+  path: string;
+  kind: string;
+  size: number;
+  count: number;
+  depth: number;
+  mtime: number;
+}
+
+export interface GraphEdgeOut {
+  source: string;
+  target: string;
+  edge_type: string;
+  strength: number;
+}
+
+export interface GraphDataOut {
+  root: string;
+  name: string;
+  nodes: GraphNodeOut[];
+  edges: GraphEdgeOut[];
+  total_files: number;
+  total_bytes: number;
+  truncated: number;
+}
+
+/** 星图节点（star 模块，对应 Rust 侧 StarNode）。 */
+export interface StarNodeOut {
+  id: string;
+  name: string;
+  node_type: string;
+  path: string;
+  kind: string;
+  size: number;
+  count: number;
+  depth: number;
+  mtime: number;
+  parent: string | null;
+  has_children: boolean;
+  cluster: number;
+  color: string;
+  /** 恒星光谱型（仅盘符节点）：system / data / archive / removable。 */
+  star_class?: string;
+  /** 物理容量（字节），仅盘符节点。0 表示取不到。 */
+  capacity?: number;
+  /** 已用比例 0~1，画恒星外圈进度光环。 */
+  used_ratio?: number;
+}
+
+/** 盘符物理信息（star_drives）：恒星大小与引力的数据源。 */
+export interface DriveOut {
+  mount: string;
+  letter: string;
+  label: string;
+  fs: string;
+  total_bytes: number;
+  free_bytes: number;
+  removable: boolean;
+  star_class: string;
+  /** 引擎直接用的世界坐标半径。 */
+  star_radius: number;
+  /** 引力强度 0~1。 */
+  gravity: number;
+}
+
+/** 语义星图节点（向量聚类的一个文件）。 */
+export interface SemanticNodeOut {
+  id: string;
+  file_id: number;
+  name: string;
+  path: string;
+  kind: string;
+  size: number;
+  mtime: number;
+  cluster: number;
+  centrality: number;
+  color: string;
+}
+
+export interface SemanticEdgeOut {
+  source: string;
+  target: string;
+  edge_type: string;
+  strength: number;
+}
+
+export interface SemanticClusterOut {
+  id: number;
+  size: number;
+  label: string;
+  color: string;
+}
+
+export interface SemanticGraphOut {
+  nodes: SemanticNodeOut[];
+  edges: SemanticEdgeOut[];
+  clusters: SemanticClusterOut[];
+  total: number;
+  available: number;
+  dim: number;
+  threshold: number;
+  truncated: boolean;
+}
+
+export interface StarEdgeOut {
+  source: string;
+  target: string;
+  edge_type: string;
+  strength: number;
+}
+
+export interface StarGraphOut {
+  root: string;
+  name: string;
+  level: number;
+  nodes: StarNodeOut[];
+  edges: StarEdgeOut[];
+  total_files: number;
+  total_bytes: number;
+  hidden_files: number;
+  hidden_bytes: number;
+  truncated: number;
+}
+
+/** 思维模型图的条目（REQ-053~061 八种模型共用）。 */
+export interface MindItem {
+  name: string;
+  path: string;
+  kind: string;
+  ext: string;
+  size: number;
+  mtime: number;
+  dir: string;
+}
+
+/** 一级分组：颜色、计数、条目列表。 */
+export interface MindGroup {
+  key: string;
+  label: string;
+  count: number;
+  bytes: number;
+  color: string;
+  items: MindItem[];
+}
+
+/** 八种思维模型图的数据（cmd::mind_map_data）。 */
+export interface MindMapOut {
+  model: string;
+  title: string;
+  subtitle: string;
+  groups: MindGroup[];
+  total_files: number;
+  total_bytes: number;
+  /** 时间线模型用：按时间桶排好的分组顺序。 */
+  buckets?: string[];
 }
 
 export interface WatchStatus {
@@ -367,6 +581,10 @@ export const api = {
 
   modelInfo: () => invoke<ModelInfo>("model_info"),
   gpuDevices: () => invoke<GpuDevice[]>("gpu_devices"),
+  /** 完整 GPU 能力报告（REQ-093），设置页「显示适配」用它。 */
+  gpuReport: () => invoke<GpuReport>("gpu_report"),
+  /** 重新探测并落盘 gpu_report.log，返回写入路径。 */
+  gpuRefreshReport: () => invoke<string>("gpu_refresh_report"),
   modelLoad: (backend: string, path?: string) =>
     invoke<ModelInfo>("model_load", { backend, path }),
   modelDeactivate: () => invoke<ModelInfo>("model_deactivate"),
@@ -404,6 +622,29 @@ export const api = {
     invoke<TreeLevel>("tree_browse", { path, fileLimit }),
   treeSearch: (query: string, limit = 200) =>
     invoke<TreeEntry[]>("tree_search", { query, limit }),
+
+  /** 星系图谱骨架：根 + depth 层目录 + 每目录前 N 个文件。 */
+  graphData: (root?: string, depth = 2, maxNodes = 900, fileLimit = 31) =>
+    invoke<GraphDataOut>("graph_data", { root, depth, maxNodes, fileLimit }),
+
+  /** 盘符物理信息：容量 / 可用 / 卷标 / 恒星半径与引力。 */
+  starDrives: () => invoke<DriveOut[]>("star_drives"),
+  /** 语义星图：按向量相似度聚类建边（"排序模式"的核心）。 */
+  starSemantic: (maxNodes = 260, threshold = 0.55) =>
+    invoke<SemanticGraphOut>("star_semantic", { maxNodes, threshold }),
+  /** 星图渐进式探索：Level 0 全局概览（类型节点 + 根，需求 #19）。 */
+  starOverview: () => invoke<StarGraphOut>("star_overview"),
+  /** 星图：展开某个节点的下一层（需求 #20/#21）。 */
+  starChildren: (nodeId?: string, fileLimit = 60, dirLimit = 80) =>
+    invoke<StarGraphOut>("star_children", { nodeId, fileLimit, dirLimit }),
+  /** 星图布局缓存（需求 #52 的 Rust 侧一级，TTL 5 分钟）。 */
+  starLayoutGet: (key: string) => invoke<number[][] | null>("star_layout_get", { key }),
+  starLayoutPut: (key: string, positions: number[]) =>
+    invoke<boolean>("star_layout_put", { key, positions }),
+
+  /** 思维模型图：把一组文件按八种模型之一整理成图数据。 */
+  mindMapData: (model: string, paths: string[], query?: string) =>
+    invoke<MindMapOut>("mind_map_data", { model, paths, query }),
   workspaceAdd: (dir: string) => invoke<string[]>("workspace_add", { dir }),
   workspaceState: () => invoke<WorkspaceState>("workspace_state"),
   workspaceRemember: (path: string, scope?: string) =>

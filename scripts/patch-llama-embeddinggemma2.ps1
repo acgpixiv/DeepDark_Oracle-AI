@@ -16,9 +16,11 @@ if (-not (Test-Path -LiteralPath $arch)) {
 $source = [System.IO.File]::ReadAllText($arch)
 $headerSource = if (Test-Path -LiteralPath $modelHeader) { [System.IO.File]::ReadAllText($modelHeader) } else { "" }
 $modelText = if (Test-Path -LiteralPath $modelSource) { [System.IO.File]::ReadAllText($modelSource) } else { "" }
+# Upstream changed build_inp_embd() to take an attention scale argument
+# (build_inp_embd(model.tok_embd, sqrtf(n_embd))), so match the call prefix only.
 if ($source.Contains("LLM_ARCH_GEMMA_EMBEDDING2") -and
     $headerSource.Contains("struct llama_model_gemma_embedding2") -and
-    $modelText.Contains("build_inp_embd(model.tok_embd);")) {
+    $modelText.Contains("build_inp_embd(model.tok_embd")) {
   Write-Host "llama.cpp already supports gemma-embedding2"
   exit 0
 }

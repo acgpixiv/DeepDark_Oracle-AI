@@ -521,6 +521,9 @@ impl Scanner {
             .elapsed_millis
             .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         self.stats.current.lock().clear();
+        // 扫描写入/标记了一大批行，目录聚合的短 TTL 缓存必须立刻作废，
+        // 否则面板和图谱会拿着扫描前的旧数字（最多差 3 秒，但用户会觉得"没刷新"）。
+        db.invalidate_dir_rollup();
         self.stats.done.store(true, Ordering::SeqCst);
         self.stats.cancelled.store(self.cancel.load(Ordering::SeqCst), Ordering::SeqCst);
         let mut snap = self.snapshot();

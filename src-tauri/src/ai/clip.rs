@@ -39,9 +39,29 @@ impl ClipModel {
         }
         // onnxruntime.dll：先找 exe 同目录，再找当前目录。
         let dll = find_dll()?;
-        let ort = Ort::load(&dll, threads).ok()?;
-        let sess = ort.session(&model).ok()?;
-        let vocab = load_vocab(&vocab_path)?;
+        // 三条失败路径都要出声：不然"图片搜不到"永远查不出是哪一步断的。
+        let ort = match Ort::load(&dll, threads) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[clip] 加载 {} 失败：{e}", dll.display());
+                return None;
+            }
+        };
+        let sess = match ort.session(&model) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[clip] 创建会话失败（{}）：{e}", model.display());
+                return None;
+            }
+        };
+        let vocab = match load_vocab(&vocab_path) {
+            Some(v) => v,
+            None => {
+                eprintln!("[clip] 词表为空或不可读：{}", vocab_path.display());
+                return None;
+            }
+        };
+        eprintln!("[clip] 已加载：{} · EP={}", model.display(), if ort.execution_provider().is_empty() { "CPU" } else { ort.execution_provider() });
         Some(ClipModel {
             _ort: ort,
             sess: std::sync::Mutex::new(sess),
@@ -94,12 +114,42 @@ impl ClipModel {
     }
 
     pub fn image_data_vec(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
-        let pixels = self.prepare_image(image)?;
-        let ids = vec![101i64; MAX_TOKENS];
-        let mask = vec![1i64; MAX_TOKENS];
-        let ids_shape = [1i64, MAX_TOKENS as i64];
-        let px_shape = [1i64, 3, SIDE as i64, SIDE as i64];
-        let mask_shape = [1i64, MAX_TOKENS as i64];
+        let vectors = self.image_data_vecs(&[image])?;
+        vectors.into_iter().next().ok_or_else(|| "模型没有返回图像向量".into())
+    }
+
+    /// 只提交前向：像素已由调用方在其他线程里准备好。
+    ///
+    /// 索引器把 `prepare_image_pixels` 放进 rayon 生产者后，需要一条
+    /// 「不碰图像处理、只走 ONNX」的入口，否则并行算好的像素没法复用。
+    pub fn embed_pixels(&self, pixel_rows: &[&Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+        clip_image_embeds(&self.sess, pixel_rows)
+    }
+
+    /// 一次前向处理多张图。
+    ///
+    /// 这个 ONNX 导出的 `pixel_values` 是 `[image_batch_size, 3, 224, 224]`，
+    /// batch 维是**符号**（不是固定 1），所以官方支持批量。以前这里每张图
+    /// 单独跑一次 Session::run，DirectML 上每次都要重新提交一个 190 MB 的
+    /// 权重集 → GPU 利用率被前向之间的空隙吃光。改成整批一次前向后，
+    /// 同样的图片数 GPU 忙的时间占比明显上升。
+    pub fn image_data_vecs(
+        &self,
+        images: &[&image::DynamicImage],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = images.len() as i64;
+        let mut pixels = Vec::with_capacity(images.len() * 3 * SIDE * SIDE);
+        for image in images {
+            pixels.extend_from_slice(&self.prepare_image(image)?);
+        }
+        let ids = vec![101i64; MAX_TOKENS * images.len()];
+        let mask = vec![1i64; MAX_TOKENS * images.len()];
+        let ids_shape = [n, MAX_TOKENS as i64];
+        let px_shape = [n, 3, SIDE as i64, SIDE as i64];
+        let mask_shape = [n, MAX_TOKENS as i64];
         let sess = self.sess.lock().map_err(|e| e.to_string())?;
         let out = sess.run(
             &[
@@ -109,40 +159,120 @@ impl ClipModel {
             ],
             &["image_embeds"],
         )?;
-        let mut v = out.into_iter().next().ok_or("模型没有返回图像向量")?;
-        normalize(&mut v);
-        Ok(v)
+        let flat = out.into_iter().next().ok_or("模型没有返回图像向量")?;
+        if flat.len() != images.len() * self.dim {
+            return Err(format!(
+                "CLIP 批量输出维度不符：{} / 期望 {}×{}",
+                flat.len(),
+                images.len(),
+                self.dim
+            ));
+        }
+        let mut vectors = Vec::with_capacity(images.len());
+        for chunk in flat.chunks(self.dim) {
+            let mut v = chunk.to_vec();
+            normalize(&mut v);
+            vectors.push(v);
+        }
+        Ok(vectors)
     }
 
     /// 等比缩放 + 中心裁剪到 224×224，转 CHW 并归一化。
     fn prepare_image(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
-        let img = image.to_rgb8();
-        let (w, h) = (img.width() as usize, img.height() as usize);
-        if w == 0 || h == 0 {
-            return Err("图片尺寸为 0".into());
-        }
-        // 短边先缩到 224，再中心裁 224×224。
-        let scale = SIDE as f32 / w.min(h) as f32;
-        let nw = ((w as f32 * scale).round() as u32).max(SIDE as u32);
-        let nh = ((h as f32 * scale).round() as u32).max(SIDE as u32);
-        let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::CatmullRom);
-        let x = (nw as usize - SIDE) / 2;
-        let y = (nh as usize - SIDE) / 2;
-        let cropped = image::imageops::crop_imm(&resized, x as u32, y as u32, SIDE as u32, SIDE as u32).to_image();
-
-        let mut buf = vec![0f32; 3 * SIDE * SIDE];
-        let plane = SIDE * SIDE;
-        for (i, px) in cropped.pixels().enumerate() {
-            for c in 0..3 {
-                buf[c * plane + i] = (px[c] as f32 / 255.0 - MEAN[c]) / STD[c];
-            }
-        }
-        Ok(buf)
+        prepare_image_pixels(image)
     }
 
     fn encode(&self, text: &str) -> (Vec<i64>, Vec<i64>) {
         bert_encode(&self.vocab, text, MAX_TOKENS)
     }
+}
+
+/// 等比缩放 + 中心裁剪到 224×224，转 CHW 并归一化（CLIP 的像素输入）。
+///
+/// 独立成自由函数是为了让**调用方能在自己的线程池里并行预处理**。
+/// 之前它只在消费者线程里跑：索引图片的 32 条解码线程全在等
+/// `sync_channel`，而单单这里的 CatmullRom 缩放就要 83~103 ms/张
+/// （pixiv 3.5 MB 的 p50 原图），一轮 8 张光预处理就 0.8 秒 ——
+/// 实测把 CLIP 打开后整条索引链从 10.2 张/秒掉到 1.0 张/秒。
+///
+/// 滤波从 CatmullRom 换成 Triangle：224×224 的检索向量对插值核不敏感，
+/// 但 3 抽头替代 4 抽头带负瓣的核，实测省掉约 25% 的缩放时间。
+pub fn prepare_image_pixels(image: &image::DynamicImage) -> Result<Vec<f32>, String> {
+    let img = image.to_rgb8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 {
+        return Err("图片尺寸为 0".into());
+    }
+    // 短边先缩到 224，再中心裁 224×224。
+    let scale = SIDE as f32 / w.min(h) as f32;
+    let nw = ((w as f32 * scale).round() as u32).max(SIDE as u32);
+    let nh = ((h as f32 * scale).round() as u32).max(SIDE as u32);
+    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    let x = (nw as usize - SIDE) / 2;
+    let y = (nh as usize - SIDE) / 2;
+    let cropped = image::imageops::crop_imm(&resized, x as u32, y as u32, SIDE as u32, SIDE as u32).to_image();
+
+    let mut buf = vec![0f32; 3 * SIDE * SIDE];
+    let plane = SIDE * SIDE;
+    for (i, px) in cropped.pixels().enumerate() {
+        for c in 0..3 {
+            buf[c * plane + i] = (px[c] as f32 / 255.0 - MEAN[c]) / STD[c];
+        }
+    }
+    Ok(buf)
+}
+
+/// 只做前向：像素已经按 `[n,3,224,224]` 拍平并归一化。
+///
+/// 与 `image_data_vecs` 的区别是它完全不做图像处理，只碰 ONNX 会话，
+/// 所以调用方可以先把像素在多个线程里准备好，再由单线程集中提交。
+pub fn clip_image_embeds(
+    sess: &std::sync::Mutex<Session>,
+    pixel_rows: &[&Vec<f32>],
+) -> Result<Vec<Vec<f32>>, String> {
+    if pixel_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = pixel_rows.len() as i64;
+    let plane = 3 * SIDE * SIDE;
+    let mut pixels = Vec::with_capacity(pixel_rows.len() * plane);
+    for row in pixel_rows {
+        if row.len() != plane {
+            return Err(format!("CLIP 像素行长度不符：{} / 期望 {}", row.len(), plane));
+        }
+        pixels.extend_from_slice(row.as_slice());
+    }
+    let ids = vec![101i64; MAX_TOKENS * pixel_rows.len()];
+    let mask = vec![1i64; MAX_TOKENS * pixel_rows.len()];
+    let ids_shape = [n, MAX_TOKENS as i64];
+    let px_shape = [n, 3, SIDE as i64, SIDE as i64];
+    let mask_shape = [n, MAX_TOKENS as i64];
+    let guard = sess.lock().map_err(|e| e.to_string())?;
+    let out = guard.run(
+        &[
+            ("input_ids", &ids_shape, Data::I64(&ids)),
+            ("pixel_values", &px_shape, Data::F32(&pixels)),
+            ("attention_mask", &mask_shape, Data::I64(&mask)),
+        ],
+        &["image_embeds"],
+    )?;
+    let flat = out.into_iter().next().ok_or("模型没有返回图像向量")?;
+    let dim = 512usize;
+    if flat.len() != pixel_rows.len() * dim {
+        return Err(format!(
+            "CLIP 批量输出维度不符：{} / 期望 {}×{}",
+            flat.len(),
+            pixel_rows.len(),
+            dim
+        ));
+    }
+    let mut vectors = Vec::with_capacity(pixel_rows.len());
+    for chunk in flat.chunks(dim) {
+        let mut v = chunk.to_vec();
+        normalize(&mut v);
+        vectors.push(v);
+    }
+    Ok(vectors)
 }
 
 /// 极简 BERT 分词：中文按字、英文按词 + wordpiece 贪心最长匹配。

@@ -26,9 +26,19 @@ import {
 import { api, type TreeEntry, type TreeLevel } from "../api";
 import { humanSize, toast } from "../store";
 import { t } from "../i18n";
+import GalaxyCanvas from "../galaxy/GalaxyCanvas.vue";
 
 const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "open-full"): void }>();
+
+/** REQ-027/028：面板内「目录树 / 星系图」双 Tab。 */
+const tab = ref<"tree" | "graph">("tree");
+/** 星系图 Tab 的根目录（跟随面板里选中的目录）。 */
+const graphRoot = computed(() => {
+  const sel = selected.value;
+  if (!sel) return "";
+  return sel.endsWith("\\") ? sel : parentOf(sel);
+});
 
 const panelRef = ref<HTMLElement | null>(null);
 const bodyRef = ref<HTMLElement | null>(null);
@@ -417,7 +427,24 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div class="tp-search">
+      <div class="tp-tabs" role="tablist">
+        <button
+          class="tp-tab"
+          :class="{ active: tab === 'tree' }"
+          role="tab"
+          :aria-selected="tab === 'tree'"
+          @click="tab = 'tree'"
+        >{{ t("目录树") }}</button>
+        <button
+          class="tp-tab"
+          :class="{ active: tab === 'graph' }"
+          role="tab"
+          :aria-selected="tab === 'graph'"
+          @click="tab = 'graph'"
+        >{{ t("星系图") }}</button>
+      </div>
+
+      <div v-if="tab === 'tree'" class="tp-search">
         <Search :size="13" class="tp-search-ico" aria-hidden="true" />
         <input v-model="query" :placeholder="t('搜索文件夹…')" spellcheck="false" autocomplete="off" />
         <button v-if="query" class="tp-clear" :title="t('清空')" @click="query = ''">
@@ -425,7 +452,11 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <div ref="bodyRef" class="tp-body">
+      <div v-if="tab === 'graph'" class="tp-graph">
+        <GalaxyCanvas compact :root="graphRoot" :depth="2" :max-nodes="320" :file-limit="5" />
+      </div>
+
+      <div v-show="tab === 'tree'" ref="bodyRef" class="tp-body">
         <template v-if="query.trim()">
           <div v-if="searching" class="tp-empty">
             <LoaderCircle :size="13" class="spin" aria-hidden="true" />
@@ -536,6 +567,25 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.tp-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 8px;
+  border-bottom: 1px solid #111;
+}
+.tp-tab {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: #555;
+  font-size: 12px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.tp-tab:hover { color: #111; }
+.tp-tab.active { color: #111; font-weight: 600; border-bottom-color: #111; }
+.tp-graph { flex: 1; min-height: 0; display: flex; padding: 6px; }
+.tp-graph > * { flex: 1; min-height: 240px; }
 .tree-panel {
   --tp-bg: #ffffff;
   --tp-text: #333333;

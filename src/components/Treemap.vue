@@ -3,6 +3,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { TreeNode } from "../api";
 import { humanSize, kindColor } from "../store";
+import { t } from "../i18n";
 
 const props = defineProps<{ node: TreeNode | null }>();
 const emit = defineEmits<{

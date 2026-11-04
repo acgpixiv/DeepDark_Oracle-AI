@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DeepDark_Oracle",
-  "version": "0.0.23",
+  "version": "0.0.28",
   "identifier": "com.deepdarkoracle.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -40,10 +40,6 @@
     ],
     "resources": {
       "../tools/bin/ffmpeg.exe": "tools/bin/ffmpeg.exe",
-      "../libstdc++-6.dll": "libstdc++-6.dll",
-      "../libgcc_s_seh-1.dll": "libgcc_s_seh-1.dll",
-      "../libwinpthread-1.dll": "libwinpthread-1.dll",
-      "../WebView2Loader.dll": "WebView2Loader.dll",
       "../.tools/cuda-runtime/": "_up_/.tools/cuda-runtime/",
       "../scripts/install-onnxruntime.ps1": "resources/scripts/install-onnxruntime.ps1",
       "../scripts/install-python-sidecar.ps1": "resources/scripts/install-python-sidecar.ps1"
