@@ -8,9 +8,26 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 
-use super::{l2_normalize, EmbedInfo, Embedder};
+use super::{
+    audio_window_ranges, encode_windows_with_decode_lookahead, l2_normalize, EmbedInfo, Embedder,
+    VideoSegmentEmbedding,
+};
 
 const MAX_NATIVE_BATCH_SEQUENCES: usize = 32;
+
+fn video_window_ranges(duration: f64, window_seconds: f64) -> Vec<(f64, f64)> {
+    let mut ranges = Vec::new();
+    let mut start = 0.0;
+    while start < duration {
+        let end = (start + window_seconds).min(duration);
+        if end <= start {
+            break;
+        }
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
 
 #[allow(non_camel_case_types)]
 type c_void = std::ffi::c_void;
@@ -60,6 +77,11 @@ extern "C" {
         device_type: *mut c_int,
     ) -> c_int;
     fn ds_llama_dim(handle: *mut c_void) -> c_int;
+    /// Effective per-sequence token budget after llama.cpp clamps the
+    /// requested context to the GGUF training limit.  The UI may configure a
+    /// very large safety value, but media window sizing must use this actual
+    /// runtime limit to avoid submitting an oversized multimodal sequence.
+    fn ds_llama_context_tokens(handle: *mut c_void) -> c_int;
     fn ds_llama_capabilities(handle: *mut c_void) -> c_int;
     fn ds_llama_detail(handle: *mut c_void, out: *mut c_char, out_len: c_int);
     fn ds_llama_audio_sample_rate(handle: *mut c_void) -> c_int;
@@ -294,7 +316,11 @@ pub fn gpu_devices() -> Vec<GpuDevice> {
             continue;
         }
         let backend_name = name.clone();
-        let display_name = if description.is_empty() { name } else { description };
+        let display_name = if description.is_empty() {
+            name
+        } else {
+            description
+        };
         let item = GpuDevice {
             id,
             name: display_name,
@@ -320,7 +346,11 @@ pub fn gpu_devices() -> Vec<GpuDevice> {
             devices.push(item);
         }
     }
-    devices.sort_by(|a, b| b.total_memory.cmp(&a.total_memory).then_with(|| a.name.cmp(&b.name)));
+    devices.sort_by(|a, b| {
+        b.total_memory
+            .cmp(&a.total_memory)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     devices
 }
 
@@ -333,21 +363,22 @@ pub fn gpu_devices() -> Vec<GpuDevice> {
 #[cfg(feature = "candle")]
 pub fn cuda_device_ordinal(selected_device: &str) -> Result<usize, String> {
     let devices = gpu_devices();
-    let selected = if selected_device.trim().is_empty() || selected_device.eq_ignore_ascii_case("auto") {
-        devices
-            .iter()
-            .filter(|d| d.backend.eq_ignore_ascii_case("cuda"))
-            .max_by_key(|d| d.total_memory)
-    } else {
-        devices.iter().find(|d| d.id == selected_device)
-    }
-    .ok_or_else(|| {
+    let selected =
         if selected_device.trim().is_empty() || selected_device.eq_ignore_ascii_case("auto") {
-            "未检测到可用 CUDA 显卡；请安装 NVIDIA 驱动并使用带 CUDA 的构建".to_string()
+            devices
+                .iter()
+                .filter(|d| d.backend.eq_ignore_ascii_case("cuda"))
+                .max_by_key(|d| d.total_memory)
         } else {
-            format!("所选 GPU 不可用于 Candle CUDA：{selected_device}")
+            devices.iter().find(|d| d.id == selected_device)
         }
-    })?;
+        .ok_or_else(|| {
+            if selected_device.trim().is_empty() || selected_device.eq_ignore_ascii_case("auto") {
+                "未检测到可用 CUDA 显卡；请安装 NVIDIA 驱动并使用带 CUDA 的构建".to_string()
+            } else {
+                format!("所选 GPU 不可用于 Candle CUDA：{selected_device}")
+            }
+        })?;
 
     if !selected.backend.eq_ignore_ascii_case("cuda") {
         return Err(format!(
@@ -398,17 +429,27 @@ pub struct LlamaEmbedder {
     media_handle: Mutex<Handle>,
     dim: usize,
     context_tokens: usize,
+    image_token_budget: usize,
+    pdf_image_token_budget: usize,
     video_token_budget: usize,
     audio_seconds: f32,
     vision_supported: bool,
     audio_supported: bool,
+    video_supported: bool,
+    video_audio_enabled: bool,
+    native_audio_sample_rate: u32,
+    native_detail: String,
     model_name: String,
     device: String,
 }
 
 fn native_media_error(err: &[u8], fallback: &str) -> String {
     let detail = c_buf_string(err);
-    if detail.is_empty() { fallback.to_string() } else { detail }
+    if detail.is_empty() {
+        fallback.to_string()
+    } else {
+        detail
+    }
 }
 
 impl LlamaEmbedder {
@@ -460,7 +501,15 @@ impl LlamaEmbedder {
                 let device = if selected_device.trim().is_empty()
                     || selected_device.eq_ignore_ascii_case("auto")
                 {
-                    devices.first()
+                    // Shared-memory integrated GPUs can report a larger
+                    // capacity than a discrete card. Automatic mode should
+                    // prefer a discrete accelerator, while an explicit
+                    // device selection remains authoritative.
+                    devices
+                        .iter()
+                        .filter(|device| !device.integrated)
+                        .max_by_key(|device| device.total_memory)
+                        .or_else(|| devices.first())
                 } else {
                     devices.iter().find(|d| d.id == selected_device)
                 }
@@ -516,7 +565,9 @@ impl LlamaEmbedder {
         if text_raw.is_null() {
             let message = error_message(&text_err);
             unsafe { ds_llama_free(media_raw) };
-            return Err(format!("Creating dedicated GGUF text context failed: {message}"));
+            return Err(format!(
+                "Creating dedicated GGUF text context failed: {message}"
+            ));
         }
         let dim = unsafe { ds_llama_dim(media_raw) };
         if dim <= 0 {
@@ -526,23 +577,53 @@ impl LlamaEmbedder {
             }
             return Err("模型未报告 embedding 维度".into());
         }
+        let effective_context = unsafe { ds_llama_context_tokens(media_raw) };
         let capabilities = unsafe { ds_llama_capabilities(media_raw) };
-        let name = std::path::Path::new(model_path)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "gguf".into());
+        let mut detail = vec![0u8; 512];
+        unsafe {
+            ds_llama_detail(media_raw, detail.as_mut_ptr() as *mut c_char, detail.len() as c_int);
+        }
+        let audio_sample_rate = unsafe { ds_llama_audio_sample_rate(media_raw) };
         Ok(Self {
             text_handle: Mutex::new(Handle(text_raw)),
             media_handle: Mutex::new(Handle(media_raw)),
             dim: dim as usize,
-            context_tokens: n_ctx.max(256) as usize,
+            context_tokens: if effective_context > 0 {
+                effective_context as usize
+            } else {
+                n_ctx.max(256) as usize
+            },
+            image_token_budget: 1120,
+            pdf_image_token_budget: 280,
             video_token_budget: video_token_budget.clamp(70, 1120),
             audio_seconds: audio_seconds.clamp(0.25, 30.0),
             vision_supported: capabilities & 2 != 0,
             audio_supported: capabilities & 4 != 0,
-            model_name: name,
-            device: selected.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| "CPU".into()),
+            video_supported: capabilities & 8 != 0,
+            video_audio_enabled: true,
+            native_audio_sample_rate: if audio_sample_rate > 0 { audio_sample_rate as u32 } else { 16_000 },
+            native_detail: c_buf_string(&detail),
+            // Persistent vector identity must distinguish same-named GGUFs
+            // in different folders. The UI can shorten this path for display.
+            model_name: model_path.to_string(),
+            device: selected
+                .as_ref()
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "CPU".into()),
         })
+    }
+
+    pub fn with_image_budgets(mut self, image: usize, pdf_image: usize) -> Self {
+        self.image_token_budget = image.clamp(70, 1120);
+        self.pdf_image_token_budget = pdf_image.clamp(70, 1120);
+        self
+    }
+
+    pub fn with_encoders(mut self, vision: bool, audio: bool, video_audio: bool) -> Self {
+        self.vision_supported &= vision;
+        self.audio_supported &= audio;
+        self.video_audio_enabled = video_audio;
+        self
     }
 
     fn embed_one(&self, text: &str, is_query: bool) -> Result<Vec<f32>, String> {
@@ -599,7 +680,11 @@ impl LlamaEmbedder {
             let detail = unsafe { CStr::from_ptr(err.as_ptr() as *const c_char) }
                 .to_string_lossy()
                 .to_string();
-            return Err(if detail.is_empty() { "GGUF 批处理失败".into() } else { detail });
+            return Err(if detail.is_empty() {
+                "GGUF 批处理失败".into()
+            } else {
+                detail
+            });
         }
         Ok(output
             .chunks_exact(self.dim)
@@ -608,14 +693,31 @@ impl LlamaEmbedder {
     }
 
     fn embed_native_media(&self, items: &[NativeMediaItem]) -> Result<Vec<f32>, String> {
-        if items.is_empty() { return Err("没有可编码的媒体输入".into()); }
+        if items.is_empty() {
+            return Err("没有可编码的媒体输入".into());
+        }
+        if items.iter().any(|item| item.kind == 1) && !self.vision_supported {
+            return Err("GGUF 视觉编码器未启用或不支持图像".into());
+        }
+        if items.iter().any(|item| item.kind == 2) && !self.audio_supported {
+            return Err("GGUF 音频编码器未启用或不支持音频".into());
+        }
         let mut output = vec![0.0f32; self.dim];
         let mut err = vec![0u8; 1024];
-        let guard = self.media_handle.lock().map_err(|error| error.to_string())?;
+        let guard = self
+            .media_handle
+            .lock()
+            .map_err(|error| error.to_string())?;
         let n = unsafe {
-            ds_llama_embed_media(guard.0, items.as_ptr(), items.len() as c_int,
-                output.as_mut_ptr(), output.len() as c_int,
-                err.as_mut_ptr() as *mut c_char, err.len() as c_int)
+            ds_llama_embed_media(
+                guard.0,
+                items.as_ptr(),
+                items.len() as c_int,
+                output.as_mut_ptr(),
+                output.len() as c_int,
+                err.as_mut_ptr() as *mut c_char,
+                err.len() as c_int,
+            )
         };
         if n < 0 || n as usize != self.dim {
             return Err(native_media_error(&err, "GGUF mmproj 媒体编码失败"));
@@ -634,6 +736,9 @@ impl LlamaEmbedder {
         if images.is_empty() || images.len() != widths.len() || images.len() != heights.len() {
             return Err("GGUF 媒体批次参数不一致".into());
         }
+        if !self.vision_supported {
+            return Err("GGUF 视觉编码器未启用或不支持图像".into());
+        }
         let items: Vec<NativeMediaItem> = images
             .iter()
             .zip(widths.iter().zip(heights))
@@ -648,7 +753,10 @@ impl LlamaEmbedder {
             .collect();
         let mut output = vec![0.0f32; images.len() * self.dim];
         let mut err = vec![0u8; 1024];
-        let guard = self.media_handle.lock().map_err(|error| error.to_string())?;
+        let guard = self
+            .media_handle
+            .lock()
+            .map_err(|error| error.to_string())?;
         let n = unsafe {
             ds_llama_embed_media_batch(
                 guard.0,
@@ -695,14 +803,10 @@ impl LlamaEmbedder {
         // The projector and encoder share the model's 8192-token budget. Leave
         // room for the text prefix and avoid oversized mtmd graphs for high
         // resolution standalone images.
-        let per_image = (self.context_tokens / (token_budget.max(1) as usize + 32))
-            .clamp(1, 32);
+        let per_image = (self.context_tokens / (token_budget.max(1) as usize + 32)).clamp(1, 32);
         let mut output = Vec::with_capacity(images.len());
         for group in images.chunks(per_image) {
-            let rgb: Vec<image::RgbImage> = group
-                .par_iter()
-                .map(|image| image.to_rgb8())
-                .collect();
+            let rgb: Vec<image::RgbImage> = group.par_iter().map(|image| image.to_rgb8()).collect();
             output.extend(self.embed_rgb_batch(&rgb, token_budget)?);
         }
         Ok(output)
@@ -725,25 +829,24 @@ impl LlamaEmbedder {
     }
 
     fn audio_sample_rate(&self) -> u32 {
-        let guard = self.media_handle.lock().unwrap();
-        let rate = unsafe { ds_llama_audio_sample_rate(guard.0) };
-        if rate > 0 { rate as u32 } else { 16_000 }
+        self.native_audio_sample_rate
     }
 }
 
 impl Embedder for LlamaEmbedder {
     fn info(&self) -> EmbedInfo {
-        let (capabilities, detail) = {
-            let guard = self.media_handle.lock().unwrap();
-            let mut buffer = vec![0u8; 512];
-            let capabilities = unsafe { ds_llama_capabilities(guard.0) };
-            unsafe { ds_llama_detail(guard.0, buffer.as_mut_ptr() as *mut c_char, buffer.len() as c_int) };
-            (capabilities, c_buf_string(&buffer))
-        };
+        // Capability discovery is immutable after load. Do not wait for the
+        // native media inference mutex while model_info is polled by the UI.
         let mut modalities = vec!["text".into()];
-        if capabilities & 2 != 0 { modalities.push("image".into()); }
-        if capabilities & 4 != 0 { modalities.push("audio".into()); }
-        if capabilities & 8 != 0 { modalities.push("video".into()); }
+        if self.vision_supported {
+            modalities.push("image".into());
+        }
+        if self.audio_supported {
+            modalities.push("audio".into());
+        }
+        if self.video_supported && (self.vision_supported || (self.audio_supported && self.video_audio_enabled)) {
+            modalities.push("video".into());
+        }
         EmbedInfo {
             backend: "llama.cpp".into(),
             model: self.model_name.clone(),
@@ -753,7 +856,15 @@ impl Embedder for LlamaEmbedder {
             // models without a matching mmproj remain text-only.
             modalities,
             ready: true,
-            detail: format!("llama.cpp GGUF · {} · {}", self.device, if detail.is_empty() { "文本" } else { detail.as_str() }),
+            detail: format!(
+                "llama.cpp GGUF · {} · {}",
+                self.device,
+                if self.native_detail.is_empty() {
+                    "文本"
+                } else {
+                    self.native_detail.as_str()
+                }
+            ),
         }
     }
 
@@ -849,15 +960,27 @@ impl Embedder for LlamaEmbedder {
 
     fn embed_image_data(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
         let rgb = image.to_rgb8();
-        let item = NativeMediaItem { kind: 1, data: rgb.as_ptr() as *const c_void,
-            length: rgb.len(), width: rgb.width(), height: rgb.height(), token_budget: 1120 };
+        let item = NativeMediaItem {
+            kind: 1,
+            data: rgb.as_ptr() as *const c_void,
+            length: rgb.len(),
+            width: rgb.width(),
+            height: rgb.height(),
+            token_budget: self.image_token_budget as c_int,
+        };
         self.embed_native_media(std::slice::from_ref(&item))
     }
 
     fn embed_pdf_image_data(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
         let rgb = image.to_rgb8();
-        let item = NativeMediaItem { kind: 1, data: rgb.as_ptr() as *const c_void,
-            length: rgb.len(), width: rgb.width(), height: rgb.height(), token_budget: 280 };
+        let item = NativeMediaItem {
+            kind: 1,
+            data: rgb.as_ptr() as *const c_void,
+            length: rgb.len(),
+            width: rgb.width(),
+            height: rgb.height(),
+            token_budget: self.pdf_image_token_budget as c_int,
+        };
         self.embed_native_media(std::slice::from_ref(&item))
     }
 
@@ -867,43 +990,196 @@ impl Embedder for LlamaEmbedder {
             .map(|path| image::open(path).map_err(|error| format!("图片读取失败：{error}")))
             .collect::<Result<_, _>>()?;
         let refs: Vec<&image::DynamicImage> = images.iter().collect();
-        self.embed_image_data_refs_batch(&refs, 1120)
+        self.embed_image_data_refs_batch(&refs, self.image_token_budget as c_int)
     }
 
     fn embed_image_data_batch(
         &self,
         images: &[&image::DynamicImage],
     ) -> Result<Vec<Vec<f32>>, String> {
-        self.embed_image_data_refs_batch(images, 1120)
+        self.embed_image_data_refs_batch(images, self.image_token_budget as c_int)
     }
 
     fn embed_pdf_image_data_batch(
         &self,
         images: &[&image::DynamicImage],
     ) -> Result<Vec<Vec<f32>>, String> {
-        self.embed_image_data_refs_batch(images, 280)
+        self.embed_image_data_refs_batch(images, self.pdf_image_token_budget as c_int)
+    }
+
+    fn embed_video_frame_data_batch(
+        &self,
+        images: &[&image::DynamicImage],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_image_data_refs_batch(images, self.video_token_budget.clamp(70, 1120) as c_int)
     }
 
     fn embed_audio(&self, path: &std::path::Path) -> Result<Vec<f32>, String> {
-        let samples = crate::media::load_audio_at_rate(path, 30.0, self.audio_sample_rate())
-            .ok_or("音频解码失败（需要 ffmpeg）")?;
-        let item = NativeMediaItem { kind: 2, data: samples.as_ptr() as *const c_void,
-            length: samples.len(), width: 0, height: 0, token_budget: 0 };
-        self.embed_native_media(std::slice::from_ref(&item))
+        let vectors = self.embed_audio_segments(path)?;
+        let mut merged = vec![0.0f32; self.dim];
+        let mut count = 0usize;
+        for vector in vectors {
+            if vector.len() != merged.len() {
+                continue;
+            }
+            for (dst, value) in merged.iter_mut().zip(vector) {
+                *dst += value;
+            }
+            count += 1;
+        }
+        if count == 0 {
+            return Err("音频没有可编码的有效分段".into());
+        }
+        for value in &mut merged {
+            *value /= count as f32;
+        }
+        l2_normalize(&mut merged);
+        Ok(merged)
+    }
+
+    fn embed_audio_segments(&self, path: &std::path::Path) -> Result<Vec<Vec<f32>>, String> {
+        let duration = crate::media::media_duration(path)
+            .ok_or_else(|| format!("无法读取音频时长：{}", path.display()))?;
+        let sample_rate = self.audio_sample_rate();
+        let decode_path = path.to_path_buf();
+        let path_display = path.display().to_string();
+        let vectors = encode_windows_with_decode_lookahead(
+            audio_window_ranges(duration),
+            move |start, seconds| {
+                crate::media::load_audio_segment_at_rate(
+                    &decode_path,
+                    start,
+                    seconds,
+                    sample_rate,
+                )
+                .ok_or_else(|| {
+                    format!("音频分段解码失败：{} ({start:.2}s)", path_display)
+                })
+            },
+            |samples| {
+                let item = NativeMediaItem {
+                    kind: 2,
+                    data: samples.as_ptr() as *const c_void,
+                    length: samples.len(),
+                    width: 0,
+                    height: 0,
+                    token_budget: 0,
+                };
+                self.embed_native_media(std::slice::from_ref(&item))
+            },
+        )?;
+        if vectors.is_empty() {
+            return Err("音频没有可编码的分段".into());
+        }
+        Ok(vectors)
     }
 
     fn embed_video(&self, path: &std::path::Path) -> Result<Vec<f32>, String> {
         let vectors = self.embed_video_segments(path)?;
+        if vectors.is_empty() {
+            return Err("video backend returned no segment vectors".into());
+        }
         let mut merged = vec![0.0f32; self.dim];
-        for vector in &vectors { for (dst, value) in merged.iter_mut().zip(vector) { *dst += value; } }
+        for vector in &vectors {
+            for (dst, value) in merged.iter_mut().zip(vector) {
+                *dst += value;
+            }
+        }
         let count = vectors.len() as f32;
-        for value in &mut merged { *value /= count; }
+        for value in &mut merged {
+            *value /= count;
+        }
         l2_normalize(&mut merged);
         Ok(merged)
     }
 
     fn embed_video_segments(&self, path: &std::path::Path) -> Result<Vec<Vec<f32>>, String> {
-        let duration = crate::media::video_duration(path).unwrap_or(0.0).max(0.1);
+        self.embed_video_segment_details(path)
+            .map(|segments| segments.into_iter().map(|segment| segment.vector).collect())
+    }
+
+    fn embed_video_segment_details(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Vec<VideoSegmentEmbedding>, String> {
+        <Self as Embedder>::embed_video_segment_details_with_cancel(self, path, &|| false)
+    }
+
+    fn embed_video_segment_details_with_cancel(
+        &self,
+        path: &std::path::Path,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<VideoSegmentEmbedding>, String> {
+        self.embed_video_segment_details_with_progress(path, cancelled, &|_, _| {})
+    }
+
+    fn embed_video_segment_details_with_progress(
+        &self,
+        path: &std::path::Path,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        on_progress: &dyn Fn(usize, usize),
+    ) -> Result<Vec<VideoSegmentEmbedding>, String> {
+        self.embed_video_segment_details_with_progress_and_callback(
+            path,
+            cancelled,
+            on_progress,
+            &std::collections::HashSet::new(),
+            &|_| Ok(()),
+        )
+    }
+
+    fn embed_video_segment_details_streaming(
+        &self,
+        path: &std::path::Path,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        on_progress: &dyn Fn(usize, usize),
+        on_segment: &dyn Fn(VideoSegmentEmbedding) -> Result<(), String>,
+    ) -> Result<usize, String> {
+        let segments = self.embed_video_segment_details_with_progress_and_callback(
+            path,
+            cancelled,
+            on_progress,
+            &std::collections::HashSet::new(),
+            on_segment,
+        )?;
+        Ok(segments.len())
+    }
+
+    fn embed_video_segment_details_resumable_streaming(
+        &self,
+        path: &std::path::Path,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        completed_segments: &std::collections::HashSet<i64>,
+        on_progress: &dyn Fn(usize, usize),
+        on_segment: &dyn Fn(VideoSegmentEmbedding) -> Result<(), String>,
+    ) -> Result<usize, String> {
+        let duration = crate::media::require_video_duration(path)?;
+        let window_seconds = crate::media::safe_video_window_seconds(
+            self.context_tokens,
+            self.video_token_budget,
+            self.audio_supported && self.video_audio_enabled,
+            self.audio_seconds,
+        );
+        let total = video_window_ranges(duration, window_seconds).len();
+        self.embed_video_segment_details_with_progress_and_callback(
+            path,
+            cancelled,
+            on_progress,
+            completed_segments,
+            on_segment,
+        )?;
+        Ok(total)
+    }
+
+    fn embed_video_segment_details_with_progress_and_callback(
+        &self,
+        path: &std::path::Path,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        on_progress: &dyn Fn(usize, usize),
+        completed_segments: &std::collections::HashSet<i64>,
+        on_segment: &dyn Fn(VideoSegmentEmbedding) -> Result<(), String>,
+    ) -> Result<Vec<VideoSegmentEmbedding>, String> {
+        let duration = crate::media::require_video_duration(path)?;
         // A 30-second window is only valid when its projected frames and
         // audio fit the shared model context.  Older configs commonly use
         // 4096 tokens, so dynamically shorten the window instead of sending
@@ -911,61 +1187,212 @@ impl Embedder for LlamaEmbedder {
         let window_seconds = crate::media::safe_video_window_seconds(
             self.context_tokens,
             self.video_token_budget,
-            self.audio_supported,
+            self.audio_supported && self.video_audio_enabled,
             self.audio_seconds,
         );
-        let mut vectors = Vec::new();
-        let mut start = 0.0f64;
-        while start < duration {
-            let window = (duration - start).min(window_seconds);
-            let frame_paths = if self.vision_supported {
-                crate::media::sample_video_frames_window(path, start, window, 1024)
-            } else {
-                Vec::new()
+        let subtitles = crate::media::video_subtitles(path);
+        let ranges = video_window_ranges(duration, window_seconds);
+        let total_windows = ranges.len();
+        let pending_windows = ranges
+            .into_iter()
+            .enumerate()
+            .filter(|(segment_no, _)| !completed_segments.contains(&(*segment_no as i64)))
+            .collect::<Vec<_>>();
+        let mut processed_windows = total_windows.saturating_sub(pending_windows.len());
+        on_progress(processed_windows, total_windows);
+        std::thread::scope(|scope| {
+            let mut windows = pending_windows.into_iter();
+            let mut segments = Vec::new();
+            let spawn_decode = |start: f64, end: f64| {
+                let path = path.to_path_buf();
+                let max_side = 1024;
+                let include_video = self.vision_supported;
+                let include_audio = self.audio_supported && self.video_audio_enabled;
+                let sample_rate = self.audio_sample_rate();
+                let should_cancel = || cancelled();
+                scope.spawn(move || {
+                    let (frame_paths, audio) = crate::media::decode_video_window_with_cancel(
+                        &path,
+                        start,
+                        end - start,
+                        max_side,
+                        include_video,
+                        include_audio,
+                        sample_rate,
+                        &should_cancel,
+                    );
+                    if should_cancel() {
+                        for frame in &frame_paths {
+                            let _ = std::fs::remove_file(frame);
+                        }
+                        if let Some(parent) = frame_paths.first().and_then(|frame| frame.parent()) {
+                            let _ = std::fs::remove_dir_all(parent);
+                        }
+                        return (Vec::new(), None);
+                    }
+                    let images = frame_paths
+                        .iter()
+                        .filter_map(|frame| {
+                            let image = image::open(frame).ok().map(|image| image.to_rgb8());
+                            let _ = std::fs::remove_file(frame);
+                            image
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(parent) = frame_paths.first().and_then(|frame| frame.parent()) {
+                        let _ = std::fs::remove_dir_all(parent);
+                    }
+                    (images, audio)
+                })
             };
-            let mut images = Vec::new();
-            for frame in &frame_paths {
-                if let Ok(image) = image::open(frame) { images.push(image.to_rgb8()); }
-                let _ = std::fs::remove_file(frame);
+            // Keep a bounded decode queue ahead of the single model
+            // consumer.  Media windows are still encoded strictly in source
+            // order and never batched across files, but three CPU/FFmpeg
+            // workers hide disk/decode latency behind the current inference.
+            // Keep four bounded FFmpeg decode jobs ahead of the single GGUF
+            // multimodal consumer. This smooths seek/decode jitter while
+            // preserving sequential model calls and bounded memory use.
+            const PREFETCH_DEPTH: usize = 4;
+            let mut decode_queue = std::collections::VecDeque::with_capacity(PREFETCH_DEPTH);
+            while decode_queue.len() < PREFETCH_DEPTH {
+                let Some((segment_no, (start, end))) = windows.next() else { break };
+                decode_queue.push_back((segment_no, start, end, spawn_decode(start, end)));
             }
-            if let Some(parent) = frame_paths.first().and_then(|frame| frame.parent()) { let _ = std::fs::remove_dir_all(parent); }
-            let audio = if self.audio_supported {
-                crate::media::load_audio_segment_at_rate(
-                    path,
-                    start,
-                    window,
-                    self.audio_sample_rate(),
-                )
-            } else {
-                None
+            while let Some((segment_no, start, end, decode_job)) = decode_queue.pop_front() {
+            let (images, audio) = decode_job
+                .join()
+                .map_err(|_| "video window decoder thread panicked".to_string())?;
+            if cancelled() {
+                for (_, _, _, job) in decode_queue {
+                    let _ = job.join();
+                }
+                return Err("index cancellation requested".into());
+            }
+            while decode_queue.len() < PREFETCH_DEPTH {
+                let Some((next_segment_no, (next_start, next_end))) = windows.next() else { break };
+                decode_queue.push_back((
+                    next_segment_no,
+                    next_start,
+                    next_end,
+                    spawn_decode(next_start, next_end),
+                ));
+            }
+            let subtitle = crate::media::subtitle_text_for_window_with_timestamps(
+                &subtitles,
+                start,
+                end,
+            );
+            let encoded = (|| {
+                let mut items = Vec::with_capacity(images.len() + usize::from(audio.is_some()));
+                for image in &images {
+                    items.push(NativeMediaItem {
+                        kind: 1,
+                        data: image.as_ptr() as *const c_void,
+                        length: image.len(),
+                        width: image.width(),
+                        height: image.height(),
+                        token_budget: self.video_token_budget.clamp(70, 1120) as c_int,
+                    });
+                }
+                if let Some(samples) = audio.as_ref() {
+                    items.push(NativeMediaItem {
+                        kind: 2,
+                        data: samples.as_ptr() as *const c_void,
+                        length: samples.len(),
+                        width: 0,
+                        height: 0,
+                        token_budget: 0,
+                    });
+                }
+                let mut vector = if !items.is_empty() {
+                    Some(self.embed_native_media(&items)?)
+                } else {
+                    None
+                };
+                // Subtitles are persisted verbatim and searched by the
+                // timestamp-aware SQLite FTS lane. Avoid a second text-model
+                // forward for every media window; it doubled video indexing
+                // work and diluted the native visual/audio signal. Keep a
+                // text fallback only when a window has no decodable media.
+                if vector.is_none() && !subtitle.is_empty() {
+                    let text = format!(
+                        "title: {} | text: {}",
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("video"),
+                        subtitle
+                    );
+                    vector = Some(self.embed_text(&text, false)?);
+                }
+                Ok::<_, String>(vector)
+            })();
+            let vector = match encoded {
+                Ok(vector) => vector,
+                Err(error) => {
+                    if error.contains("cancellation") {
+                        for (_, _, _, next_job) in decode_queue {
+                            let _ = next_job.join();
+                        }
+                        return Err(error);
+                    }
+                    // Keep later temporal windows searchable when one window
+                    // is malformed or exceeds the backend media budget.
+                    processed_windows = processed_windows.saturating_add(1);
+                    on_progress(processed_windows, total_windows);
+                    continue;
+                }
             };
-            let mut items = Vec::with_capacity(images.len() + usize::from(audio.is_some()));
-            for image in &images {
-                items.push(NativeMediaItem { kind: 1, data: image.as_ptr() as *const c_void,
-                    length: image.len(), width: image.width(), height: image.height(), token_budget: 140 });
+            if cancelled() {
+                for (_, _, _, next_job) in decode_queue {
+                    let _ = next_job.join();
+                }
+                return Err("index cancellation requested".into());
             }
-            if let Some(samples) = audio.as_ref() {
-                items.push(NativeMediaItem { kind: 2, data: samples.as_ptr() as *const c_void,
-                    length: samples.len(), width: 0, height: 0, token_budget: 0 });
+            if let Some(vector) = vector {
+                let segment = VideoSegmentEmbedding {
+                    segment_no,
+                    start_seconds: start,
+                    end_seconds: end,
+                    subtitle,
+                    vector,
+                };
+                on_segment(segment.clone())?;
+                segments.push(segment);
             }
-            if !items.is_empty() { vectors.push(self.embed_native_media(&items)?); }
-            start += window;
+            // Count decoded windows rather than only windows that produced a
+            // vector. A muted/blank or otherwise undecodable window still
+            // advances work and must not leave the progress indicator stuck.
+            processed_windows = processed_windows.saturating_add(1);
+            on_progress(processed_windows, total_windows);
         }
-        if vectors.is_empty() { return Err("视频未能解码出图像帧或音频轨".into()); }
-        Ok(vectors)
+        if segments.is_empty() && processed_windows < total_windows {
+            return Err("video has no decodable media or subtitle windows".into());
+        }
+        Ok(segments)
+        })
     }
-
 }
 
 #[cfg(test)]
 mod tests {
-    use super::gpu_devices;
+    use super::{gpu_devices, video_window_ranges};
+
+    #[test]
+    fn video_windows_preserve_contiguous_ranges_and_partial_tail() {
+        assert_eq!(
+            video_window_ranges(65.0, 30.0),
+            vec![(0.0, 30.0), (30.0, 60.0), (60.0, 65.0)]
+        );
+    }
 
     #[test]
     fn accelerator_devices_are_named_and_sorted_by_memory() {
         let devices = gpu_devices();
-        assert!(devices.iter().all(|device| !device.name.is_empty() && !device.id.is_empty()));
-        assert!(devices.windows(2).all(|pair| pair[0].total_memory >= pair[1].total_memory));
+        assert!(devices
+            .iter()
+            .all(|device| !device.name.is_empty() && !device.id.is_empty()));
+        assert!(devices
+            .windows(2)
+            .all(|pair| pair[0].total_memory >= pair[1].total_memory));
         for device in devices {
             println!(
                 "GPU: {} | {} | total={} free={}",

@@ -697,7 +697,15 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
     }
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = static_cast<uint32_t>(n_ctx > 0 ? n_ctx : 2048);
+    // Embedding GGUF files carry their own trained context limit.  Never let
+    // a stale/overridden UI value allocate an unbounded KV/activation buffer
+    // (for example 500,000 tokens on an 8K EmbeddingGemma checkpoint).  The
+    // previous code passed that value straight to llama.cpp, which could
+    // reserve the whole VRAM budget before the first document was processed.
+    const uint32_t model_context = llama_model_n_ctx_train(model);
+    const uint32_t requested_context = static_cast<uint32_t>(n_ctx > 0 ? n_ctx : 2048);
+    const uint32_t context_limit = model_context > 0 ? model_context : 8192u;
+    cparams.n_ctx = std::min(std::max(requested_context, 512u), context_limit);
     // 新版 llama.cpp 对 encoder 模型有硬断言：
     //   GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens")
     // 一旦传入的文本 token 数超过 n_ubatch，进程会被直接 abort（不是返回错误码），
@@ -739,9 +747,12 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
     if (mmproj_path) {
         mtmd_context_params mmparams = mtmd_context_params_default();
         mmparams.use_gpu = selected_device != nullptr;
-        // llama.cpp 0.7 把 mtmd_context_params::backend_device（设备名字符串）
-        // 换成了 ggml_backend_dev_t device 句柄；传 nullptr 表示使用默认设备。
-        mmparams.device = selected_device;
+        // mtmd receives the backend device by name. Keep the selected ggml
+        // device handle in the llama model setup, but pass its stable name to
+        // the mtmd C API instead of relying on an internal device pointer.
+        mmparams.backend_device = selected_device
+            ? ggml_backend_dev_name(selected_device)
+            : nullptr;
         mmparams.print_timings = false;
         mmparams.warmup = false;
         mmparams.n_threads = threads;
@@ -830,7 +841,10 @@ void *ds_llama_duplicate_context(void *source, int n_ctx, int n_threads,
         : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = static_cast<uint32_t>(n_ctx > 0 ? n_ctx : 2048);
+    const uint32_t model_context = llama_model_n_ctx_train(model);
+    const uint32_t requested_context = static_cast<uint32_t>(n_ctx > 0 ? n_ctx : 2048);
+    const uint32_t context_limit = model_context > 0 ? model_context : 8192u;
+    cparams.n_ctx = std::min(std::max(requested_context, 512u), context_limit);
     const uint32_t sequence_context = std::max<uint32_t>(cparams.n_ctx, 512u);
     const bool non_causal = !model->hparams.causal_attn;
     const uint32_t max_sequences = non_causal ? kMaxBatchSequences : 4u;
@@ -865,7 +879,9 @@ void *ds_llama_duplicate_context(void *source, int n_ctx, int n_threads,
         if (mmproj_path) {
             mtmd_context_params mmparams = mtmd_context_params_default();
             mmparams.use_gpu = selected_device != nullptr;
-            mmparams.device = selected_device;
+            mmparams.backend_device = selected_device
+                ? ggml_backend_dev_name(selected_device)
+                : nullptr;
             mmparams.print_timings = false;
             mmparams.warmup = false;
             mmparams.n_threads = threads;
@@ -932,6 +948,16 @@ void *ds_llama_duplicate_context(void *source, int n_ctx, int n_threads,
 int ds_llama_dim(void *handle) {
     auto *h = static_cast<Handle *>(handle);
     return h ? h->dim : 0;
+}
+
+// Return the effective per-sequence token budget.  `ds_llama_create` clamps
+// the requested value to llama_model_n_ctx_train(model), while the Rust side
+// may intentionally receive a much larger configuration safety value.  Media
+// window sizing must use this runtime value or a large setting (for example
+// 500000) could incorrectly allow a 30-second high-token video window.
+int ds_llama_context_tokens(void *handle) {
+    auto *h = static_cast<Handle *>(handle);
+    return h ? h->n_batch : 0;
 }
 
 int ds_llama_capabilities(void *handle) {
@@ -1260,7 +1286,6 @@ int ds_llama_embed_batch(void *handle, const char **texts, int count,
 
     std::vector<std::vector<llama_token>> token_lists;
     token_lists.reserve(static_cast<size_t>(count));
-    size_t total_tokens = 0;
     for (int i = 0; i < count; ++i) {
         const char *body = texts[i] ? texts[i] : "";
         if (!*body) {
@@ -1292,69 +1317,104 @@ int ds_llama_embed_batch(void *handle, const char **texts, int count,
             set_err(err, err_len, "one text exceeds the model batch context");
             return -1;
         }
-        total_tokens += tokens.size();
         token_lists.push_back(std::move(tokens));
     }
-    if (h->n_batch > 0 && total_tokens > static_cast<size_t>(h->n_batch)) {
-        set_err(err, err_len, "batch exceeds the model context");
-        return -1;
-    }
-
-    llama_batch batch = llama_batch_init(static_cast<int32_t>(total_tokens), 0, count);
-    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
-        llama_batch_free(batch);
-        set_err(err, err_len, "failed to allocate llama batch");
-        return -1;
-    }
-    batch.n_tokens = static_cast<int32_t>(total_tokens);
-    size_t cursor = 0;
-    for (int i = 0; i < count; ++i) {
-        const auto &tokens = token_lists[static_cast<size_t>(i)];
-        for (size_t pos = 0; pos < tokens.size(); ++pos, ++cursor) {
-            batch.token[cursor] = tokens[pos];
-            batch.pos[cursor] = static_cast<llama_pos>(pos);
-            batch.n_seq_id[cursor] = 1;
-            // llama_batch_init owns each seq_id array and llama_batch_free
-            // releases it. Write into that allocation instead of replacing
-            // the pointer with a temporary vector address.
-            batch.seq_id[cursor][0] = static_cast<llama_seq_id>(i);
-            batch.logits[cursor] = pos + 1 == tokens.size() ? 1 : 0;
-        }
-    }
-
     const auto clear_context = [h]() {
         llama_memory_t mem = llama_get_memory(h->ctx);
         if (mem) llama_memory_clear(mem, true);
     };
-    const int32_t rc = llama_decode(h->ctx, batch);
-    if (rc != 0) {
-        llama_batch_free(batch);
-        clear_context();
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), "llama_decode returned %d", rc);
-        set_err(err, err_len, buf);
-        return -1;
-    }
-    for (int i = 0; i < count; ++i) {
-        float *emb = llama_get_embeddings_seq(h->ctx, static_cast<llama_seq_id>(i));
-        if (!emb) {
-            llama_batch_free(batch);
+
+    // Keep every decode within the model's real token budget.  A caller may
+    // submit 16 short documents, but their combined token count can exceed an
+    // 8K embedding context.  The old implementation rejected the whole call,
+    // forcing Rust to retry each document one by one and leaving the GPU idle.
+    // Greedily split the request into context-fitting groups while retaining
+    // sequence batching inside each group.  This preserves throughput without
+    // increasing the KV/context allocation.
+    const size_t token_limit = h->n_batch > 0
+        ? static_cast<size_t>(h->n_batch)
+        : std::numeric_limits<size_t>::max();
+    int group_start = 0;
+    while (group_start < count) {
+        const int group_end_limit = std::min(count,
+            group_start + static_cast<int>(h->max_sequences));
+        size_t group_tokens = 0;
+        int group_end = group_start;
+        for (; group_end < group_end_limit; ++group_end) {
+            const size_t item_tokens = token_lists[static_cast<size_t>(group_end)].size();
+            if (item_tokens > token_limit) {
+                set_err(err, err_len, "one text exceeds the model batch context");
+                clear_context();
+                return -1;
+            }
+            if (group_end > group_start && group_tokens + item_tokens > token_limit) {
+                break;
+            }
+            group_tokens += item_tokens;
+        }
+        if (group_end == group_start) {
+            set_err(err, err_len, "unable to form a context-fitting text batch");
             clear_context();
-            set_err(err, err_len, "model returned no sequence embedding");
             return -1;
         }
-        double sum = 0.0;
-        for (int j = 0; j < h->dim; ++j) {
-            sum += static_cast<double>(emb[j]) * static_cast<double>(emb[j]);
+
+        const int group_count = group_end - group_start;
+        llama_batch batch = llama_batch_init(static_cast<int32_t>(group_tokens), 0,
+                                             group_count);
+        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+            llama_batch_free(batch);
+            set_err(err, err_len, "failed to allocate llama batch");
+            clear_context();
+            return -1;
         }
-        const double norm = std::sqrt(sum);
-        const float inv = norm > 1e-12 ? static_cast<float>(1.0 / norm) : 0.0f;
-        for (int j = 0; j < h->dim; ++j) {
-            out[static_cast<size_t>(i) * static_cast<size_t>(out_stride) + static_cast<size_t>(j)] = emb[j] * inv;
+        batch.n_tokens = static_cast<int32_t>(group_tokens);
+        size_t cursor = 0;
+        for (int local = 0; local < group_count; ++local) {
+            const auto &tokens = token_lists[static_cast<size_t>(group_start + local)];
+            for (size_t pos = 0; pos < tokens.size(); ++pos, ++cursor) {
+                batch.token[cursor] = tokens[pos];
+                batch.pos[cursor] = static_cast<llama_pos>(pos);
+                batch.n_seq_id[cursor] = 1;
+                // llama_batch_init owns each seq_id array and llama_batch_free
+                // releases it. Write into that allocation instead of replacing
+                // the pointer with a temporary vector address.
+                batch.seq_id[cursor][0] = static_cast<llama_seq_id>(local);
+                batch.logits[cursor] = pos + 1 == tokens.size() ? 1 : 0;
+            }
         }
+
+        const int32_t rc = llama_decode(h->ctx, batch);
+        if (rc != 0) {
+            llama_batch_free(batch);
+            clear_context();
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "llama_decode returned %d", rc);
+            set_err(err, err_len, buf);
+            return -1;
+        }
+        for (int local = 0; local < group_count; ++local) {
+            float *emb = llama_get_embeddings_seq(h->ctx, static_cast<llama_seq_id>(local));
+            if (!emb) {
+                llama_batch_free(batch);
+                clear_context();
+                set_err(err, err_len, "model returned no sequence embedding");
+                return -1;
+            }
+            double sum = 0.0;
+            for (int j = 0; j < h->dim; ++j) {
+                sum += static_cast<double>(emb[j]) * static_cast<double>(emb[j]);
+            }
+            const double norm = std::sqrt(sum);
+            const float inv = norm > 1e-12 ? static_cast<float>(1.0 / norm) : 0.0f;
+            const int output_index = group_start + local;
+            for (int j = 0; j < h->dim; ++j) {
+                out[static_cast<size_t>(output_index) * static_cast<size_t>(out_stride) + static_cast<size_t>(j)] = emb[j] * inv;
+            }
+        }
+        llama_batch_free(batch);
+        clear_context();
+        group_start = group_end;
     }
-    llama_batch_free(batch);
-    clear_context();
     return count;
 }
 

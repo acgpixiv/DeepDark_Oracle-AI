@@ -11,6 +11,43 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+pub fn embedder_model_key(embedder: &dyn Embedder, cfg: &IndexConfig) -> String {
+    let info = embedder.info();
+    // Modalities are a set.  Backends may report them in a different order
+    // after a restart (or after an mmproj upgrade), but that must not make an
+    // otherwise compatible video/image index disappear from search.
+    let mut modality_set: Vec<String> = if info.modalities.is_empty() {
+        vec!["text".to_string()]
+    } else {
+        info.modalities
+            .iter()
+            .map(|item| item.trim().to_ascii_lowercase())
+            .filter(|item| !item.is_empty())
+            .collect()
+    };
+    modality_set.sort();
+    modality_set.dedup();
+    let modalities = if modality_set.is_empty() {
+        "text".to_string()
+    } else {
+        modality_set.join("-")
+    };
+    format!(
+        "{}:{}|{}|{}|encoder={}:{}",
+        info.model, modalities, cfg.vector_dim, cfg.pdf_image_token_budget,
+        info.backend, info.dim,
+    )
+}
+
+/// Add the temporal-storage suffix exactly once.  Search callers may receive
+/// a key that was already normalized for video storage (for example after a
+/// restored query state); appending blindly would create `|video|video` and
+/// make otherwise compatible windows disappear from the allow-list.
+pub fn video_model_key(model_key: &str) -> String {
+    let trimmed = model_key.trim_end_matches("|video");
+    format!("{trimmed}|video")
+}
+
 const VECTOR_CHECKPOINT_ITEMS: usize = 512;
 // The UI renders this as one clipped line. Keep enough names to reflect the
 // actual single-model batch (rather than reporting only one lane or five
@@ -27,12 +64,212 @@ const IMAGE_PREFETCH_CAPACITY: usize = 32;
 /// 提高到 64 之后，真正的上限由 `ai::image_batch_ceiling`（按显存分档）
 /// 与 `effective_batch_size` 共同决定，索引时 GPU 不再空转。
 const IMAGE_GPU_BATCH_LIMIT: usize = 64;
+/// Keep a small number of FFmpeg windows decoding ahead of the single model
+/// consumer.  A bounded depth overlaps CPU/disk work with GPU inference
+/// without creating an unbounded FFmpeg process storm or exhausting memory.
+// Keep enough FFmpeg windows ahead of the single model consumer to hide
+// decode/disk latency.  The queue is bounded, so this does not create an
+// unbounded process or memory storm; six windows is still small compared with
+// the available CPU/VRAM on the target machines and keeps the GPU fed while
+// one window is being encoded.
+const VIDEO_DECODE_PREFETCH_DEPTH: usize = 6;
 /// 文本抽取流水线的在途条数。
 ///
 /// 文本路径原来是「整批抽取 → 整批编码」，抽取阶段 GPU 完全空转。
 /// 允许几条文本提前抽好排在通道里，GPU 编完一批立刻能拿到下一批，
 /// 同时把内存占用限制在几十 MB 量级（每条约 max_text_chars 字符）。
 const TEXT_PREFETCH_CAPACITY: usize = 64;
+
+struct IndexTimingGuard {
+    db: Arc<Db>,
+    file: String,
+    stage: &'static str,
+    started: std::time::Instant,
+}
+
+impl Drop for IndexTimingGuard {
+    fn drop(&mut self) {
+        let ms = self.started.elapsed().as_millis();
+        let file = self.file.replace('|', "/").replace('\n', " ");
+        let _ = self.db.log(
+            "perf",
+            &format!("index_timing|file={file}|stage={}|ms={ms}", self.stage),
+        );
+    }
+}
+
+/// Encode an image batch without turning one oversized/unsupported batch into
+/// N serial model calls.  A few backends reject a batch because its combined
+/// token budget is too large; recursively bisecting keeps the successful
+/// portions batched and only falls back to a scalar call for a single image.
+fn embed_image_batch_resilient(
+    embedder: &dyn Embedder,
+    images: &[&image::DynamicImage],
+    cancelled: &dyn Fn() -> bool,
+) -> (Vec<Result<Vec<f32>, String>>, Option<String>) {
+    if images.is_empty() {
+        return (Vec::new(), None);
+    }
+    if cancelled() {
+        return (cancelled_batch_results(images.len()), None);
+    }
+    match embedder.embed_image_data_batch(images) {
+        Ok(vectors) if vectors.len() == images.len() => {
+            (vectors.into_iter().map(Ok).collect(), None)
+        }
+        Ok(vectors) => {
+            let reason = format!("image batch returned {} vectors for {} inputs", vectors.len(), images.len());
+            if cancelled() {
+                return (cancelled_batch_results(images.len()), Some(reason));
+            }
+            if images.len() == 1 {
+                return (vec![embedder.embed_image_data(images[0])], Some(reason));
+            }
+            let mid = images.len() / 2;
+            let (mut left, left_error) = embed_image_batch_resilient(embedder, &images[..mid], cancelled);
+            let (right, right_error) = embed_image_batch_resilient(embedder, &images[mid..], cancelled);
+            left.extend(right);
+            (left, left_error.or(right_error).or(Some(reason)))
+        }
+        Err(error) => {
+            // A text-only backend cannot encode any item in this image lane.
+            // Do not recursively split into N scalar calls; preserve the
+            // successful text lane and let callers mark image vectors absent.
+            if is_unsupported_backend_error(&error) {
+                return (
+                    std::iter::repeat_with(|| Err(error.clone()))
+                        .take(images.len())
+                        .collect(),
+                    Some(error),
+                );
+            }
+            if cancelled() {
+                return (cancelled_batch_results(images.len()), Some(error));
+            }
+            if images.len() == 1 {
+                if is_out_of_memory_error(&error) {
+                    return (vec![Err(error.clone())], Some(error));
+                }
+                return (vec![embedder.embed_image_data(images[0])], Some(error));
+            }
+            let mid = images.len() / 2;
+            let (mut left, left_error) = embed_image_batch_resilient(embedder, &images[..mid], cancelled);
+            let (right, right_error) = embed_image_batch_resilient(embedder, &images[mid..], cancelled);
+            left.extend(right);
+            (left, left_error.or(right_error).or(Some(error)))
+        }
+    }
+}
+
+/// Encode video frames with bounded recovery. A single oversized frame batch
+/// must not discard the complete video: split failed batches until the
+/// backend accepts the remaining work, and let the caller keep subtitle-only
+/// evidence when an individual frame still cannot be encoded.
+fn embed_video_frame_batch_resilient(
+    embedder: &dyn Embedder,
+    images: &[&image::DynamicImage],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<Vec<f32>>, String> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cancelled() {
+        return Err("index cancellation requested".into());
+    }
+    match embedder.embed_video_frame_data_batch(images) {
+        Ok(vectors) if vectors.len() == images.len() => Ok(vectors),
+        Ok(_) | Err(_) if images.len() > 1 => {
+            let midpoint = images.len() / 2;
+            let mut left = embed_video_frame_batch_resilient(embedder, &images[..midpoint], cancelled)?;
+            let right = embed_video_frame_batch_resilient(embedder, &images[midpoint..], cancelled)?;
+            left.extend(right);
+            Ok(left)
+        }
+        // A singleton can be malformed or unsupported even after the batch
+        // has been bisected. Drop only that frame; the surrounding window can
+        // still contribute visual evidence and/or subtitle text.
+        Ok(_) | Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Keep successful text batches batched when one item is malformed or exceeds
+/// a backend's context limit.  A failed full batch is recursively split; only
+/// a single item is sent through the scalar path.  This avoids turning one
+/// pathological document into a long sequence of GPU launches for every
+/// otherwise valid document in the same bucket.
+fn embed_text_batch_resilient(
+    embedder: &dyn Embedder,
+    texts: &[String],
+    cancelled: &dyn Fn() -> bool,
+) -> (Vec<Result<Vec<f32>, String>>, Option<String>) {
+    if texts.is_empty() {
+        return (Vec::new(), None);
+    }
+    if cancelled() {
+        return (cancelled_batch_results(texts.len()), None);
+    }
+    match embedder.embed_text_batch(texts) {
+        Ok(vectors) if vectors.len() == texts.len() => {
+            (vectors.into_iter().map(Ok).collect(), None)
+        }
+        Ok(vectors) => {
+            let reason = format!(
+                "text batch returned {} vectors for {} inputs",
+                vectors.len(),
+                texts.len()
+            );
+            if cancelled() {
+                return (cancelled_batch_results(texts.len()), Some(reason));
+            }
+            if texts.len() == 1 {
+                return (vec![embedder.embed_text(&texts[0], false)], Some(reason));
+            }
+            let mid = texts.len() / 2;
+            let (mut left, left_error) = embed_text_batch_resilient(embedder, &texts[..mid], cancelled);
+            let (right, right_error) = embed_text_batch_resilient(embedder, &texts[mid..], cancelled);
+            left.extend(right);
+            (left, left_error.or(right_error).or(Some(reason)))
+        }
+        Err(error) => {
+            if is_unsupported_backend_error(&error) {
+                return (
+                    std::iter::repeat_with(|| Err(error.clone()))
+                        .take(texts.len())
+                        .collect(),
+                    Some(error),
+                );
+            }
+            if cancelled() {
+                return (cancelled_batch_results(texts.len()), Some(error));
+            }
+            if texts.len() == 1 {
+                if is_out_of_memory_error(&error) {
+                    return (vec![Err(error.clone())], Some(error));
+                }
+                return (vec![embedder.embed_text(&texts[0], false)], Some(error));
+            }
+            let mid = texts.len() / 2;
+            let (mut left, left_error) = embed_text_batch_resilient(embedder, &texts[..mid], cancelled);
+            let (right, right_error) = embed_text_batch_resilient(embedder, &texts[mid..], cancelled);
+            left.extend(right);
+            (left, left_error.or(right_error).or(Some(error)))
+        }
+    }
+}
+
+fn cancelled_batch_results(size: usize) -> Vec<Result<Vec<f32>, String>> {
+    std::iter::repeat_with(|| Err("index cancellation requested".into()))
+        .take(size)
+        .collect()
+}
+
+fn is_out_of_memory_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("out of memory")
+        || lower.contains("out_of_memory")
+        || lower.contains("failed to allocate")
+        || lower.contains("allocation failed")
+}
 
 /// 抽取完成、等待送进模型编码的文本。
 struct ExtractedText {
@@ -42,6 +279,9 @@ struct ExtractedText {
 }
 
 fn is_unsupported_backend_error(error: &str) -> bool {
+    if crate::ai::is_unsupported_media_error(error) {
+        return true;
+    }
     let lower = error.to_ascii_lowercase();
     lower.contains("不支持")
         || lower.contains("unsupported")
@@ -63,6 +303,41 @@ fn is_expected_media_skip_error(error: &str) -> bool {
         || lower.contains("音频解码失败")
         || lower.contains("视频抽帧失败")
         || lower.contains("视频未能解码")
+}
+
+/// Persist temporal metadata for video backends that cannot produce native
+/// per-window embeddings.  The legacy media/hash fallback still creates one
+/// file-level vector, but keeping 30-second subtitle windows in SQLite makes
+/// spoken phrases searchable and lets the UI report the matching timestamp.
+/// No model or FFmpeg frame decode is performed here: only duration and
+/// subtitles are inspected, so this fallback does not add another expensive
+/// media pass to indexing.
+fn persist_video_subtitle_windows(db: &Db, file_id: i64, path: &Path) {
+    let duration = match media::require_video_duration(path) {
+        Ok(value) if value.is_finite() && value > 0.0 => value,
+        _ => return,
+    };
+    let cues = media::video_subtitles(path);
+    let mut segments = Vec::new();
+    let mut start = 0.0_f64;
+    let mut segment_no = 0_i64;
+    while start < duration {
+        let end = (start + 30.0).min(duration);
+        let subtitle = media::subtitle_text_for_window_with_timestamps(&cues, start, end);
+        segments.push(crate::db::VideoSegmentMeta {
+            vector_id: crate::ai::video_segment_id(file_id, segment_no as usize),
+            file_id,
+            segment_no,
+            start_ms: (start * 1000.0).round() as i64,
+            end_ms: (end * 1000.0).round() as i64,
+            subtitle,
+        });
+        segment_no += 1;
+        start = end;
+    }
+    if !segments.is_empty() {
+        let _ = db.replace_video_segments(file_id, &segments);
+    }
 }
 
 /// Split document inputs into small homogeneous buckets before sending them
@@ -204,9 +479,33 @@ pub struct Indexer {
     index_elapsed_millis: AtomicU64,
     /// 上次把进度写回 `stats` 的时刻。见 `refresh_progress_throttled`。
     last_progress_refresh: Mutex<Option<std::time::Instant>>,
+    _ocr: crate::ocr::OcrConfig,
 }
 
 impl Indexer {
+    #[cfg(windows)]
+    fn set_process_priority(above_normal: bool) {
+        extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn SetPriorityClass(process: *mut std::ffi::c_void, priority: u32) -> i32;
+        }
+        const NORMAL_PRIORITY_CLASS: u32 = 0x20;
+        const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x8000;
+        unsafe {
+            let _ = SetPriorityClass(
+                GetCurrentProcess(),
+                if above_normal {
+                    ABOVE_NORMAL_PRIORITY_CLASS
+                } else {
+                    NORMAL_PRIORITY_CLASS
+                },
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn set_process_priority(_above_normal: bool) {}
+
     #[inline]
     fn work_kind_of(kind: &str, ext: &str) -> WorkKind {
         if ext.eq_ignore_ascii_case("pdf") {
@@ -225,6 +524,15 @@ impl Indexer {
         self.cancel_requested.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed)
     }
 
+    fn timing(&self, file: impl Into<String>, stage: &'static str) -> IndexTimingGuard {
+        IndexTimingGuard {
+            db: Arc::clone(&self.db),
+            file: file.into(),
+            stage,
+            started: std::time::Instant::now(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<Db>,
@@ -235,6 +543,7 @@ impl Indexer {
         embedder: Arc<dyn Embedder>,
         media_embedder: Arc<dyn Embedder>,
         cfg: IndexConfig,
+        ocr: crate::ocr::OcrConfig,
         thumb_dir: PathBuf,
     ) -> Self {
         let configured_batch_size = cfg.batch_size.clamp(1, 128) as u64;
@@ -278,6 +587,7 @@ impl Indexer {
             index_started_at: Mutex::new(None),
             index_elapsed_millis: AtomicU64::new(0),
             last_progress_refresh: Mutex::new(None),
+            _ocr: ocr,
         }
     }
 
@@ -323,6 +633,37 @@ impl Indexer {
             }
         }
         s
+    }
+
+    pub fn is_idle(&self) -> bool {
+        !self.busy.load(Ordering::Relaxed) && self.queue.lock().is_empty()
+    }
+
+    pub fn restore_elapsed_millis(&self, millis: u64) {
+        self.index_elapsed_millis.store(millis, Ordering::Relaxed);
+    }
+
+    /// Runtime replacement is not a new indexing operation. Model unloading,
+    /// reloading and switching must keep the last task's counters and scope;
+    /// only enqueue/reset_progress starts a fresh set of counters. Call this
+    /// after the old worker has stopped so its final checkpoint is included.
+    pub fn inherit_progress(&self, previous: &Indexer) {
+        let mut stats = previous.snapshot();
+        stats.queued = 0;
+        stats.running = false;
+        stats.current = None;
+        stats.current_items.clear();
+        *self.stats.lock() = stats;
+        *self.progress_what.lock() = previous.progress_what.lock().clone();
+        *self.progress_roots.lock() = previous.progress_roots.lock().clone();
+        self.index_elapsed_millis.store(
+            previous.index_elapsed_millis.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.resume_pending.store(
+            previous.resume_pending.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn set_progress_scope(&self, roots: Option<Vec<String>>) {
@@ -440,7 +781,10 @@ impl Indexer {
         )
     }
 
-    pub fn enqueue(&self, ids: Vec<i64>, what: &str) {
+    pub fn enqueue(&self, ids: Vec<i64>, what: &str) -> Result<(), String> {
+        if !ids.is_empty() {
+            Self::set_process_priority(true);
+        }
         *self.progress_what.lock() = what.to_string();
         let _ = self.db.set_meta("index_progress_what", what);
         let resume = self.resume_pending.swap(false, Ordering::Relaxed);
@@ -492,6 +836,7 @@ impl Indexer {
         self.refresh_progress(what, true);
         let mut stats = self.stats.lock();
         stats.last_error = None;
+        Ok(())
     }
 
     fn finish_elapsed(&self) {
@@ -521,7 +866,7 @@ impl Indexer {
     pub fn enqueue_all_pending(&self, what: &str) -> usize {
         let ids = self.db.pending_ids_active(what, 100_000).unwrap_or_default();
         let n = ids.len();
-        self.enqueue(ids, what);
+        let _ = self.enqueue(ids, what);
         n
     }
 
@@ -529,7 +874,7 @@ impl Indexer {
     pub fn enqueue_all_pending_limited(&self, what: &str, limit: usize) -> usize {
         let ids = self.db.pending_ids_active(what, limit).unwrap_or_default();
         let n = ids.len();
-        self.enqueue(ids, what);
+        let _ = self.enqueue(ids, what);
         n
     }
 
@@ -567,6 +912,7 @@ impl Indexer {
                 // 队列空了：把攒着的向量落盘，并把真实进度写回去
                 self.flush();
                 self.finish_elapsed();
+                Self::set_process_priority(false);
                 let progress_what = self.progress_what.lock().clone();
                 self.refresh_progress(&progress_what, true);
                 std::thread::sleep(std::time::Duration::from_millis(150));
@@ -669,6 +1015,7 @@ impl Indexer {
             let _ = self.db.mark_missing(&row.path);
             return Ok(());
         }
+        let _file_timing = self.timing(row.name.clone(), "file");
         self.set_current_items(std::slice::from_ref(&row.name), 1);
 
         // 1. 文本
@@ -680,6 +1027,7 @@ impl Indexer {
             // 用户搜正文永远搜不到 —— 全文检索形同虚设。
             let want_text = matches!(row.kind.as_str(), "text" | "document");
             if want_text {
+                let _extract_timing = self.timing(row.name.clone(), "extract");
                 match crate::textract::extract_text(Path::new(&row.path), self.cfg.max_text_chars) {
                     Some(text) if !text.trim().is_empty() => {
                         let body = crate::util::index_text(&text);
@@ -791,9 +1139,10 @@ impl Indexer {
                     crate::textract::extract_text(Path::new(&row.path), self.cfg.max_text_chars)
                         .filter(|value| !value.trim().is_empty())
                 });
+            let _decode_timing = self.timing(row.name.clone(), "pdf-decode");
             let images = crate::textract::pdf_images_with_cancel(
                 Path::new(&row.path),
-                8,
+                4,
                 || self.is_cancelled(),
             );
             (text, images)
@@ -807,6 +1156,7 @@ impl Indexer {
         // into the same 768-dimensional space. Backends without that
         // capability still fall back to the separate media vector store.
         if what == "embed" || what == "auto" {
+            let _model_timing = self.timing(row.name.clone(), "model");
             let is_media = matches!(row.kind.as_str(), "image" | "audio" | "video");
             let modality = match row.kind.as_str() {
                 "image" => "image",
@@ -816,7 +1166,61 @@ impl Indexer {
             };
             let primary_supports_media = is_media
                 && self.embedder.info().modalities.iter().any(|item| item == modality);
-            let (embedder, store) = if is_media && !primary_supports_media {
+            let primary_supports_image = self
+                .embedder
+                .info()
+                .modalities
+                .iter()
+                .any(|item| item == "image");
+            let primary_supports_video = self
+                .embedder
+                .info()
+                .modalities
+                .iter()
+                .any(|item| item == "video");
+            let primary_supports_audio = self
+                .embedder
+                .info()
+                .modalities
+                .iter()
+                .any(|item| item == "audio");
+            // A model may expose image input without advertising a native
+            // video tower. Keep those videos in the primary shared space by
+            // encoding their decoded frames per temporal window below. The
+            // old selection sent them to the hash/media fallback and left
+            // only a file-level vector, which made visual video queries lose
+            // the matching timestamp.
+            // If the backend has a vision projector but does not advertise a
+            // native video tower, always use the frame-window path.  Some
+            // GGUF/mmproj builds advertise both image and audio while still
+            // lacking the native video entry point; routing those files to
+            // `embed_video_segment_details_*` made the whole file fail (or
+            // produced audio-only vectors), so visual content could never be
+            // recalled.  The frame-window path keeps one timestamped vector
+            // per window and lets the subtitle FTS lane cover spoken text.
+            let image_window_video = row.kind == "video"
+                && !primary_supports_video
+                && primary_supports_image
+                // When the model also accepts audio, use the native temporal
+                // path so each window can fuse its frames and audio track.
+                && !primary_supports_audio;
+            let primary_can_encode_video_window = row.kind == "video"
+                && (primary_supports_video || primary_supports_image || primary_supports_audio);
+            let (embedder, store) = if image_window_video {
+                (Arc::clone(&self.embedder), Arc::clone(&self.vectors))
+            } else if primary_can_encode_video_window {
+                // A video can be encoded from its supported components even
+                // when the backend does not advertise a native video tower:
+                // audio-only models consume the window audio in the media
+                // space, while image/audio models with a native video tower
+                // remain in the shared primary space.
+                let target_store = if primary_supports_video {
+                    Arc::clone(&self.vectors)
+                } else {
+                    Arc::clone(&self.media_vectors)
+                };
+                (Arc::clone(&self.embedder), target_store)
+            } else if is_media && !primary_supports_media {
                 (
                     Arc::clone(&self.media_embedder),
                     Arc::clone(&self.media_vectors),
@@ -824,39 +1228,263 @@ impl Indexer {
             } else {
                 (Arc::clone(&self.embedder), Arc::clone(&self.vectors))
             };
-            let is_shared_video = row.kind == "video"
-                && primary_supports_media
-                && embedder.info().backend == "candle";
-            let video_segments = if is_shared_video {
-                Some(embedder.embed_video_segments(Path::new(&row.path)))
+            // Every primary backend that advertises video support must use the
+            // temporal streaming path.  Restricting this to Candle silently
+            // sent GGUF + mmproj videos through the legacy file-level vector
+            // path, which discarded subtitle and timestamp metadata and made
+            // specific video-content queries impossible to resolve.
+            // Native multimodal backends index videos as temporal windows in
+            // the shared primary space. A media fallback still uses its fast
+            // file-level visual vector; subtitle windows are persisted below
+            // without forcing an expensive second FFmpeg decode pass.
+            // Keep temporal locality for every backend that can encode at
+            // least one video modality.  A video-capable primary model writes
+            // to the shared store; an audio-only model uses the media store
+            // so its per-window audio embeddings are not discarded behind a
+            // single file-level fallback vector.
+            // The selected encoder can be the dedicated media fallback when
+            // the primary model is text-only. Temporal video persistence must
+            // follow that actual encoder, otherwise the fallback path is
+            // reduced to one file-level vector and all visual/audio windows
+            // become unsearchable.
+            let embedder_info = embedder.info();
+            let temporal_video = row.kind == "video"
+                && (embedder_info
+                    .modalities
+                    .iter()
+                    .any(|item| matches!(item.as_str(), "image" | "audio" | "video"))
+                    // Keep the deterministic fallback on the same temporal
+                    // persistence path.  HashEmbedder cannot provide
+                    // cross-modal semantic matching, but its per-window
+                    // vectors still carry the correct 30-second boundaries
+                    // and are useful for image-space/fallback searches and
+                    // for resuming an interrupted video without collapsing
+                    // everything into one file-level vector.
+                    || embedder_info.backend.eq_ignore_ascii_case("hash"));
+            // The durable space is determined by the store selected above,
+            // not by the embedder's advertised modalities.  A text-only
+            // primary model can use a multimodal fallback embedder; that
+            // fallback is intentionally stored in `media_vectors` even when
+            // it advertises a native video tower.  Using the modality flag
+            // here used to label those rows as `primary` while the payload
+            // lived in the media store, making every video window invisible
+            // to search and to startup recovery.
+            if image_window_video {
+                let video_key = video_model_key(&embedder_model_key(embedder.as_ref(), &self.cfg));
+                let video_space = if Arc::ptr_eq(&store, &self.vectors) {
+                    "primary"
+                } else {
+                    "media"
+                };
+                let result = self.embed_video_image_windows(
+                    fid,
+                    Path::new(&row.path),
+                    embedder.as_ref(),
+                    &store,
+                    video_space,
+                    &video_key,
+                );
+                match result {
+                    Ok(segment_count) => {
+                        // A resumed/cancelled run may have durable windows
+                        // from an earlier invocation. The decoder skips
+                        // those windows, so restore their SQLite payloads
+                        // into the live stores before this file is exposed to
+                        // search. Startup already does this, but an in-place
+                        // resume must do it as well.
+                        let _ = self.db.restore_video_segment_vectors_for_file(
+                            fid,
+                            &self.vectors,
+                            &self.media_vectors,
+                        );
+                        if segment_count == 0 {
+                            let _ = self.db.set_state(fid, "embed", "skip");
+                            let _ = self.db.log(
+                                "index",
+                                &format!("video skipped: no decodable visual windows: {}", row.name),
+                            );
+                        } else {
+                            self.pending_states.lock().push(fid);
+                            self.dirty.fetch_add(1, Ordering::Relaxed);
+                            self.stats.lock().emb_done += 1;
+                        }
+                    }
+                    Err(error) => {
+                        if is_expected_media_skip_error(&error) {
+                            let _ = self.db.set_state(fid, "embed", "skip");
+                            let _ = self.db.log("index", &format!("video skipped {}: {error}", row.name));
+                        } else {
+                            let _ = self.db.set_state(fid, "embed", "fail");
+                            self.stats.lock().emb_fail += 1;
+                            return Err(format!("{}: {error}", row.name));
+                        }
+                    }
+                }
+                // The temporal vectors are already persisted. Avoid creating
+                // the obsolete file-level vector as a duplicate result.
+                store.remove(fid);
+                // The temporal visual vectors already cover every video
+                // window. Running a second full-video CLIP/CLAP pass here
+                // would decode the same file again and can dominate index
+                // time. Keep the optional cross-modal fallback only for
+                // audio-only temporal backends, where CLIP may still be the
+                // only image search space.
+                if !primary_supports_image && !primary_supports_video {
+                    self.embed_cross_modal(&row, if is_pdf { Some(&pdf_images) } else { None }, None);
+                }
+                return Ok(());
+            }
+            // Video windows need their temporal metadata persisted together
+            // with the vector. Legacy code only wrote subtitle rows and then
+            // created one file-level media vector, which made visual/audio
+            // content inside a long video impossible to retrieve. Stream all
+            // native temporal backends here; the selected store determines
+            // whether the space is `primary` or `media`.
+            let video_key = video_model_key(&embedder_model_key(embedder.as_ref(), &self.cfg));
+            let video_space = if Arc::ptr_eq(&store, &self.vectors) {
+                "primary"
+            } else {
+                "media"
+            };
+            if row.kind == "video" && !temporal_video {
+                persist_video_subtitle_windows(self.db.as_ref(), fid, Path::new(&row.path));
+            }
+            let video_segments = if temporal_video {
+                let vector_dim = store.dim();
+                let completed = self
+                    .db
+                    .completed_video_segments_compatible(fid, video_space, &video_key, vector_dim)
+                    .unwrap_or_default();
+                let db = Arc::clone(&self.db);
+                let store_for_callback = Arc::clone(&store);
+                // Commit a small group of completed windows together.  This
+                // keeps every flushed group searchable during a long video,
+                // while avoiding one SQLite transaction/fsync per window.
+                const VIDEO_DB_BATCH: usize = 8;
+                let pending_rows = Arc::new(Mutex::new(Vec::<crate::db::VideoSegmentEmbeddingRow>::with_capacity(VIDEO_DB_BATCH)));
+                let pending_for_callback = Arc::clone(&pending_rows);
+                let cancelled = || self.is_cancelled();
+                let on_progress = |_done: usize, _total: usize| {};
+                let on_segment = |segment: crate::ai::VideoSegmentEmbedding| {
+                    let vector_id = crate::ai::video_segment_id(fid, segment.segment_no);
+                    let vector = store_for_callback.fit_vector(&segment.vector);
+                    if vector.len() != vector_dim || vector.iter().any(|value| !value.is_finite()) {
+                        return Err(format!(
+                            "video segment {} produced an invalid vector dimension",
+                            segment.segment_no
+                        ));
+                    }
+                    let metadata = crate::db::VideoSegmentMeta {
+                        vector_id,
+                        file_id: fid,
+                        segment_no: segment.segment_no as i64,
+                        start_ms: (segment.start_seconds.max(0.0) * 1000.0).round() as i64,
+                        end_ms: (segment.end_seconds.max(segment.start_seconds) * 1000.0).round() as i64,
+                        subtitle: segment.subtitle.clone(),
+                    };
+                    let mut flush = None;
+                    {
+                        let mut pending = pending_for_callback.lock();
+                        pending.push(crate::db::VideoSegmentEmbeddingRow {
+                            segment: metadata.clone(),
+                            vector_space: video_space.to_string(),
+                            model_key: video_key.clone(),
+                            vector: vector.clone(),
+                        });
+                        if pending.len() >= VIDEO_DB_BATCH {
+                            flush = Some(std::mem::take(&mut *pending));
+                        }
+                    }
+                    if let Some(rows) = flush {
+                        db.upsert_video_segment_embeddings_batch(&rows).map_err(|error| {
+                            format!("persist video segment {}: {error}", segment.segment_no)
+                        })?;
+                    }
+                    store_for_callback.add(vector_id, &vector);
+                    self.dirty.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                };
+                let stream_result = embedder.embed_video_segment_details_resumable_streaming(
+                    Path::new(&row.path),
+                    &cancelled,
+                    &completed,
+                    &on_progress,
+                    &on_segment,
+                );
+                // Flush a final short batch even when the stream ends before
+                // VIDEO_DB_BATCH windows (or is cancelled after producing a
+                // few more completed windows).
+                let tail = {
+                    let mut pending = pending_rows.lock();
+                    std::mem::take(&mut *pending)
+                };
+                let stream_result = match (stream_result, tail.is_empty()) {
+                    (Ok(count), true) => Ok(count),
+                    (Ok(count), false) => db
+                        .upsert_video_segment_embeddings_batch(&tail)
+                        .map(|_| count)
+                        .map_err(|error| format!("persist video segment batch: {error}")),
+                    (Err(error), true) => Err(error),
+                    (Err(error), false) => db
+                        .upsert_video_segment_embeddings_batch(&tail)
+                        .map(|_| 0usize)
+                        .map_err(|flush_error| format!("{error}; persist video segment batch: {flush_error}")),
+                };
+                Some(stream_result)
             } else {
                 None
             };
             let embedded = if is_pdf {
-                crate::ai::embed_pdf_parts(embedder.as_ref(), pdf_text.as_deref(), &pdf_images)
-            } else if is_shared_video {
+                let images: Vec<image::DynamicImage> =
+                    pdf_images.iter().cloned().collect();
+                crate::ai::embed_pdf_parts(embedder.as_ref(), pdf_text.as_deref(), &images)
+            } else if temporal_video {
                 Err("video segments handled separately".into())
             } else {
                 embed_path(embedder.as_ref(), Path::new(&row.path), &row.kind)
             };
             if let Some(result) = video_segments {
                 match result {
-                    Ok(segments) if !segments.is_empty() => {
-                        store.remove(fid);
-                        store.remove_matching(|id| crate::ai::video_segment_source(id) == Some(fid));
-                        for (segment, vector) in segments.into_iter().enumerate() {
-                            store.add(crate::ai::video_segment_id(fid, segment), &vector);
-                        }
-                        self.pending_states.lock().push(fid);
-                        self.dirty.fetch_add(1, Ordering::Relaxed);
-                        self.stats.lock().emb_done += 1;
-                    }
-                    Ok(_) => {
-                        let _ = self.db.set_state(fid, "embed", "skip");
-                        let _ = self.db.log(
-                            "index",
-                            &format!("跳过媒体 {}：没有可用的视频窗口（需要 FFmpeg 或文件没有可解码轨道）", row.name),
+                    Ok(segment_count) => {
+                        // The streaming API skips windows completed before a
+                        // cancellation/resume. Restore those durable rows
+                        // into the in-memory stores so the current process can
+                        // search the whole video immediately.
+                        let _ = self.db.restore_video_segment_vectors_for_file(
+                            fid,
+                            &self.vectors,
+                            &self.media_vectors,
                         );
+                        // The streaming API returns only the number produced in
+                        // this invocation. A resumed video may already have
+                        // earlier durable windows, so rebuild the live ID set
+                        // from SQLite instead of treating segment_count as the
+                        // total and deleting completed temporal vectors.
+                        let completed_after = self
+                            .db
+                            .completed_video_segments_compatible(fid, video_space, &video_key, store.dim())
+                            .unwrap_or_default();
+                        if !completed_after.is_empty() {
+                            store.remove(fid);
+                            let current_ids: std::collections::HashSet<i64> = completed_after
+                                .into_iter()
+                                .filter_map(|segment| usize::try_from(segment).ok())
+                                .map(|segment| crate::ai::video_segment_id(fid, segment))
+                                .collect();
+                            store.remove_matching(|id| {
+                                crate::ai::video_segment_source(id) == Some(fid)
+                                    && !current_ids.contains(&id)
+                            });
+                            self.pending_states.lock().push(fid);
+                            self.dirty.fetch_add(1, Ordering::Relaxed);
+                            self.stats.lock().emb_done += 1;
+                        } else if segment_count == 0 {
+                            let _ = self.db.set_state(fid, "embed", "skip");
+                            let _ = self.db.log(
+                                "index",
+                                &format!("video skipped: no decodable windows: {}", row.name),
+                            );
+                        }
                     }
                     Err(error) => {
                         if is_expected_media_skip_error(&error) {
@@ -874,9 +1502,8 @@ impl Indexer {
                 Ok(vec) => {
                     store.add(fid, &vec);
                     self.pending_states.lock().push(fid);
-                    // 批量落盘：向量库是全量写盘（几百 MB 量级），每条都 save()
-                    // 会让硬盘狂转、索引速度掉到个位数。每 64 条或队列空闲时再写。
-                    self.dirty.fetch_add(1, Ordering::Relaxed);
+                    // 批量落盘：向量库是全量写盘（几百 MB 量级），每条�?save()
+                    // 会让硬盘狂转、索引速度掉到个位数。每 64 条或队列空闲时再写�?                    self.dirty.fetch_add(1, Ordering::Relaxed);
                     self.stats.lock().emb_done += 1;
                 }
                 Err(e) => {
@@ -902,9 +1529,258 @@ impl Indexer {
         // 4. 跨模态（CLIP / CLAP）：把图片和音频编码到「和文字同一空间」，
         //    这样「一句话描述找图片」才成立。hash 向量只描述颜色/能量分布，
         //    跟文字八竿子打不着，不能拿来给文字查询用。
-        self.embed_cross_modal(&row, if is_pdf { Some(&pdf_images) } else { None }, None);
+            // Do not decode a temporal video a second time for the optional
+            // file-level CLIP/CLAP stores. The shared/media window vectors and
+            // subtitle FTS already provide timestamped video retrieval. Keep
+            // the fallback for non-temporal videos and audio-only encoders.
+            let should_embed_cross_modal = if row.kind != "video" {
+                true
+            } else {
+                // The temporal capability variables above are scoped to the
+                // primary embedding branch. Recompute the cheap capability
+                // check here so this final optional CLIP/CLAP pass does not
+                // decode a video twice when either configured encoder already
+                // persisted timestamped windows.
+                let primary_info = self.embedder.info();
+                let media_info = self.media_embedder.info();
+                let has_visual_temporal = primary_info
+                    .modalities
+                    .iter()
+                    .any(|item| matches!(item.as_str(), "image" | "video"))
+                    || media_info
+                        .modalities
+                        .iter()
+                        .any(|item| matches!(item.as_str(), "image" | "video"));
+                !has_visual_temporal
+            };
+            if should_embed_cross_modal {
+                self.embed_cross_modal(&row, if is_pdf { Some(&pdf_images) } else { None }, None);
+            }
 
         Ok(())
+    }
+
+    /// Encode videos with an image-capable backend that has no native video
+    /// projector. Each bounded 30-second window becomes one primary vector
+    /// with durable timing metadata. This keeps visual content searchable for
+    /// GGUF/mmproj combinations that expose `image` but not `video`.
+    fn embed_video_image_windows(
+        &self,
+        file_id: i64,
+        path: &Path,
+        embedder: &dyn Embedder,
+        store: &VectorStore,
+        vector_space: &str,
+        model_key: &str,
+    ) -> Result<usize, String> {
+        let duration = media::require_video_duration(path)?;
+        let subtitles = media::video_subtitles(path);
+        let mut completed = self
+            .db
+            .completed_video_segments_compatible(file_id, vector_space, model_key, store.dim())
+            .unwrap_or_default();
+        // FFmpeg decoding is substantially slower than a small image batch
+        // forward on modern GPUs.  Keep at most three windows in flight so
+        // the CPU can decode the next window while the model consumes the
+        // current one.  The scoped threads are joined before this function
+        // returns, so cancellation and temporary files remain deterministic.
+        std::thread::scope(|scope| {
+            let mut pending = VecDeque::new();
+            let mut next_segment = 0usize;
+            let mut next_start = 0.0f64;
+            let mut encoded_count = 0usize;
+            const VIDEO_DB_BATCH: usize = 8;
+            let mut pending_db: Vec<crate::db::VideoSegmentEmbeddingRow> =
+                Vec::with_capacity(VIDEO_DB_BATCH);
+
+            let schedule_window = |pending: &mut VecDeque<_>,
+                                   segment_no: usize,
+                                   start: f64,
+                                   end: f64| {
+                let handle = scope.spawn(move || {
+                    media::decode_video_window_with_cancel(
+                        path,
+                        start,
+                        end - start,
+                        self.cfg.image_max_side.max(512),
+                        true,
+                        false,
+                        16_000,
+                        &|| self.is_cancelled(),
+                    )
+                });
+                pending.push_back((segment_no, start, end, handle));
+            };
+
+            while next_start < duration && pending.len() < VIDEO_DECODE_PREFETCH_DEPTH {
+                let window_start = next_start;
+                let end = (next_start + 30.0).min(duration);
+                let segment_no = next_segment;
+                next_segment += 1;
+                next_start = end;
+                if !completed.contains(&(segment_no as i64)) {
+                    schedule_window(&mut pending, segment_no, window_start, end);
+                }
+            }
+
+            while let Some((segment_no, start, end, handle)) = pending.pop_front() {
+                if self.is_cancelled() {
+                    return Err("index cancellation requested".into());
+                }
+
+                // Refill the bounded queue before waiting for/processing the
+                // current decode, keeping the decoder busy during inference.
+                while next_start < duration && pending.len() < VIDEO_DECODE_PREFETCH_DEPTH {
+                    let window_start = next_start;
+                    let window_end = (window_start + 30.0).min(duration);
+                    let queued_segment = next_segment;
+                    next_segment += 1;
+                    next_start = window_end;
+                    if !completed.contains(&(queued_segment as i64)) {
+                        schedule_window(&mut pending, queued_segment, window_start, window_end);
+                    }
+                }
+
+                let (frames, _audio) = handle
+                    .join()
+                    .map_err(|_| format!("video segment {} decoder thread panicked", segment_no))?;
+                if self.is_cancelled() {
+                    for frame in &frames {
+                        let _ = std::fs::remove_file(frame);
+                    }
+                    if let Some(parent) = frames.first().and_then(|frame| frame.parent()) {
+                        let _ = std::fs::remove_dir_all(parent);
+                    }
+                    for (_, _, _, job) in pending.drain(..) {
+                        if let Ok((queued_frames, _)) = job.join() {
+                            for frame in &queued_frames {
+                                let _ = std::fs::remove_file(frame);
+                            }
+                            if let Some(parent) = queued_frames.first().and_then(|frame| frame.parent()) {
+                                let _ = std::fs::remove_dir_all(parent);
+                            }
+                        }
+                    }
+                    return Err("index cancellation requested".into());
+                }
+                let images: Vec<image::DynamicImage> = frames
+                    .iter()
+                    .filter_map(|frame| image::open(frame).ok())
+                    .collect();
+                for frame in &frames {
+                    let _ = std::fs::remove_file(frame);
+                }
+                if let Some(parent) = frames.first().and_then(|frame| frame.parent()) {
+                    let _ = std::fs::remove_dir_all(parent);
+                }
+
+                // Keep the frame average separate from the subtitle vector.
+                // The previous implementation accumulated frame vectors,
+                // divided once before subtitle fusion, then divided the fused
+                // vector a second time after fusion.  That made visual
+                // evidence shrink with the number of frames and left the
+                // subtitle signal effectively dominating every window.
+                let mut frame_vector = None;
+                let mut encoded_items = 0usize;
+                let mut frame_error = None;
+                for chunk in images.chunks(IMAGE_GPU_BATCH_LIMIT) {
+                    let refs: Vec<&image::DynamicImage> = chunk.iter().collect();
+                    let batch = match embed_video_frame_batch_resilient(
+                        embedder,
+                        &refs,
+                        &|| self.is_cancelled(),
+                    ) {
+                        Ok(batch) => batch,
+                        Err(error) if error == "index cancellation requested" => {
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            frame_error = Some(error);
+                            break;
+                        }
+                    };
+                    for item in batch {
+                        if item.is_empty() {
+                            continue;
+                        }
+                        let target = frame_vector.get_or_insert_with(|| vec![0.0f32; item.len()]);
+                        if target.len() == item.len() {
+                            for (dst, value) in target.iter_mut().zip(item) {
+                                *dst += value;
+                            }
+                            encoded_items += 1;
+                        }
+                    }
+                }
+                let subtitle = media::subtitle_text_for_window_with_timestamps(&subtitles, start, end);
+                if let Some(error) = frame_error {
+                    let _ = self.db.log(
+                        "index",
+                        &format!("video frame batch skipped in window {}-{}s: {}", start, end, error),
+                    );
+                }
+                // Subtitle text is already persisted in `video_segments` and
+                // queried through the timestamp-aware FTS lane. Do not run a
+                // second text-model forward for every image-only window when
+                // a visual vector is available; retain a text fallback only
+                // when no frame could be encoded.
+                let vector = match frame_vector {
+                    Some(mut frames) => {
+                        if encoded_items > 0 {
+                            let count = encoded_items as f32;
+                            for value in &mut frames {
+                                *value /= count;
+                            }
+                        }
+                        Some(frames)
+                    }
+                    None if !subtitle.is_empty() => {
+                        let title = path.file_name().and_then(|name| name.to_str()).unwrap_or("video");
+                        Some(embedder.embed_text(
+                            &format!("title: {title} | text: {subtitle}"),
+                            false,
+                        )?)
+                    }
+                    None => None,
+                };
+                if let Some(mut vector) = vector {
+                    crate::ai::l2_normalize(&mut vector);
+                    let vector = store.fit_vector(&vector);
+                    if vector.len() != store.dim() || vector.iter().any(|value| !value.is_finite()) {
+                        return Err(format!("video segment {} produced an invalid vector dimension", segment_no));
+                    }
+                    let metadata = crate::db::VideoSegmentMeta {
+                        vector_id: crate::ai::video_segment_id(file_id, segment_no),
+                        file_id,
+                        segment_no: segment_no as i64,
+                        start_ms: (start * 1000.0).round() as i64,
+                        end_ms: (end * 1000.0).round() as i64,
+                        subtitle,
+                    };
+                    pending_db.push(crate::db::VideoSegmentEmbeddingRow {
+                        segment: metadata.clone(),
+                        vector_space: vector_space.to_string(),
+                        model_key: model_key.to_string(),
+                        vector: vector.clone(),
+                    });
+                    if pending_db.len() >= VIDEO_DB_BATCH {
+                        self.db
+                            .upsert_video_segment_embeddings_batch(&pending_db)
+                            .map_err(|error| format!("persist video segment {}: {error}", segment_no))?;
+                        pending_db.clear();
+                    }
+                    store.add(metadata.vector_id, &vector);
+                    completed.insert(segment_no as i64);
+                    encoded_count += 1;
+                }
+            }
+            if !pending_db.is_empty() {
+                self.db
+                    .upsert_video_segment_embeddings_batch(&pending_db)
+                    .map_err(|error| format!("persist video segment batch: {error}"))?;
+            }
+            Ok(encoded_count)
+        })
     }
 
     /// Process a PDF batch with parallel extraction and flattened model batches.
@@ -977,15 +1853,31 @@ impl Indexer {
                         return (None, Vec::new());
                     }
                     let text = if candidate.needs_extract {
+                        let _extract_timing = self.timing(candidate.name.clone(), "extract");
                         crate::textract::extract_text(&candidate.path, max_chars)
                     } else {
                         None
                     };
-                    let images = crate::textract::pdf_images_with_cancel(
-                        &candidate.path,
-                        if what == "text" { 1 } else { 8 },
-                        || self.is_cancelled(),
-                    );
+                    // The text-only pass does not need PDF rasters once a
+                    // thumbnail already exists.  Avoid reopening and
+                    // inflating PDF image streams in that common incremental
+                    // path; keep a single image decode only for files whose
+                    // thumbnail still has to be created.
+                    let image_limit = if what == "text" {
+                        if candidate.thumb_valid { 0 } else { 1 }
+                    } else {
+                        4
+                    };
+                    let images = if image_limit == 0 {
+                        Vec::new()
+                    } else {
+                        let _decode_timing = self.timing(candidate.name.clone(), "pdf-decode");
+                        crate::textract::pdf_images_with_cancel(
+                            &candidate.path,
+                            image_limit,
+                            || self.is_cancelled(),
+                        )
+                    };
                     (text, images)
                 })
                 .collect()
@@ -1088,6 +1980,13 @@ impl Indexer {
             return Err("index cancellation requested".into());
         }
         let mut errors = Vec::new();
+        // Keep the primary PDF batch uninterrupted.  Cross-modal encoders
+        // (CLIP/other media lanes) are optional enrichment and can be much
+        // slower than the shared text/page batch; invoking them from the
+        // per-item callback serialized every GPU batch behind a second
+        // forward pass.  Record the items and process enrichment after the
+        // primary batch has drained.
+        let mut cross_modal_indices = Vec::new();
         let embed_started = std::time::Instant::now();
         crate::ai::embed_pdf_parts_batch_with(
             self.embedder.as_ref(),
@@ -1098,21 +1997,18 @@ impl Indexer {
                     return;
                 }
                 let item = &items[index];
+                let _model_timing = self.timing(item.name.clone(), "model");
                 match vector {
                     Ok(vector) => {
                         self.vectors.add(item.id, &vector);
                         self.pending_states.lock().push(item.id);
                         self.dirty.fetch_add(1, Ordering::Relaxed);
                         self.stats.lock().emb_done += 1;
-                        if let Ok(Some(row)) = self.db.get_by_id(item.id) {
-                            self.embed_cross_modal(&row, Some(&item.images), None);
-                        }
+                        cross_modal_indices.push(index);
                     }
                     Err(error) if error.contains("PDF") => {
                         let _ = self.db.set_state(item.id, "embed", "skip");
-                        if let Ok(Some(row)) = self.db.get_by_id(item.id) {
-                            self.embed_cross_modal(&row, Some(&item.images), None);
-                        }
+                        cross_modal_indices.push(index);
                     }
                     Err(error) => {
                         if is_unsupported_backend_error(&error) {
@@ -1126,6 +2022,18 @@ impl Indexer {
                 }
             },
         )?;
+        // Enrich only after the primary batch is complete.  This preserves
+        // incremental image search while preventing CLIP from interrupting
+        // the high-throughput page/text path for every PDF.
+        for index in cross_modal_indices {
+            if self.is_cancelled() {
+                return Err("index cancellation requested".into());
+            }
+            let item = &items[index];
+            if let Ok(Some(row)) = self.db.get_by_id(item.id) {
+                self.embed_cross_modal(&row, Some(&item.images), None);
+            }
+        }
         let _ = self.db.log(
             "index",
             &format!(
@@ -1245,6 +2153,12 @@ impl Indexer {
         struct PreparedImage {
             row: crate::db::FileRow,
             image: Result<image::DynamicImage, String>,
+            // Defer SQLite metadata writes until after the model consumes the
+            // batch. Producer threads must stay CPU/decode-only so they do
+            // not block the bounded queue on the database mutex.
+            text_skip: bool,
+            thumb_ready: bool,
+            tags: Option<String>,
             /// CLIP 的 224×224 CHW 像素输入，已在生产者线程里算好。
             ///
             /// 放进生产者是因为这一步（缩放+归一化）单张要 40~80 ms，
@@ -1315,12 +2229,12 @@ impl Indexer {
                             return;
                         }
                         let row = &item.row;
-                        if matches!(row.text_state.as_str(), "pending" | "fail") {
-                            let _ = self.db.set_state(row.id, "text", "skip");
-                        }
+                        let text_skip = matches!(row.text_state.as_str(), "pending" | "fail");
                         let image = image::open(&row.path).map_err(|error| {
                             format!("图片读取失败: {}: {error}", row.path)
                         });
+                        let mut thumb_ready = false;
+                        let mut tags_value = None;
                         if let Ok(image) = &image {
                             let thumb_path = self.thumb_dir.join(format!("{}.jpg", row.id));
                             if (!thumb_path.is_file() || row.thumb_key.is_none())
@@ -1330,8 +2244,7 @@ impl Indexer {
                                     image_max_side,
                                 )
                             {
-                                let _ = self.db.set_thumb(row.id, &format!("{}.jpg", row.id));
-                                self.stats.lock().thumb_done += 1;
+                                thumb_ready = true;
                             }
                             if row.tags.is_none() {
                                 // Match the old scalar path: visual tags use
@@ -1343,8 +2256,7 @@ impl Indexer {
                                     &row.kind,
                                 );
                                 if !tags.is_empty() {
-                                    let joined = tags.join(",");
-                                    let _ = self.db.update_fields(&row.path, &[("tags", joined)]);
+                                    tags_value = Some(tags.join(","));
                                 }
                             }
                         }
@@ -1363,6 +2275,9 @@ impl Indexer {
                             row: row.clone(),
                             image,
                             clip_pixels,
+                            text_skip,
+                            thumb_ready,
+                            tags: tags_value,
                         });
                     });
                 });
@@ -1370,6 +2285,7 @@ impl Indexer {
 
             let mut pipeline_errors = errors;
             let mut cancelled = false;
+            let mut deferred_metadata = Vec::with_capacity(items.len());
             loop {
                 let first = match receiver.recv() {
                     Ok(item) => item,
@@ -1399,6 +2315,13 @@ impl Indexer {
 
                 let mut valid = Vec::with_capacity(prepared.len());
                 for item in prepared {
+                    deferred_metadata.push((
+                        item.row.id,
+                        item.row.path.clone(),
+                        item.text_skip,
+                        item.thumb_ready,
+                        item.tags,
+                    ));
                     match item.image {
                         Ok(image) => valid.push((item.row, image, item.clip_pixels)),
                         Err(error) => {
@@ -1416,8 +2339,21 @@ impl Indexer {
                 self.set_current_items(&current_names, IMAGE_GPU_BATCH_LIMIT);
                 let image_refs: Vec<&image::DynamicImage> =
                     valid.iter().map(|(_, image, _)| image).collect();
-                let vectors: Vec<Result<Vec<f32>, String>> =
-                    match embedder.embed_image_data_batch(&image_refs) {
+                let model_started = std::time::Instant::now();
+                let (vectors, batch_error) =
+                    embed_image_batch_resilient(embedder.as_ref(), &image_refs, &|| self.is_cancelled());
+                let model_ms = model_started.elapsed().as_millis();
+                for (row, _, _) in &valid {
+                    let file = row.name.replace('|', "/");
+                    let _ = self.db.log(
+                        "perf",
+                        &format!("index_timing|file={file}|stage=model-image|ms={model_ms}"),
+                    );
+                }
+                if let Some(reason) = batch_error {
+                    let _ = self.db.log("error", &format!("image batch recovered: {reason}"));
+                }
+                    /* match embedder.embed_image_data_batch(&image_refs) {
                         Ok(vectors) if vectors.len() == valid.len() => {
                             vectors.into_iter().map(Ok).collect()
                         }
@@ -1439,7 +2375,7 @@ impl Indexer {
                                 .map(|(_, image, _)| embedder.embed_image_data(image))
                                 .collect()
                         }
-                    };
+                    } */
                 if self.is_cancelled() {
                     cancelled = true;
                     while receiver.recv().is_ok() {}
@@ -1547,6 +2483,21 @@ impl Indexer {
             }
             if producer.join().is_err() {
                 pipeline_errors.push("image CPU producer panicked".into());
+            }
+            // Metadata is small compared with decoded images. Keep these
+            // writes outside the hot decode/inference loop so SQLite cannot
+            // create a GPU idle gap between batches.
+            for (id, path, text_skip, thumb_ready, tags) in deferred_metadata {
+                if text_skip {
+                    let _ = self.db.set_state(id, "text", "skip");
+                }
+                if thumb_ready {
+                    let _ = self.db.set_thumb(id, &format!("{}.jpg", id));
+                    self.stats.lock().thumb_done += 1;
+                }
+                if let Some(tags) = tags {
+                    let _ = self.db.update_fields(&path, &[("tags", tags)]);
+                }
             }
             if cancelled || self.is_cancelled() {
                 Err("index cancellation requested".into())
@@ -1744,6 +2695,7 @@ impl Indexer {
                         if self.is_cancelled() {
                             return;
                         }
+                        let _extract_timing = self.timing(candidate.name.clone(), "extract");
                         let extracted = if candidate.needs_extract {
                             crate::textract::extract_text(&candidate.path, max_chars)
                                 .or_else(|| candidate.cached_text.clone())
@@ -1828,45 +2780,22 @@ impl Indexer {
                     self.set_current_items(&current_names, current_names.len());
                     let input: Vec<String> =
                         bucket.iter().map(|&index| group[index].text.clone()).collect();
-                    match self.embedder.embed_text_batch(&input) {
-                        Ok(encoded) if encoded.len() == bucket.len() => {
-                            for (index, vector) in bucket.into_iter().zip(encoded) {
-                                vectors[index] = Some(Ok(vector));
-                            }
-                        }
-                        Ok(encoded) => {
-                            // A malformed batch result is recoverable. Fall
-                            // back to one-item encoding and only report an
-                            // error when the fallback also fails.
-                            let returned = encoded.len().min(bucket.len());
-                            for (offset, vector) in encoded.into_iter().take(returned).enumerate() {
-                                vectors[bucket[offset]] = Some(Ok(vector));
-                            }
-                            for &index in bucket.iter().skip(returned) {
-                                if self.is_cancelled() {
-                                    cancelled = true;
-                                    break;
-                                }
-                                self.set_current_items(std::slice::from_ref(&group[index].name), 1);
-                                vectors[index] = Some(self.embedder.embed_text(&group[index].text, false));
-                            }
-                        }
-                        Err(batch_error) => {
-                            let mut fallback_failed = true;
-                            for index in bucket {
-                                if self.is_cancelled() {
-                                    cancelled = true;
-                                    break;
-                                }
-                                self.set_current_items(std::slice::from_ref(&group[index].name), 1);
-                                let result = self.embedder.embed_text(&group[index].text, false);
-                                fallback_failed &= result.is_err();
-                                vectors[index] = Some(result);
-                            }
-                            if fallback_failed {
-                                pipeline_errors.push(format!("batch embedding failed: {batch_error}"));
-                            }
-                        }
+                    let model_started = std::time::Instant::now();
+                    let (encoded, batch_error) =
+                        embed_text_batch_resilient(self.embedder.as_ref(), &input, &|| self.is_cancelled());
+                    let model_ms = model_started.elapsed().as_millis();
+                    for &index in &bucket {
+                        let file = group[index].name.replace('|', "/");
+                        let _ = self.db.log(
+                            "perf",
+                            &format!("index_timing|file={file}|stage=model|ms={model_ms}"),
+                        );
+                    }
+                    if let Some(reason) = batch_error {
+                        let _ = self.db.log("error", &format!("text batch recovered: {reason}"));
+                    }
+                    for (index, result) in bucket.into_iter().zip(encoded) {
+                        vectors[index] = Some(result);
                     }
                 }
                 if cancelled {
@@ -2117,11 +3046,16 @@ impl Indexer {
             .save()
             .map_err(|error| format!("CLAP 向量保存失败：{error}"))?;
 
+        // A checkpoint can contain hundreds of completed files. Keep the
+        // state acknowledgements in one SQLite transaction instead of
+        // committing once per file. If the batch update fails, restore every
+        // id so a later checkpoint can retry it.
         let ids = std::mem::take(&mut *self.pending_states.lock());
-        for id in ids {
-            self.db
-                .set_state(id, "embed", "ok")
-                .map_err(|error| format!("提交文件 {id} 的索引状态失败：{error}"))?;
+        if !ids.is_empty() {
+            if let Err(error) = self.db.set_state_batch(&ids, "embed", "ok") {
+                self.pending_states.lock().extend(ids.iter().copied());
+                return Err(format!("checkpoint state batch failed for {} files: {error}", ids.len()));
+            }
         }
         self.dirty.store(0, Ordering::Relaxed);
         Ok(())
@@ -2142,6 +3076,7 @@ impl Indexer {
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        Self::set_process_priority(false);
         let handle = self.worker.lock().take();
         if let Some(handle) = handle {
             if std::thread::current().id() != handle.thread().id() {
@@ -2199,7 +3134,152 @@ impl Indexer {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_expected_media_skip_error, text_batch_groups};
+    use super::{embed_text_batch_resilient, is_expected_media_skip_error, text_batch_groups, Indexer};
+    use crate::ai::{EmbedInfo, Embedder};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn indexer_replacement_preserves_completed_counters_and_scope() {
+        let db = Arc::new(crate::db::Db::open(Path::new(":memory:")).unwrap());
+        for (path, state) in [
+            ("C:\\docs\\done.pdf", "ok"),
+            ("C:\\docs\\failed.pdf", "fail"),
+            ("C:\\other\\pending.pdf", "pending"),
+        ] {
+            let mut row = crate::db::FileRow::new(path);
+            row.kind = "document".into();
+            let id = db.upsert_file(&row).unwrap();
+            db.set_state(id, "text", state).unwrap();
+            db.set_state(id, "embed", state).unwrap();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "deepdark-index-progress-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let vectors = Arc::new(crate::vector::VectorStore::open(&dir, 768).unwrap());
+        let new_indexer = || Indexer::new(
+            Arc::clone(&db),
+            Arc::clone(&vectors),
+            Arc::clone(&vectors),
+            Arc::clone(&vectors),
+            Arc::clone(&vectors),
+            Arc::new(crate::ai::hash::HashEmbedder::new()),
+            Arc::new(crate::ai::hash::HashEmbedder::new()),
+            crate::config::IndexConfig::default(),
+            crate::ocr::OcrConfig::default(),
+            dir.join("thumbs"),
+        );
+        let previous = new_indexer();
+        previous.set_progress_scope(Some(vec!["C:\\docs".into()]));
+        previous.restore_elapsed_millis(123_456);
+        *previous.progress_what.lock() = "embed".into();
+        {
+            let mut stats = previous.stats.lock();
+            stats.text_done = 1;
+            stats.text_fail = 1;
+            stats.emb_done = 1;
+            stats.emb_fail = 1;
+            stats.current = Some("done.pdf".into());
+            stats.current_items = vec!["done.pdf".into()];
+        }
+
+        let replacement = new_indexer();
+        replacement.inherit_progress(&previous);
+        let stats = replacement.snapshot();
+        assert_eq!((stats.text_done, stats.emb_done), (1, 1));
+        assert_eq!((stats.text_fail, stats.emb_fail), (1, 1));
+        assert_eq!((stats.total, stats.completed), (2, 2));
+        assert_eq!(stats.elapsed_seconds, 123);
+        assert_eq!(replacement.index_elapsed_millis.load(Ordering::Relaxed), 123_456);
+        assert_eq!(replacement.progress_what.lock().as_str(), "embed");
+        assert!(!stats.running);
+        assert_eq!(stats.queued, 0);
+        assert!(stats.current.is_none());
+        assert!(stats.current_items.is_empty());
+
+        // Explicitly resetting the next task still clears its counters.
+        replacement.reset_progress();
+        let reset = replacement.snapshot();
+        assert_eq!((reset.text_done, reset.emb_done, reset.text_fail, reset.emb_fail), (0, 0, 0, 0));
+        drop(replacement);
+        drop(previous);
+        drop(vectors);
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    struct FailingBatchEmbedder {
+        error: &'static str,
+        batch_calls: AtomicUsize,
+        scalar_calls: AtomicUsize,
+    }
+
+    impl Embedder for FailingBatchEmbedder {
+        fn info(&self) -> EmbedInfo {
+            EmbedInfo {
+                backend: "test".into(),
+                model: "test".into(),
+                dim: 1,
+                device: "cpu".into(),
+                modalities: vec!["text".into()],
+                ready: true,
+                detail: String::new(),
+            }
+        }
+
+        fn dim(&self) -> usize { 1 }
+
+        fn embed_text(&self, _text: &str, _query: bool) -> Result<Vec<f32>, String> {
+            self.scalar_calls.fetch_add(1, Ordering::Relaxed);
+            Err("unexpected scalar retry".into())
+        }
+
+        fn embed_text_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            Err(self.error.into())
+        }
+
+        fn embed_image(&self, _path: &Path) -> Result<Vec<f32>, String> { Err("unused".into()) }
+        fn embed_audio(&self, _path: &Path) -> Result<Vec<f32>, String> { Err("unused".into()) }
+        fn embed_video(&self, _path: &Path) -> Result<Vec<f32>, String> { Err("unused".into()) }
+    }
+
+    #[test]
+    fn cancellation_stops_recursive_batch_retries() {
+        let embedder = Arc::new(FailingBatchEmbedder {
+            error: "temporary backend failure",
+            batch_calls: AtomicUsize::new(0),
+            scalar_calls: AtomicUsize::new(0),
+        });
+        let texts = vec!["text".to_string(); 8];
+        let cancel_checks = AtomicUsize::new(0);
+        let (results, _) = embed_text_batch_resilient(embedder.as_ref(), &texts, &|| {
+            cancel_checks.fetch_add(1, Ordering::Relaxed) > 0
+        });
+
+        assert_eq!(results.len(), texts.len());
+        assert_eq!(embedder.batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(embedder.scalar_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn singleton_out_of_memory_does_not_retry_scalar_inference() {
+        let embedder = FailingBatchEmbedder {
+            error: "CUDA_ERROR_OUT_OF_MEMORY",
+            batch_calls: AtomicUsize::new(0),
+            scalar_calls: AtomicUsize::new(0),
+        };
+        let (results, _) = embed_text_batch_resilient(&embedder, &["text".into()], &|| false);
+
+        assert!(results[0].is_err());
+        assert_eq!(embedder.batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(embedder.scalar_calls.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn decoder_capability_errors_are_skips_but_model_errors_are_failures() {

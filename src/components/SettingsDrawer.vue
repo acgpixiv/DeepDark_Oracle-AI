@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
 import { Cpu, Files, MonitorCog, Package, ScrollText, SlidersHorizontal, Wifi } from "lucide-vue-next";
 import { api, type Activity, type AppConfig, type PartialConfig, type Rule, type ServerStatus, type WatchStatus } from "../api";
@@ -20,13 +20,17 @@ const TABS = [
   { key: "general", label: "通用配置", icon: SlidersHorizontal },
   { key: "index", label: "文件索引", icon: Files },
   { key: "model", label: "模型配置", icon: Cpu },
-  { key: "lan", label: "局域网配置", icon: Wifi },
-  { key: "render", label: "图形与 GPU", icon: MonitorCog },
+  { key: "gpu", label: "图形与 GPU", icon: MonitorCog },
   { key: "extensions", label: "可选扩展", icon: Package },
+  { key: "lan", label: "局域网配置", icon: Wifi },
   { key: "log", label: "日志", icon: ScrollText },
 ] as const;
 
-const activeTab = computed(() => TABS.some((item) => item.key === props.tab) ? props.tab : "general");
+const VISIBLE_TAB_KEYS = new Set(TABS.map((item) => item.key));
+const activeTab = computed(() => {
+  if (props.tab === "render") return "gpu";
+  return VISIBLE_TAB_KEYS.has(props.tab) ? props.tab : "general";
+});
 const cfg = ref<AppConfig | null>(null);
 const rules = ref<Rule[]>([]);
 const logs = ref<Activity[]>([]);
@@ -99,6 +103,7 @@ async function saveFileConfig(): Promise<boolean> {
       follow_links: cfg.value.scan.follow_links,
     },
     index: {
+      vector_dim: cfg.value.index.vector_dim,
       max_text_chars: cfg.value.index.max_text_chars,
       image_max_side: cfg.value.index.image_max_side,
       image_token_budget: cfg.value.index.image_token_budget,
@@ -129,11 +134,9 @@ async function saveFileConfig(): Promise<boolean> {
   });
 }
 
-/** 通用配置：界面、启动行为和「工作区」目录。 */
+/** 通用配置：界面和启动行为。 */
 async function saveGeneralConfig(): Promise<boolean> {
   if (!cfg.value) return false;
-  const startupScope = String(cfg.value.workspace?.startup_scope ?? "remember");
-  const startupPath = String(cfg.value.workspace?.startup_path ?? "");
   const ok = await savePatch({
     ui: {
       language: cfg.value.ui.language,
@@ -150,29 +153,7 @@ async function saveGeneralConfig(): Promise<boolean> {
       parallel_mode: cfg.value.model.parallel_mode,
       parallel_threads: cfg.value.model.parallel_threads,
     },
-    workspace: {
-      dirs: (cfg.value.workspace?.dirs as string[]) ?? [],
-      enabled: cfg.value.workspace?.enabled ?? true,
-      live_extract: cfg.value.workspace?.live_extract ?? true,
-      max_file_mb: cfg.value.workspace?.max_file_mb ?? 64,
-      depth: cfg.value.workspace?.depth ?? 4,
-      recent_paths: (cfg.value.workspace?.recent_paths as string[]) ?? [],
-      pinned_paths: (cfg.value.workspace?.pinned_paths as string[]) ?? [],
-      startup_scope: cfg.value.workspace?.startup_scope ?? "remember",
-      startup_path: cfg.value.workspace?.startup_path ?? "",
-      last_scope: cfg.value.workspace?.last_scope ?? "indexed",
-      last_path: cfg.value.workspace?.last_path ?? "",
-    },
   }, "通用设置已保存");
-  if (ok) {
-    try {
-      const workspace = await api.workspaceSetStartup(startupScope, startupPath || undefined);
-      if (cfg.value) cfg.value.workspace = { ...cfg.value.workspace, ...workspace };
-    } catch {
-      toast(t("保存启动搜索范围失败"), "error");
-      return false;
-    }
-  }
   // 注意：必须传入 ui，否则 applyAppearance 会用默认值（system / zh）把刚保存的语言和主题覆盖掉。
   if (ok) await applyAppearance(cfg.value?.ui);
   return ok;
@@ -347,6 +328,8 @@ onMounted(load);
           :key="item.key"
           class="settings-nav-item"
           :class="{ active: activeTab === item.key }"
+          :title="t(item.label)"
+          :aria-label="t(item.label)"
           @click="emit('tab', item.key)"
         >
           <component :is="item.icon" :size="17" aria-hidden="true" />
@@ -359,17 +342,17 @@ onMounted(load);
       <header class="settings-main-head">
         <div>
           <h1>{{ t(TABS.find((item) => item.key === activeTab)?.label ?? "设置") }}</h1>
-          <p v-if="activeTab === 'general'">{{ t("界面语言与主题、启动行为，以及无需建索引的工作区目录。") }}</p>
-          <p v-else-if="activeTab === 'index'">{{ t("扫描目录、建立全文与向量索引、管理分类规则。") }}</p>
-          <p v-else-if="activeTab === 'model'">{{ t("管理嵌入模型、跨模态模型和 GPU 推理参数。") }}</p>
-          <p v-else-if="activeTab === 'lan'">{{ t("配置局域网访问和文件变化监控。") }}</p>
-          <p v-else-if="activeTab === 'render'">{{ t("图形渲染后端、画质档位与 GPU 兼容性诊断。") }}</p>
-          <p v-else-if="activeTab === 'log'">{{ t("查看应用、扫描、索引和模型活动。") }}</p>
-          <p v-else>{{ t("按需安装 ONNX Runtime 和 Python sidecar，扩展文件保存在项目目录。") }}</p>
+          <p v-if="activeTab === 'general'">{{ t("界面语言与主题、启动行为") }}</p>
+          <p v-else-if="activeTab === 'index'">{{ t("扫描目录、建立全文与向量索引、管理分类规则") }}</p>
+          <p v-else-if="activeTab === 'model'">{{ t("管理嵌入模型、跨模态模型和 OCR 模型") }}</p>
+          <p v-else-if="activeTab === 'gpu'">{{ t("图形渲染后端与推理硬件") }}</p>
+          <p v-else-if="activeTab === 'extensions'">{{ t("按需安装可选运行时") }}</p>
+          <p v-else-if="activeTab === 'lan'">{{ t("配置局域网访问和文件变化监控") }}</p>
+          <p v-else-if="activeTab === 'log'">{{ t("查看应用、扫描、索引和模型活动") }}</p>
         </div>
       </header>
 
-      <div v-if="loading" class="settings-loading">{{ t("正在读取设置…") }}</div>
+      <div v-if="loading" class="settings-loading">{{ t("Loading settings...") }}</div>
       <div v-else-if="cfg" class="settings-scroll">
         <SettingsGeneralTab
           v-if="activeTab === 'general'"
@@ -415,7 +398,7 @@ onMounted(load);
           :refresh-logs="refreshLogs"
           @update-log-kind="logKind = $event"
         />
-        <SettingsGpuTab v-if="activeTab === 'render'" />
+        <SettingsGpuTab v-if="activeTab === 'gpu'" :cfg="cfg" :save-model-config="saveModelConfig" />
         <SettingsExtensionTab v-if="activeTab === 'extensions'" />
       </div>
     </section>
@@ -436,13 +419,13 @@ onMounted(load);
 
 <style scoped>
 .settings-page { height: 100%; display: flex; min-height: 0; background: var(--bg); }
-.settings-sidebar { width: 218px; flex: none; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: #151a17; }
-.settings-sidebar-head { display: flex; align-items: center; gap: 9px; min-height: 68px; padding: 12px 15px; border-bottom: 1px solid var(--border); }
+.settings-sidebar { width: 218px; flex: none; display: flex; min-height: 0; flex-direction: column; overflow: hidden; border-right: 1px solid var(--border); background: #151a17; }
+.settings-sidebar-head { display: flex; flex: 0 0 68px; align-items: center; gap: 9px; min-height: 68px; padding: 12px 15px; border-bottom: 1px solid var(--border); }
 .back-button { width: 30px; height: 30px; }
 .settings-title { font-size: 15px; font-weight: 650; }
 .settings-subtitle { color: #849087; font: 10px Consolas, monospace; margin-top: 2px; }
-.settings-nav { display: flex; flex-direction: column; gap: 3px; padding: 14px 10px; }
-.settings-nav-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #909b93; text-align: left; font-size: 12px; }
+.settings-nav { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 3px; padding: 14px 10px 18px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: auto; scrollbar-color: #59635c transparent; }
+.settings-nav-item { display: flex; flex: 0 0 38px; align-items: center; gap: 10px; width: 100%; min-height: 38px; padding: 0 12px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #909b93; text-align: left; font-size: 12px; }
 .settings-nav-item:hover { color: var(--text); background: #202723; border-color: #2e3a32; }
 .settings-nav-item.active { color: #d8e8dc; background: #294033; border-color: #45624e; }
 .settings-sidebar-foot { display: none; margin-top: auto; padding: 14px; line-height: 1.5; }
@@ -625,11 +608,10 @@ onMounted(load);
   .settings-scroll :deep(.rule-form input), .settings-scroll :deep(.rule-form button) { grid-column: span 2; }
 }
 @media (max-width: 600px) {
-  .settings-sidebar { width: 54px; }
-  .settings-sidebar-head { justify-content: center; padding-inline: 8px; }
-  .settings-title, .settings-subtitle, .settings-nav-item span, .settings-sidebar-foot { display: none; }
-  .settings-nav { padding-inline: 7px; }
-  .settings-nav-item { justify-content: center; padding-inline: 0; }
+  .settings-sidebar { width: 184px; }
+  .settings-sidebar-head { padding-inline: 12px; }
+  .settings-nav { padding-inline: 8px; }
+  .settings-nav-item { padding-inline: 10px; }
   .settings-scroll :deep(.form-grid.three) { grid-template-columns: 1fr; }
   .settings-scroll :deep(.data-section) { align-items: flex-start; flex-direction: column; }
   .settings-scroll :deep(.embedded-view) { height: auto; }

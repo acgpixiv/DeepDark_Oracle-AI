@@ -1,0 +1,217 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ResolveNugetPackages>false</ResolveNugetPackages>
+  </PropertyGroup>
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="MinSizeRel|x64">
+      <Configuration>MinSizeRel</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="RelWithDebInfo|x64">
+      <Configuration>RelWithDebInfo</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{0505CCDB-8780-34B2-9F9D-5482BF631998}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <Platform>x64</Platform>
+    <ProjectName>ALL_BUILD</ProjectName>
+    <VCProjectUpgraderObjectName>NoUpgrade</VCProjectUpgraderObjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'" Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 13.1.props" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <_ProjectFileVersion>10.0.20506.1</_ProjectFileVersion>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Midl>
+      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Midl>
+      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">
+    <Midl>
+      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">
+    <Midl>
+      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <CustomBuild Include="E:\项目\AI--deepaisee\vendor\llama.cpp\CMakeLists.txt">
+      <UseUtf8Encoding>Always</UseUtf8Encoding>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Building Custom Rule E:/项目/AI--deepaisee/vendor/llama.cpp/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SE:/项目/AI--deepaisee/src-tauri/native -BE:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build --check-stamp-file E:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build/llama.cpp/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">C:\Program Files\CMake\share\cmake-4.4\Modules\BasicConfigVersion-SameMajorVersion.cmake.in;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakePackageConfigHelpers.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CheckIncludeFileCXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindGit.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageMessage.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\GNUInstallDirs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CheckCommon.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\WriteBasicConfigVersionFile.cmake;E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cmake.verify_globs;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\build-info.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\common.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\license.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\llama-config.cmake.in;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\llama.pc.in;E:\项目\AI--deepaisee\vendor\llama.cpp\ggml\cmake\common.cmake;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Building Custom Rule E:/项目/AI--deepaisee/vendor/llama.cpp/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SE:/项目/AI--deepaisee/src-tauri/native -BE:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build --check-stamp-file E:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build/llama.cpp/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">C:\Program Files\CMake\share\cmake-4.4\Modules\BasicConfigVersion-SameMajorVersion.cmake.in;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakePackageConfigHelpers.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CheckIncludeFileCXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindGit.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageMessage.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\GNUInstallDirs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CheckCommon.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\WriteBasicConfigVersionFile.cmake;E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cmake.verify_globs;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\build-info.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\common.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\license.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\llama-config.cmake.in;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\llama.pc.in;E:\项目\AI--deepaisee\vendor\llama.cpp\ggml\cmake\common.cmake;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">Building Custom Rule E:/项目/AI--deepaisee/vendor/llama.cpp/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SE:/项目/AI--deepaisee/src-tauri/native -BE:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build --check-stamp-file E:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build/llama.cpp/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">C:\Program Files\CMake\share\cmake-4.4\Modules\BasicConfigVersion-SameMajorVersion.cmake.in;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakePackageConfigHelpers.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CheckIncludeFileCXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindGit.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageMessage.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\GNUInstallDirs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CheckCommon.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\WriteBasicConfigVersionFile.cmake;E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cmake.verify_globs;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\build-info.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\common.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\license.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\llama-config.cmake.in;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\llama.pc.in;E:\项目\AI--deepaisee\vendor\llama.cpp\ggml\cmake\common.cmake;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">Building Custom Rule E:/项目/AI--deepaisee/vendor/llama.cpp/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SE:/项目/AI--deepaisee/src-tauri/native -BE:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build --check-stamp-file E:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build/llama.cpp/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">C:\Program Files\CMake\share\cmake-4.4\Modules\BasicConfigVersion-SameMajorVersion.cmake.in;C:\Program Files\CMake\share\cmake-4.4\Modules\CMakePackageConfigHelpers.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\CheckIncludeFileCXX.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindGit.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageHandleStandardArgs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\FindPackageMessage.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\GNUInstallDirs.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\Internal\CheckCommon.cmake;C:\Program Files\CMake\share\cmake-4.4\Modules\WriteBasicConfigVersionFile.cmake;E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cmake.verify_globs;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\build-info.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\common.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\license.cmake;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\llama-config.cmake.in;E:\项目\AI--deepaisee\vendor\llama.cpp\cmake\llama.pc.in;E:\项目\AI--deepaisee\vendor\llama.cpp\ggml\cmake\common.cmake;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">false</LinkObjects>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+  </ItemGroup>
+  <ItemGroup />
+  <ItemGroup>
+    <ProjectReference Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\ZERO_CHECK.vcxproj">
+      <Project>{305D4940-20EA-3402-B283-25E46661414C}</Project>
+      <Name>ZERO_CHECK</Name>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </ProjectReference>
+    <ProjectReference Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml.vcxproj">
+      <Project>{5112D9F3-54E5-38F1-9AD2-654C16437C7C}</Project>
+      <Name>ggml</Name>
+    </ProjectReference>
+    <ProjectReference Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-base.vcxproj">
+      <Project>{F25A683E-7346-3835-81A2-DD8DC837C96A}</Project>
+      <Name>ggml-base</Name>
+    </ProjectReference>
+    <ProjectReference Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-cpu.vcxproj">
+      <Project>{117630F8-8676-3043-8CCE-4DBD2875A383}</Project>
+      <Name>ggml-cpu</Name>
+    </ProjectReference>
+    <ProjectReference Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-cuda\ggml-cuda.vcxproj">
+      <Project>{51A3852F-5CD5-35A0-9FCD-DFE2D6F7B574}</Project>
+      <Name>ggml-cuda</Name>
+    </ProjectReference>
+    <ProjectReference Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\ggml-vulkan.vcxproj">
+      <Project>{15FF8652-0A52-30A5-9872-05F9BCA80F10}</Project>
+      <Name>ggml-vulkan</Name>
+    </ProjectReference>
+    <ProjectReference Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\src\llama.vcxproj">
+      <Project>{262F2F2D-7FC7-3D4A-8E7D-827838B7B023}</Project>
+      <Name>llama</Name>
+    </ProjectReference>
+    <ProjectReference Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\tools\mtmd\mtmd.vcxproj">
+      <Project>{7FF429FE-3C4E-3F59-B98A-ADC0D38ED8A9}</Project>
+      <Name>mtmd</Name>
+    </ProjectReference>
+    <ProjectReference Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\vulkan-shaders-gen.vcxproj">
+      <Project>{2B0E1F21-3C21-391B-B6F6-0DD989A81843}</Project>
+      <Name>vulkan-shaders-gen</Name>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 13.1.targets" />
+  </ImportGroup>
+</Project>

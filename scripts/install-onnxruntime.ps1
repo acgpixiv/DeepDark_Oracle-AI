@@ -1,11 +1,18 @@
-﻿param([switch]$Update)
+param(
+  [switch]$Update,
+  [string]$InstallRoot = ""
+)
 
 $ErrorActionPreference = "Stop"
 
 # Keep the native runtime under the repository. Nothing is removed by this
 # script; an existing runtime is left in place and a downloaded archive is
 # only expanded into a new project-local directory.
-$repo = Split-Path -Parent $PSScriptRoot
+$repo = if ($InstallRoot) {
+  (Resolve-Path -LiteralPath $InstallRoot).Path
+} else {
+  Split-Path -Parent $PSScriptRoot
+}
 $version = if ($env:DEEPAISEE_ORT_VERSION) { $env:DEEPAISEE_ORT_VERSION } else { "1.20.1" }
 $destination = Join-Path $repo ".tools\onnxruntime"
 $native = Join-Path $destination "onnxruntime.dll"

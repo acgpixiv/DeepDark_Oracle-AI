@@ -1,18 +1,19 @@
-<script setup lang="ts">
-// 模型管理：列出本地 GGUF、切换嵌入模型、导入 / 删除、切回哈希基线
-import { computed, onMounted, ref } from "vue";
+﻿<script setup lang="ts">
+// 模型管理：列出本地 GGUF 与 safetensors，切换推理/OCR 模型并支持导入、删除。
+import { computed, onMounted, ref, watch } from "vue";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { AudioLines, FileText, Film, FolderOpen, Image as ImageIcon, Power, Save, SlidersHorizontal } from "lucide-vue-next";
-import { api, type AppConfig, type GpuDevice, type ModelEntry, type ModelInfo, type ModelImportResult } from "../api";
+import { AudioLines, FileText, Film, FolderOpen, Image as ImageIcon, Save, SlidersHorizontal, ScanText } from "lucide-vue-next";
+import { api, type AppConfig, type ModelEntry, type ModelInfo, type ModelImportResult, type OcrStatus } from "../api";
 import { refreshStats, store, toast, humanSize } from "../store";
 import { t } from "../i18n";
+import { hasModelListCache, modelEntries, refreshModelList } from "../modelListCache";
 
 const props = defineProps<{
   cfg?: AppConfig;
   saveModelConfig?: () => Promise<boolean | void>;
 }>();
 
-const list = ref<ModelEntry[]>([]);
+const list = modelEntries;
 const info = ref<ModelInfo | null>(null);
 const dir = ref("");
 const importedDir = ref("");
@@ -20,8 +21,21 @@ const loading = ref(false);
 const busy = ref("");
 const filter = ref("all");
 const selected = ref<ModelEntry | null>(null);
-const gpuDevices = ref<GpuDevice[]>([]);
-const gpuLoadError = ref("");
+const ocrModelPath = ref("");
+const ocrStatus = ref<OcrStatus | null>(null);
+const roleModel = ref<ModelEntry | null>(null);
+const roleDialogOpen = ref(false);
+
+// Keep the expensive OCR runtime probe outside the view instance. Settings
+// tabs are mounted/unmounted as the user navigates, so without this small
+// cache every visit would synchronously start Python/Tesseract discovery.
+let cachedOcrStatus: OcrStatus | null = null;
+let cachedOcrStatusAt = 0;
+
+watch(list, (entries) => {
+  if (!selected.value) return;
+  selected.value = entries.find((model) => model.path === selected.value?.path) || null;
+});
 
 const PARALLEL_MODES = [
   { key: "eco", label: "节能", className: "eco" },
@@ -33,7 +47,6 @@ const FILTERS = [
   { v: "all", label: "全部" },
   { v: "embed", label: "嵌入" },
   { v: "chat", label: "对话" },
-  { v: "projector", label: "投影" },
 ];
 const visibleParallelModes = computed(() => PARALLEL_MODES.filter(
   (mode) => mode.key !== "custom" || !!props.cfg?.ui?.professional_mode,
@@ -46,7 +59,9 @@ const currentParallelMode = computed(() => {
 // A GGUF mmproj is a companion file, not an embedding model. When it is
 // selected, use the sibling embedding entry for capability display.
 const selectedEmbedding = computed(() => {
-  const candidate = selected.value || list.value.find((model) => model.active && model.kind === "embed");
+  const candidate = selected.value?.kind === "embed" || selected.value?.kind === "projector"
+    ? selected.value
+    : list.value.find((model) => model.active && model.kind === "embed");
   if (!candidate) return null;
   const modelDir = candidate.model_dir.toLowerCase();
   if (candidate.kind !== "projector") return candidate;
@@ -77,20 +92,44 @@ const hasProjectorCompanion = computed(() => {
   return !!dir && list.value.some((model) => model.kind === "projector" && model.model_dir.toLowerCase() === dir);
 });
 
-async function load() {
-  loading.value = true;
+async function load(forceModels = false) {
+  const hadCachedList = hasModelListCache();
+  loading.value = forceModels || !hadCachedList;
   try {
-    const [l, m, d] = await Promise.all([api.modelList(), api.modelInfo(), api.modelDir()]);
-    list.value = l;
+    const models = refreshModelList(forceModels);
+    if (forceModels || !hadCachedList) await models;
+    else void models.catch(() => {
+      // A silent background refresh failure must not hide the cached inventory.
+    });
+    const refreshOcrStatus = () => api.teleocrStatus().then((status) => {
+      cachedOcrStatus = status;
+      cachedOcrStatusAt = Date.now();
+      ocrStatus.value = status;
+      ocrModelPath.value = status.model_dir || ocrModelPath.value;
+      return status;
+    });
+    let ocrRequest: Promise<OcrStatus>;
+    if (forceModels || !cachedOcrStatus) {
+      ocrRequest = refreshOcrStatus();
+    } else {
+      // Paint the cached capability card immediately. A stale cache is
+      // refreshed in the background so newly installed OCR runtimes/models
+      // appear without making the settings page wait on Python discovery.
+      ocrRequest = Promise.resolve(cachedOcrStatus);
+      if (Date.now() - cachedOcrStatusAt > 20_000) void refreshOcrStatus().catch(() => {});
+    }
+    const [m, d, ocr] = await Promise.all([api.modelInfo(), api.modelDir(), ocrRequest]);
     // Keep the selected card's active flag in sync after activation/deactivation.
     // Otherwise the old object can keep reporting text as available after the
     // user has switched back to the hash fallback.
     if (selected.value) {
-      selected.value = l.find((model) => model.path === selected.value?.path) || null;
+      selected.value = list.value.find((model) => model.path === selected.value?.path) || null;
     }
     info.value = m;
     store.model = m;
     dir.value = d;
+    ocrStatus.value = ocr;
+    ocrModelPath.value = ocr.model_dir || "";
   } catch (e) {
     toast(`${t("读取模型列表失败：")}${e}`, "error");
   } finally {
@@ -98,52 +137,48 @@ async function load() {
   }
 }
 
-async function loadGpus() {
-  try {
-    gpuDevices.value = (await api.gpuDevices()).sort((a, b) => b.total_memory - a.total_memory);
-  } catch (error) {
-    gpuLoadError.value = String(error);
-  }
-}
-
 const shown = computed(() =>
-  filter.value === "all" ? list.value : list.value.filter((m) => m.kind === filter.value)
+  (filter.value === "all" ? list.value : list.value.filter((m) => m.kind === filter.value))
+    .filter((m) => m.kind !== "projector")
 );
 
-const totalSize = computed(() => list.value.reduce((s, m) => s + m.size, 0));
+const totalSize = computed(() => shown.value.reduce((s, m) => s + m.size, 0));
+
+function isOcrModel(model: ModelEntry): boolean {
+  return !!ocrModelPath.value && model.model_dir.toLowerCase() === ocrModelPath.value.toLowerCase();
+}
+
+function hasActiveRole(model: ModelEntry): boolean {
+  return model.active || isOcrModel(model);
+}
+
+function hasMultimodalCompanion(model: ModelEntry): boolean {
+  if (model.modalities.some((modality) => ["image", "audio", "video"].includes(modality))) return true;
+  const modelStem = model.file.toLowerCase().replace(/\.(gguf|safetensors)$/i, "");
+  return list.value.some((item) => {
+    if (item.kind !== "projector") return false;
+    if (item.model_dir.toLowerCase() === model.model_dir.toLowerCase()) return true;
+    const projectorStem = item.file.toLowerCase().replace(/\.(gguf|safetensors)$/i, "").replace(/^mmproj[-_]?/, "");
+    return modelStem === projectorStem || modelStem.includes(projectorStem) || projectorStem.includes(modelStem);
+  });
+}
 
 // The backend is selected from the model contents by Rust. The UI only
 // exposes whether a complete, supported model package is available.
 function canActivate(model: ModelEntry): boolean {
-  return model.kind !== "projector" && model.files_complete && model.direct_loadable;
+  return model.kind === "embed" && model.files_complete && model.direct_loadable;
 }
 
-const gpuOptions = computed(() => {
-  const seen = new Set<string>();
-  return gpuDevices.value.filter((device) => {
-    const key = `${device.name.trim().toLocaleLowerCase()}|${device.total_memory}|${device.integrated}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-});
-
-function activationLabel(model: ModelEntry): string {
-  if (busy.value === model.path) return t("加载中…");
-  if (model.active) return t("当前使用");
-  if (model.kind === "projector") return t("配套文件");
-  if (canActivate(model)) return t("设为当前模型");
-  if (!model.files_complete) return t("缺少完整文件");
-  return model.candidate_backends.includes("candle")
-    ? t("需要 Candle CUDA 后端")
-    : model.candidate_backends.includes("python")
-      ? t("需要 Python 推理后端")
-      : t("当前构建不支持此模型架构");
+function canUseOcr(model: ModelEntry): boolean {
+  // OCR is a vision-to-text pipeline. A plain safetensors embedding
+  // checkpoint is not interchangeable with it, even when its weights are
+  // complete. The backend repeats this validation when the worker starts.
+  return model.format === "safetensors" && model.ocr_compatible;
 }
 
-/** 把某个 GGUF 设为当前嵌入模型 */
+/** 把模型设为当前嵌入推理模型。 */
 async function activate(m: ModelEntry) {
-  if (m.kind === "projector") return toast(t("这是模型配套投影文件，不能单独作为嵌入模型加载"), "warn");
+  if (m.kind !== "embed") return toast(t("此模型不能作为嵌入推理模型加载"), "warn");
   if (!canActivate(m)) {
     const reason = !m.files_complete
       ? t("此模型缺少可识别的完整配套文件，暂时不能加载")
@@ -159,9 +194,9 @@ async function activate(m: ModelEntry) {
     const out = await api.modelLoad("auto", m.path);
     info.value = out;
     store.model = out;
-    if (out.ready) toast(`${t("已切换到")} ${m.file}（${out.dim} ${t("维")}）`, "ok");
+    if (out.ready) toast(`${t("已切换到")} ${m.file} · ${out.dim} ${t("维")}`, "ok");
     else toast(out.detail || t("模型加载失败"), "warn");
-    await load();
+    await load(true);
     await refreshStats();
   } catch (e) {
     toast(`${t("切换失败：")}${e}`, "error");
@@ -170,23 +205,45 @@ async function activate(m: ModelEntry) {
   }
 }
 
-/** 切回哈希基线：不需要任何模型文件，秒启动 */
-async function useHash() {
-  busy.value = "hash";
+async function deactivateModel(m: ModelEntry) {
+  busy.value = m.path;
+  try { info.value = await api.modelDeactivate(); store.model = info.value; await load(true); toast("模型已停用", "ok"); }
+  catch (e) { toast(`停用模型失败：${e}`, "error"); }
+  finally { busy.value = ""; }
+}
+
+async function deactivateOcrModel(m: ModelEntry) {
+  busy.value = m.path;
   try {
-    const out = await api.modelDeactivate();
-    info.value = out;
-    store.model = out;
-    toast(t("已停用当前模型，改用基础检索"), "ok");
-    await load();
-    await refreshStats();
-  } catch (e) {
-    toast(`${t("切换失败：")}${e}`, "error");
-  } finally {
-    busy.value = "";
-  }
+    await api.ocrModelDeactivate();
+    ocrModelPath.value = "";
+    toast("OCR 模型已停用", "ok");
+    await load(true);
+  } catch (e) { toast(`停用 OCR 模型失败：${e}`, "error"); }
+  finally { busy.value = ""; }
 }
 
+function chooseRole(m: ModelEntry) {
+  roleModel.value = m;
+  roleDialogOpen.value = true;
+}
+
+async function setRole(role: "embed" | "ocr") {
+  const m = roleModel.value;
+  roleDialogOpen.value = false;
+  if (!m) return;
+  if (role === "embed") return activate(m);
+  if (!canUseOcr(m)) {
+    toast(t("此 safetensors 模型未检测到 OCR/视觉编码器配置"), "warn");
+    return;
+  }
+  try {
+    await api.saveConfig({ model: { teleocr_model_dir: m.model_dir } });
+    ocrModelPath.value = m.model_dir;
+    toast("已设置为 OCR 模型", "ok");
+    await load(true);
+  } catch (e) { toast(`OCR 模型设置失败：${e}`, "error"); }
+}
 async function importFile() {
   try {
     const picked = await openDialog({
@@ -203,15 +260,17 @@ async function importFile() {
       : !result.files_complete
         ? t("已识别，但缺少可用的完整模型文件")
         : result.candidate_backends?.includes("candle")
-          ? t("已识别，开发构建需要 Candle CUDA 后端")
+          ? t("已识别，当前构建需要 Candle CUDA 后端")
           : result.candidate_backends?.includes("python")
             ? t("已识别，但需要 Python 推理后端")
             : t("已识别，但当前构建不支持此模型架构");
-    const components = result.components.length ? `（${result.components.join(" + ")}）` : "";
-    const architecture = result.architecture ? `${t("架构：")}${result.architecture}${components}` : `${t("分类：")}${result.primary_kind}`;
-    toast(`${t("已导入")} ${result.copied_files} ${t("个配套文件")}（${humanSize(result.total_bytes)}），${architecture}；${loadState}`, result.direct_loadable ? "ok" : "warn");
+    const components = result.components.length ? ` · ${result.components.join(" + ")}` : "";
+    const architecture = result.architecture
+      ? `架构：${result.architecture}${components}`
+      : `分类：${result.primary_kind}`;
+    toast(`${t("已导入")} ${result.copied_files} ${t("个配套文件")} · ${humanSize(result.total_bytes)} · ${architecture} · ${loadState}`, result.direct_loadable ? "ok" : "warn");
     for (const warning of result.warnings) toast(warning, "warn");
-    await load();
+    await load(true);
   } catch (e) {
     toast(`${t("导入失败：")}${e}`, "error");
   } finally {
@@ -220,13 +279,13 @@ async function importFile() {
 }
 
 async function remove(m: ModelEntry) {
-  if (m.active) return toast(t("正在使用的模型不能删除，先切换到其它模型"), "warn");
+  if (m.active) return toast(t("正在使用的模型不能删除，请先切换到其他模型"), "warn");
   if (!confirm(`${t("确定删除模型文件？")}\n\n${m.file}\n${m.size_label}\n\n${t("删除后不可恢复。")}`)) return;
   busy.value = m.path;
   try {
     await api.modelDelete(m.path);
     toast(`${t("已删除")} ${m.file}`, "ok");
-    await load();
+    await load(true);
   } catch (e) {
     toast(`${t("删除失败：")}${e}`, "error");
   } finally {
@@ -261,12 +320,6 @@ async function saveParams() {
   }
   const ok = await props.saveModelConfig();
   if (ok) toast(t("推理参数已保存；重新加载模型后生效"), "ok");
-}
-
-function formatMemory(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return t("显存未知");
-  const gib = bytes / 1024 ** 3;
-  return `${gib.toFixed(gib >= 10 ? 0 : 1)} GiB`;
 }
 
 async function setParallelMode(mode: string) {
@@ -326,13 +379,14 @@ const modalityCards = computed(() => {
     ? "已检测同目录 mmproj；加载模型后可用"
     : declared(key) && !isUsable(key)
       ? "模型已声明此能力，加载后可用"
-      : activeSupports(key) ? "共用 768 维向量空间" : "未配置可用编码器";
+      : activeSupports(key) ? "共享 768 维向量空间" : "未配置可用编码器";
   return [
     {
       key: "text",
       label: "文本",
       icon: FileText,
       ok: activeSupports("text") || selectedReady,
+      error: false,
       status: activeSupports("text") || selectedReady ? "可用" : (selected.value?.format === "safetensors" && declared("text") ? "声明" : "未配置"),
       detail: declared("text") && !selectedReady
         ? "模型声明 · 需加载"
@@ -343,6 +397,7 @@ const modalityCards = computed(() => {
       label: "图片",
       icon: ImageIcon,
       ok: isUsable("image"),
+      error: false,
       status: statusFor("image"),
       detail: detailFor("image"),
     },
@@ -351,6 +406,7 @@ const modalityCards = computed(() => {
       label: "音频",
       icon: AudioLines,
       ok: isUsable("audio"),
+      error: false,
       status: statusFor("audio"),
       detail: detailFor("audio"),
     },
@@ -359,36 +415,39 @@ const modalityCards = computed(() => {
       label: "视频",
       icon: Film,
       ok: isUsable("video"),
+      error: false,
       status: statusFor("video"),
       detail: detailFor("video"),
+    },
+    {
+      key: "ocr",
+      label: "OCR",
+      icon: ScanText,
+      ok: Boolean(
+        (ocrStatus.value?.teleocr_available && ocrStatus.value?.model_configured)
+        || (!ocrModelPath.value && ocrStatus.value?.tesseract_available),
+      ),
+      error: Boolean(
+        ocrModelPath.value
+        && !(ocrStatus.value?.teleocr_available && ocrStatus.value?.model_configured),
+      ),
+      status: ocrModelPath.value
+        ? (ocrStatus.value?.teleocr_available && ocrStatus.value?.model_configured ? "可用" : "缺少依赖")
+        : (ocrStatus.value?.tesseract_available ? "Tesseract OCR" : "未配置"),
+      detail: ocrModelPath.value && ocrStatus.value?.missing_dependencies?.length
+        ? `缺少：${ocrStatus.value.missing_dependencies.join("、")}`
+        : ocrStatus.value?.model_candidates?.length && !ocrModelPath.value
+          ? `检测到 ${ocrStatus.value.model_candidates.length} 个 OCR 模型，可在下方设为 OCR 模型`
+          : ocrStatus.value?.detail || (ocrStatus.value?.tesseract_available ? "未选择模型，使用系统 OCR" : "未找到 Tesseract OCR"),
     },
   ];
 });
 
-onMounted(() => { void Promise.all([load(), loadGpus()]); });
+onMounted(() => { void load(); });
 </script>
 
 <template>
   <div class="view">
-    <!-- 第一行：GPU 选择 -->
-    <div class="gpu-row card">
-      <div>
-        <div class="sec">{{ t("选择GPU硬件") }}</div>
-        <div class="muted tiny">{{ t("所选硬件将优先调用，并行策略可能还会调用其他GPU硬件") }}</div>
-      </div>
-      <div class="gpu-controls">
-        <select v-if="props.cfg" v-model="props.cfg.model.gpu_device" :aria-label="t('选择GPU硬件')">
-          <option value="auto">{{ t("自动选择（按显存）") }}</option>
-          <option v-for="device in gpuOptions" :key="device.id" :value="device.id">
-            {{ device.name }} · {{ formatMemory(device.total_memory) }}{{ device.integrated ? t(" · 核显") : "" }}
-          </option>
-        </select>
-        <span v-if="gpuLoadError" class="tiny warn-text">{{ t("GPU 列表加载失败：") }}{{ gpuLoadError }}</span>
-        <span v-else-if="!gpuOptions.length" class="tiny muted">{{ t("未检测到可用GPU硬件") }}</span>
-        <button v-if="props.saveModelConfig" class="ghost icon-action" :title="t('保存 GPU 设置')" @click="saveParams"><Save :size="15" /></button>
-      </div>
-    </div>
-
     <div class="parallel-row card">
       <div>
         <div class="sec">{{ t("单模型批处理") }}</div>
@@ -409,16 +468,16 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
       </label>
     </div>
 
-    <!-- 第二行：四种模态状态 -->
+    <!-- Modal capability status -->
     <div class="modality-grid">
-      <div v-for="card in modalityCards" :key="card.key" class="modality-card card" :class="{ supported: card.ok }">
+      <div v-for="card in modalityCards" :key="card.key" class="modality-card card" :class="{ supported: card.ok, error: card.error }">
         <component :is="card.icon" :size="18" aria-hidden="true" />
         <div class="modality-copy"><strong>{{ t(card.label) }}</strong><span>{{ t(card.detail) }}</span></div>
         <span class="modality-state">{{ t(card.status) }}</span>
       </div>
     </div>
 
-    <!-- 第三行：模型列表工具条 -->
+    <!-- Model list toolbar -->
     <div class="bar">
       <div class="chips">
         <button
@@ -439,10 +498,7 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
         {{ list.length }} {{ t("个模型") }} · {{ t("共") }} {{ humanSize(totalSize) }} · {{ dir }}
       </span>
       <button v-if="importedDir" class="ghost" @click="openImportedDir">{{ t("打开导入目录") }}</button>
-      <button v-if="info?.ready" class="ghost danger" :disabled="!!busy" :title="t('停用当前模型')" @click="useHash">
-        <Power :size="14" />{{ t("停用模型") }}
-      </button>
-      <button class="ghost" :disabled="loading" @click="load">{{ t("刷新") }}</button>
+      <button class="ghost" :disabled="loading" @click="load(true)">{{ t("刷新") }}</button>
       <button class="primary" :disabled="!!busy" @click="importFile">{{ t("导入模型") }}</button>
     </div>
 
@@ -458,30 +514,38 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
             <span class="nm" :title="m.name">{{ m.name }}</span>
             <span class="kind" :class="m.kind">{{ m.kind_label }}</span>
             <span class="kind format">{{ m.format.toUpperCase() }}</span>
+            <span v-if="hasMultimodalCompanion(m)" class="kind multimodal">{{ t("多模态") }}</span>
           </div>
           <div class="file mono" :title="m.path">{{ m.file }} · {{ m.size_label }}</div>
           <div class="meta muted tiny">{{ m.mtime_label }} · {{ m.path }}</div>
         </div>
         <div class="ops">
-          <button
-            @click.stop
-            class="primary"
-            :disabled="m.active || !!busy || !canActivate(m)"
-            @click="activate(m)"
-          >
-            {{ activationLabel(m) }}
-          </button>
+          <button v-if="m.active" class="ghost danger" :title="t('停用推理模型')" :disabled="!!busy" @click.stop="deactivateModel(m)">{{ busy === m.path ? t("正在暂停并停用…") : t("停用") }}</button>
+          <button v-if="isOcrModel(m)" class="ghost danger" :title="t('停用 OCR')" :disabled="!!busy" @click.stop="deactivateOcrModel(m)">{{ t("停用") }}</button>
+          <button v-if="m.kind !== 'projector' && !hasActiveRole(m)" class="primary" :disabled="!!busy || (!canActivate(m) && m.format !== 'safetensors')" @click.stop="chooseRole(m)">{{ t("设为当前模型") }}</button>
           <button class="ghost" :title="`${t('打开模型文件夹：')}${m.model_dir}`" @click.stop="openModelDir(m)">
             <FolderOpen :size="14" />
           </button>
-          <button class="ghost danger" :disabled="m.active || !!busy" @click.stop="remove(m)">
+          <button class="ghost danger" :disabled="m.active || isOcrModel(m) || !!busy" @click.stop="remove(m)">
             {{ t("删除") }}
           </button>
         </div>
       </div>
     </div>
 
-    <!-- 点击模型后展开推理参数 -->
+    <div v-if="roleDialogOpen && roleModel" class="role-modal-backdrop" role="presentation" @click.self="roleDialogOpen = false">
+      <section class="role-modal" role="dialog" aria-modal="true" :aria-label="t('选择模型用途')">
+        <button type="button" class="role-modal-close" :aria-label="t('关闭')" @click="roleDialogOpen = false">×</button>
+        <h2>{{ t("选择模型用途") }}</h2>
+        <p class="role-model-name" :title="roleModel.path">{{ roleModel.name }}</p>
+        <div class="role-actions">
+          <button class="primary" :disabled="!canActivate(roleModel) || !!busy" @click="setRole('embed')">{{ t("推理模型") }}</button>
+          <button class="secondary-button" :disabled="!canUseOcr(roleModel) || !!busy" @click="setRole('ocr')">{{ t("OCR 模型") }}</button>
+        </div>
+      </section>
+    </div>
+
+    <!-- Click a model to expand its inference parameters. -->
     <section v-if="selected && props.cfg?.ui?.professional_mode" class="params card">
       <div class="params-head">
         <div><strong>{{ selected.name }}</strong><span class="kind format">{{ selected.format.toUpperCase() }}</span></div>
@@ -512,17 +576,6 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
   gap: 8px;
   min-height: 0;
 }
-.gpu-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px 14px;
-  flex: none;
-}
-.gpu-controls { display: flex; align-items: center; gap: 8px; min-width: min(100%, 420px); justify-content: flex-end; }
-.gpu-controls select { min-width: min(100%, 360px); }
-.gpu-note { margin-top: 3px; max-width: 740px; line-height: 1.45; }
 .icon-action { display: inline-grid; place-items: center; width: 32px; height: 32px; padding: 0; }
 .parallel-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 14px; flex: none; }
 .parallel-buttons { display: inline-flex; gap: 0; }
@@ -534,14 +587,16 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
 .parallel-count { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .parallel-count input { width: 86px; }
 .warn-text { color: var(--warn); }
-.modality-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; flex: none; }
+.modality-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; flex: none; }
 .modality-card { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 11px 12px; color: #555; }
 .modality-card.supported { color: #111; }
+.modality-card.error { color: #b42318; border-color: #b42318; }
 .modality-copy { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
 .modality-copy strong { font-size: 12px; font-weight: 600; }
 .modality-copy span { font-size: 10px; color: #777; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .modality-state { margin-left: auto; font-size: 10px; white-space: nowrap; color: #888; }
 .modality-card.supported .modality-state { color: #111; }
+.modality-card.error .modality-state, .modality-card.error .modality-copy span { color: #b42318; }
 .cur {
   display: flex;
   align-items: center;
@@ -670,13 +725,17 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
 .item.active { background: #f7f7f7; border-color: #111; }
 .kind { border-radius: 2px; color: #333; }
 .kind.embed, .kind.chat, .kind.projector { color: #111; border-color: #777; }
+.kind.multimodal { color: #111; border-color: #111; background: #f2f2f2; }
 .inuse { color: #111; }
 .danger { color: #9b2923; border-color: #9b2923; }
 .empty .big { color: #111; }
+.role-modal-backdrop { position: fixed; inset: 0; z-index: 500; display: grid; place-items: center; padding: 18px; background: rgba(0,0,0,.38); backdrop-filter: blur(4px); }
+.role-modal { position: relative; width: min(390px, calc(100vw - 36px)); padding: 22px; border: 1px solid #111; background: #fff; color: #111; box-shadow: 0 18px 48px rgba(0,0,0,.2); }
+.role-modal h2 { margin: 0 28px 10px 0; font-size: 16px; }
+.role-modal-close { position: absolute; top: 7px; right: 9px; border: 0; background: transparent; color: #111; font-size: 22px; cursor: pointer; }
+.role-model-name { overflow: hidden; margin: 0; color: #555; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.role-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 @media (max-width: 700px) {
-  .gpu-row { align-items: flex-start; flex-direction: column; }
-  .gpu-controls { width: 100%; justify-content: flex-start; }
-  .gpu-controls select { flex: 1; min-width: 0; }
   .modality-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .params-grid { grid-template-columns: 1fr; }
   .params-grid .param-path { grid-column: auto; }

@@ -414,16 +414,18 @@ fn spirv_headers_dir(sdk: &std::path::Path) -> Option<std::path::PathBuf> {
         .find(|dir| dir.join("SPIRV-HeadersConfig.cmake").exists())
 }
 
-/// Return a unique ASCII-only CMake output directory on the Cargo target volume.
-/// This is needed for the Vulkan shader-generator subproject on Windows/MSVC.
+/// Return a short ASCII-only CMake output directory on the Cargo target volume.
+///
+/// The Vulkan backend configures a nested `ExternalProject` for its shader
+/// generator. Even an ASCII Cargo target path can become too deep after that
+/// nesting, and MSBuild's FileTracker then fails with FTK1011. Keep the native
+/// CMake tree near the drive root on every Windows build, while leaving Cargo's
+/// normal target directory and Rust artifacts untouched.
 fn windows_ascii_cmake_out_dir() -> Option<std::path::PathBuf> {
     if !cfg!(windows) {
         return None;
     }
     let cargo_out = std::path::PathBuf::from(std::env::var_os("OUT_DIR")?);
-    if cargo_out.to_string_lossy().is_ascii() {
-        return None;
-    }
     let build_id = cargo_out.parent()?.file_name()?;
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
@@ -439,5 +441,5 @@ fn windows_ascii_cmake_out_dir() -> Option<std::path::PathBuf> {
     if volume_root.as_os_str().is_empty() {
         return None;
     }
-    Some(volume_root.join(".deepdark-oracle-cmake").join(build_id))
+    Some(volume_root.join(".ddo-cmake").join(build_id))
 }

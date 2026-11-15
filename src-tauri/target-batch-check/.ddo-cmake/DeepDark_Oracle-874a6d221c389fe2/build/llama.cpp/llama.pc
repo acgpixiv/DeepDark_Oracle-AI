@@ -1,0 +1,10 @@
+prefix=E:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2
+exec_prefix=E:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2
+libdir=E:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/lib
+includedir=E:/项目/AI--deepaisee/src-tauri/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/build/target-batch-check/.ddo-cmake/DeepDark_Oracle-874a6d221c389fe2/include
+
+Name: llama
+Description: Port of Facebook's LLaMA model in C/C++
+Version: 0.0.0
+Libs: -L${libdir} -lggml -lggml-base -lllama
+Cflags: -I${includedir}

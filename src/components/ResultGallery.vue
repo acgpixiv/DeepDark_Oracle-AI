@@ -15,6 +15,7 @@ const props = defineProps<{
   thumbDir: string;
   loading?: boolean;
   query?: string;
+  searchMode?: "fulltext" | "semantic" | "image" | "audio" | string;
 }>();
 
 const emit = defineEmits<{
@@ -40,6 +41,7 @@ const hoverHit = ref<Hit | null>(null);
 const hoverStyle = ref<Record<string, string>>({});
 const contextHit = ref<Hit | null>(null);
 const contextStyle = ref<Record<string, string>>({});
+const hoverAnchor = ref<DOMRect | null>(null);
 const failedThumbs = ref(new Set<number>());
 const readyThumbs = ref(new Set<number>());
 const previewRequests = new Set<number>();
@@ -86,6 +88,9 @@ function onThumbError(hit: Hit) {
 }
 function sourceUrl(hit: Hit): string { return convertFileSrc(hit.path); }
 function isPdf(hit: Hit): boolean { return [".pdf", "pdf"].includes(hit.ext.toLowerCase()); }
+function hitPage(hit: Hit): number | undefined {
+  return hit.page != null && Number.isFinite(Number(hit.page)) ? Math.max(1, Math.floor(Number(hit.page))) : undefined;
+}
 function isVideo(hit: Hit): boolean { return hit.kind === "video"; }
 function scoreClass(hit: Hit): string {
   const score = Math.max(0, Math.min(1, Number(hit.score) || 0));
@@ -96,13 +101,39 @@ function scoreClass(hit: Hit): string {
 function displayScore(hit: Hit): string {
   return Math.max(0, Math.min(1, Number(hit.score) || 0)).toFixed(2);
 }
-function hoverStart(hit: Hit, event: MouseEvent) {
+function scoreHint(hit: Hit): string {
+  const score = Math.max(0, Math.min(1, Number(hit.score) || 0));
+  const reason = hit.reason || "";
+  if (/全文|full/i.test(reason)) {
+    // Full-text is the selected retrieval lane; its numeric score is still
+    // a term-coverage score. A value below 1 means only part of a multi-term
+    // query was present (for example 2/3 -> 0.76), rather than a semantic
+    // penalty applied to an exact phrase.
+    return score >= 0.999
+      ? "全文匹配：完整短语或全部查询词命中"
+      : "全文匹配：部分查询词命中，分数按词覆盖率计算";
+  }
+  return "相似度";
+}
+function updateHoverStyle() {
+  const rect = hoverAnchor.value;
+  if (!rect) return;
+  const availableWidth = Math.max(1, window.innerWidth - 16);
+  const availableHeight = Math.max(1, window.innerHeight - 16);
   clearTimeout(hoverTimer); clearTimeout(closeTimer);
-  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-  const width = 430; const height = 520;
+  // Adapt the enlarged preview to the current WebView instead of using a
+  // fixed 430x520 rectangle. Keep enough room for a readable PDF page while
+  // respecting small laptop windows and high-DPI displays.
+  const width = Math.min(availableWidth, Math.max(1, 200, Math.min(680, Math.round(window.innerWidth * 0.42))));
+  const height = Math.min(availableHeight, Math.max(1, 240, Math.min(760, Math.round(window.innerHeight * 0.78))));
   const left = rect.right + width + 8 <= window.innerWidth ? rect.right + 8 : Math.max(8, rect.left - width - 8);
   const top = Math.max(8, Math.min(window.innerHeight - height - 8, rect.top));
-  hoverStyle.value = { left: `${left}px`, top: `${top}px` };
+  hoverStyle.value = { left: `${left}px`, top: `${top}px`, width: `${width}px`, height: `${height}px` };
+}
+function hoverStart(hit: Hit, event: MouseEvent) {
+  clearTimeout(hoverTimer); clearTimeout(closeTimer);
+  hoverAnchor.value = (event.currentTarget as HTMLElement).getBoundingClientRect();
+  updateHoverStyle();
   hoverTimer = window.setTimeout(() => {
     void ensureDocumentThumb(hit);
     hoverHit.value = hit;
@@ -111,6 +142,9 @@ function hoverStart(hit: Hit, event: MouseEvent) {
 function hoverLeave() {
   clearTimeout(hoverTimer);
   closeTimer = window.setTimeout(() => { hoverHit.value = null; }, 260);
+}
+function onWindowResize() {
+  if (hoverHit.value) updateHoverStyle();
 }
 function popoverEnter() { clearTimeout(closeTimer); }
 function popoverLeave() { hoverHit.value = null; }
@@ -135,13 +169,58 @@ function highlight(s: string): string {
   return safe.replace(new RegExp(terms.map(escapeRx).join("|"), "gi"), (match) => `<mark>${match}</mark>`);
 }
 function tags(hit: Hit): string[] { return (hit.tags || "").split(",").filter(Boolean).slice(0, 2); }
+function matchLabel(hit: Hit): string {
+  // The selected retrieval lane defines the meaning of the result list.
+  // Backend reasons may describe a secondary signal (for example a filename
+  // match) and must not change the visible modality badge.
+  switch (props.searchMode) {
+    case "fulltext": return t("全文匹配");
+    case "semantic": return t("语义相似");
+    case "image": return t("图像相似");
+    case "audio": return t("音频相似");
+  }
+  const reason = hit.reason || "";
+  if (/音频|声音|audio/i.test(reason)) return t("音频相似");
+  if (/图像|画面|图片|image/i.test(reason)) return t("图像相似");
+  if (/全文|名称|路径|拼音|模糊|full/i.test(reason)) return t("全文匹配");
+  if (/语义|semantic/i.test(reason)) return t("语义相似");
+  return t("语义相似");
+}
+function hitLocation(hit: Hit): string {
+  if (hit.page != null) return `P. ${hit.page}`;
+  if (hit.start_seconds != null) {
+    const format = (value: number) => {
+      const seconds = Math.max(0, Math.floor(value));
+      const minutes = Math.floor(seconds / 60);
+      const remaining = seconds % 60;
+      if (minutes >= 60) {
+        return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+      }
+      return `${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+    };
+    const start = Math.max(0, Number(hit.start_seconds));
+    const end = Number(hit.end_seconds);
+    // Video vectors currently identify a temporal window. Show its bounds so
+    // a first-window hit is not mistaken for an exact match at 00:00; subtitle
+    // matches are refined to the narrower cue bounds by the backend.
+    return Number.isFinite(end) && end > start
+      ? `${format(start)}-${format(end)}`
+      : format(start);
+  }
+  return "";
+}
 function handleDocumentClick() { closeContext(); }
 function onGalleryScroll(event: Event) {
   const element = event.currentTarget as HTMLElement;
   if (element.scrollTop + element.clientHeight >= element.scrollHeight - 560) emit("reach-end");
 }
 window.addEventListener("click", handleDocumentClick);
-onBeforeUnmount(() => { clearTimeout(hoverTimer); clearTimeout(closeTimer); window.removeEventListener("click", handleDocumentClick); });
+window.addEventListener("resize", onWindowResize);
+onBeforeUnmount(() => {
+  clearTimeout(hoverTimer); clearTimeout(closeTimer);
+  window.removeEventListener("click", handleDocumentClick);
+  window.removeEventListener("resize", onWindowResize);
+});
 </script>
 
 <template>
@@ -149,28 +228,28 @@ onBeforeUnmount(() => { clearTimeout(hoverTimer); clearTimeout(closeTimer); wind
     <div v-if="loading" class="gallery-state">正在检索…</div>
     <div v-else-if="!rows.length" class="gallery-state"><div class="empty-title">没有找到匹配的文件</div><div>换一种描述，或到设置中的“文件索引”添加目录。</div></div>
     <div v-else class="grid">
-      <article v-for="hit in rows" :key="hit.id" v-memo="[hit.id, hit.thumb_key, hit.score, selectedId === hit.id, selectedIds.has(hit.id), readyThumbs.has(hit.id), failedThumbs.has(hit.id)]" class="result" :class="{ active: hit.id === selectedId }" tabindex="0"
+      <article v-for="hit in rows" :key="hit.id" v-memo="[hit.id, hit.path, hit.mtime, hit.page, hit.thumb_key, hit.score, selectedId === hit.id, selectedIds.has(hit.id), readyThumbs.has(hit.id), failedThumbs.has(hit.id)]" class="result" :class="{ active: hit.id === selectedId }" tabindex="0"
         @click="emit('select', hit)" @dblclick="emit('open', hit)" @contextmenu="openContext(hit, $event)"
         @mouseenter="hoverStart(hit, $event)" @mouseleave="hoverLeave"
         @keydown.enter="emit('select', hit)" @keydown.space.prevent="emit('select', hit)">
         <div class="media" :style="{ '--kind-color': kindColor(hit.kind) }">
-          <img v-if="thumbnail(hit)" :src="thumbnail(hit)" loading="lazy" decoding="async" fetchpriority="low" alt="" @error="onThumbError(hit)" />
-          <PdfThumbnail v-else-if="isPdf(hit)" :file-id="hit.id" :path="hit.path" @ready="markThumbReady(hit.id)" />
+          <PdfThumbnail v-if="isPdf(hit)" :file-id="hit.id" :path="hit.path" :page="hitPage(hit)" :mtime="hit.mtime" @ready="markThumbReady(hit.id)" />
+          <img v-else-if="thumbnail(hit)" :src="thumbnail(hit)" loading="lazy" decoding="async" fetchpriority="low" alt="" @error="onThumbError(hit)" />
           <video v-else-if="isVideo(hit)" class="video-card" :src="sourceUrl(hit)" muted preload="metadata"></video>
           <component :is="iconFor[hit.kind] || PackageOpen" v-else :size="30" stroke-width="1.5" />
-          <span class="score" :class="scoreClass(hit)" @click.stop @dblclick.stop>{{ displayScore(hit) }}</span>
+          <span class="score" :class="scoreClass(hit)" :title="scoreHint(hit)" @click.stop @dblclick.stop>{{ displayScore(hit) }}</span>
           <input class="check" type="checkbox" :aria-label="`${t('选择')} ${hit.name} ${t('用于导出')}`" :checked="selectedIds.has(hit.id)" @click.stop @change="emit('toggle', hit.id)" />
         </div>
         <div class="details">
           <div class="title-line"><span class="name" :title="hit.name">{{ hit.name }}</span><span class="kind">{{ hit.kind_label }}</span></div>
-          <div class="reason-line"><span v-if="hit.reason" class="reason">{{ hit.reason }}</span><span v-for="tag in tags(hit)" :key="tag" class="tag">{{ tag }}</span></div>
-          <div v-if="hit.snippet" class="snippet" v-html="highlight(hit.snippet)"></div>
+          <div class="reason-line"><span class="reason">{{ matchLabel(hit) }}</span><span v-if="hitLocation(hit)" class="location">{{ hitLocation(hit) }}</span><span v-for="tag in tags(hit)" :key="tag" class="tag">{{ tag }}</span></div>
+          <div v-if="hit.snippet || hit.subtitle" class="snippet" v-html="highlight(hit.snippet || hit.subtitle || '')"></div>
           <div class="meta"><span>{{ hit.size_label || humanSize(hit.size) }}</span><span>{{ hit.mtime_label || fmtTime(hit.mtime) }}</span></div>
         </div>
       </article>
     </div>
     <div v-if="hoverHit" class="preview-popover" :style="hoverStyle" @mouseenter="popoverEnter" @mouseleave="popoverLeave">
-      <PdfPreview v-if="isPdf(hoverHit)" :path="hoverHit.path" />
+      <PdfPreview v-if="isPdf(hoverHit)" :path="hoverHit.path" :initial-page="hitPage(hoverHit)" />
       <img v-else-if="thumbnail(hoverHit)" :src="thumbnail(hoverHit)" alt="" @error="markThumbFailed(hoverHit.id)" />
         <video v-else-if="isVideo(hoverHit)" :src="sourceUrl(hoverHit)" controls></video>
     </div>
@@ -191,6 +270,7 @@ onBeforeUnmount(() => { clearTimeout(hoverTimer); clearTimeout(closeTimer); wind
 .media img, .video-card, .pdf-card { width: 100%; height: 100%; object-fit: cover; border: 0; }.pdf-card { background: #fff; pointer-events: none; }.video-card { object-fit: contain; }
 .score { position: absolute; left: 8px; bottom: 8px; padding: 3px 6px; border: 1px solid currentColor; border-radius: 2px; background: rgba(255,255,255,.92); font: 11px Consolas, monospace; font-variant-numeric: tabular-nums; user-select: none; }.score-high { color: #16733a; }.score-medium { color: #a46300; }.score-low { color: #8c1d24; }.check { position: absolute; top: 8px; right: 8px; width: 17px; height: 17px; accent-color: #111; cursor: pointer; }
 .details { padding: 9px 10px 10px; }.title-line { display: flex; align-items: baseline; gap: 6px; min-width: 0; }.name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }.kind { flex: none; color: #666; font-size: 10px; }.reason-line { min-height: 18px; display: flex; gap: 4px; overflow: hidden; padding-top: 5px; }.reason, .tag { flex: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 5px; border-radius: 2px; font-size: 10px; }.reason { color: #333; background: #f1f1f1; }.tag { color: #222; background: #f7f7f7; border: 1px solid #aaa; }.snippet { margin-top: 5px; min-height: 30px; color: #444; font-size: 10px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }.snippet :deep(mark) { color: #111; background: #eee; border-bottom: 1px solid #111; }.meta { display: flex; justify-content: space-between; gap: 6px; margin-top: 8px; color: #666; font-size: 10px; font-variant-numeric: tabular-nums; }.meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.location { flex: none; padding: 1px 5px; border: 1px solid #111; border-radius: 2px; color: #111; font: 10px Consolas, monospace; font-variant-numeric: tabular-nums; }
 .preview-popover { position: fixed; z-index: 100; width: 430px; height: 520px; display: flex; flex-direction: column; border: 1px solid #111; border-radius: 2px; background: #fff; box-shadow: 0 16px 40px rgba(0,0,0,.24); overflow: hidden; }.popover-head { display: none; }.preview-popover > .pdf-preview, .preview-popover > img, .preview-popover > video { flex: 1; width: 100%; min-height: 0; border: 0; object-fit: contain; background: #fff; overflow: hidden; }.page-indicator { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); padding: 4px 10px; border-radius: 2px; background: rgba(0,0,0,.62); color: #fff; font: 12px Consolas, monospace; pointer-events: none; }.popover-empty { display: grid; place-items: center; flex: 1; color: #666; font-size: 12px; }
 .context-menu { position: fixed; z-index: 120; width: 170px; padding: 4px; border: 1px solid #111; border-radius: 2px; background: #fff; box-shadow: 0 8px 24px rgba(0,0,0,.18); }.context-menu button { display: block; width: 100%; padding: 8px 10px; border: 0; background: transparent; color: #111; text-align: left; font-size: 12px; cursor: pointer; }.context-menu button:hover { background: #eee; }
 .gallery-state { min-height: 240px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: #666; font-size: 12px; }.empty-title { color: #111; font-size: 14px; }

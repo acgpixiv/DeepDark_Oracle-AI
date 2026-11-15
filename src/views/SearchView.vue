@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { ArrowDownUp, Check, ChevronDown, ChevronRight, Download, FolderOpen, LayoutGrid, Network, Search, Sparkles, X } from "lucide-vue-next";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, type Hit, type MindMapOut, type SearchQuery } from "../api";
@@ -7,18 +7,16 @@ import { langState, t } from "../i18n";
 import { toast } from "../store";
 import ResultGallery from "../components/ResultGallery.vue";
 import GalaxyCanvas from "../galaxy/GalaxyCanvas.vue";
-import MindMap from "../components/MindMap.vue";
+const MindMap = defineAsyncComponent(() => import("../components/MindMap.vue"));
 
 const props = defineProps<{ thumbDir: string }>();
 
 const text = ref("");
-// Hybrid is the default: lexical matches stay instant, while semantic search
-// is loaded lazily on the first query that needs it.
-const semantic = ref(true);
-const fulltext = ref(true);
-const pinyin = ref(true);
-const fuzzy = ref(true);
-const visual = ref(true);
+// Retrieval lanes are independently selectable. Keep all lanes enabled by default
+// so a normal search can combine exact text, semantic, image and audio matches.
+type SearchMode = "fulltext" | "semantic" | "image" | "audio";
+const SEARCH_MODES: SearchMode[] = ["fulltext", "semantic", "image", "audio"];
+const selectedSearchModes = ref<SearchMode[]>([...SEARCH_MODES]);
 const workspaceMode = ref(true);
 const debounceMs = ref(260);
 const RESULT_PAGE_SIZE = 500;
@@ -28,6 +26,7 @@ const sort = ref("relevance");
 const desc = ref(true);
 const hits = shallowRef<Hit[]>([]);
 const allHits: Hit[] = [];
+const loadedHitIds = new Set<number>();
 const hitBuckets = new Map<string, Hit[]>();
 const loadedResultsRevision = ref(0);
 const loading = ref(false);
@@ -39,6 +38,8 @@ const selectedIds = ref<Set<number>>(new Set());
 const selectAllActive = ref(false);
 const selectAllKind = ref("all");
 const loadingMore = ref(false);
+// Keep the empty-state spinner alive while detached semantic/media lanes run.
+const backgroundSearchPending = ref(false);
 const renderLimit = ref(RESULT_PAGE_SIZE);
 const typedPrompt = ref("");
 const scopeOpen = ref(false);
@@ -64,30 +65,76 @@ const mindModel = ref<string>("definition");
 const mindData = ref<MindMapOut | null>(null);
 const mindLoading = ref(false);
 const mindError = ref("");
+let mindLoadTimer: number | undefined;
+let mindLoadGeneration = 0;
 
 /** 当前结果里的文件路径（最多 600 条，够画图了）。 */
 const mindPaths = computed(() => hits.value.slice(0, 600).map((h) => h.path));
 
 async function loadMind() {
+  const generation = ++mindLoadGeneration;
+  const paths = mindPaths.value;
   mindLoading.value = true;
   mindError.value = "";
   try {
-    mindData.value = await api.mindMapData(mindModel.value, mindPaths.value, text.value);
+    const data = await api.mindMapData(mindModel.value, paths, text.value);
+    // A newer search/model change may have superseded this request while the
+    // backend was grouping rows. Do not let stale graph data overwrite the
+    // current result set.
+    if (generation !== mindLoadGeneration || viewMode.value !== "mind") return;
+    mindData.value = data;
   } catch (e) {
+    if (generation !== mindLoadGeneration || viewMode.value !== "mind") return;
     mindError.value = String(e);
     mindData.value = null;
   } finally {
-    mindLoading.value = false;
+    if (generation === mindLoadGeneration) mindLoading.value = false;
   }
+}
+
+function scheduleMindLoad(delay = 120) {
+  window.clearTimeout(mindLoadTimer);
+  if (
+    viewMode.value !== "mind"
+    || loading.value
+    || backgroundSearchPending.value
+    || loadingMore.value
+  ) return;
+  mindLoadTimer = window.setTimeout(() => {
+    mindLoadTimer = undefined;
+    if (loading.value || backgroundSearchPending.value || loadingMore.value) return;
+    void loadMind();
+  }, delay);
 }
 
 function setView(v: ViewMode) {
   viewMode.value = v;
-  if (v === "mind") void loadMind();
+  if (v === "mind") scheduleMindLoad(0);
+  else {
+    window.clearTimeout(mindLoadTimer);
+    mindLoadGeneration++;
+  }
 }
 
-watch([mindModel, () => hits.value.length], () => {
-  if (viewMode.value === "mind") void loadMind();
+watch([
+  mindModel,
+  () => hits.value.length,
+  loading,
+  backgroundSearchPending,
+  loadingMore,
+], () => {
+  if (viewMode.value !== "mind") return;
+  // Search owns the database/CPU path. Wait until the foreground request and
+  // detached background pagination are idle before asking for graph data.
+  // This keeps changing the view from affecting retrieval latency.
+  if (loading.value || backgroundSearchPending.value || loadingMore.value) {
+    window.clearTimeout(mindLoadTimer);
+    mindLoadTimer = undefined;
+    mindLoadGeneration++;
+    mindLoading.value = false;
+    return;
+  }
+  scheduleMindLoad();
 });
 type ScopeOption = { value: string; label: string; path?: string; mode: "all" | "indexed" | "path" };
 const driveOptions = computed<ScopeOption[]>(() => {
@@ -166,7 +213,7 @@ function typePrompt() {
   typeTimer = window.setTimeout(typePrompt, deleting ? 45 : 85);
 }
 
-function buildQuery(): SearchQuery {
+function buildQuery(mode: SearchMode): SearchQuery {
   const scope = activeScope.value;
   return {
     text: text.value,
@@ -179,14 +226,251 @@ function buildQuery(): SearchQuery {
     limit: pageSize.value,
     sort: sort.value,
     desc: desc.value,
-    use_fts: fulltext.value,
-    use_pinyin: pinyin.value,
-    use_fuzzy: fuzzy.value,
-    use_semantic: semantic.value,
-    cross_modal: visual.value,
-    workspace: workspaceMode.value && scope?.mode !== "indexed",
+    use_fts: mode === "fulltext",
+    use_pinyin: false,
+    use_fuzzy: false,
+    use_semantic: mode === "semantic",
+    cross_modal: mode === "image" || mode === "audio",
+    search_mode: mode,
+    // Workspace search is a model-free filesystem/FTS lane. Running it again
+    // for semantic, image, and audio requests made one query rescan the same
+    // unindexed files up to four times, while those lanes can only resolve
+    // persisted vectors. Keep the workspace lane on the fast full-text pass.
+    workspace: mode === "fulltext" && workspaceMode.value && scope?.mode !== "indexed",
     scope: scope?.mode ?? "all",
     scope_path: scope?.mode === "path" ? scope.path ?? null : null,
+  };
+}
+
+function toggleSearchMode(mode: SearchMode) {
+  const current = selectedSearchModes.value;
+  selectedSearchModes.value = current.includes(mode)
+    ? current.filter((item) => item !== mode)
+    : [...current, mode];
+}
+
+const laneOffsets = new Map<SearchMode, number>();
+const laneHasMore = new Map<SearchMode, boolean>();
+// Keep duplicate-hit updates O(1) while background lanes append hundreds or
+// thousands of results.  The old allHits.findIndex() path made each page of
+// results progressively more expensive and could stall the gallery.
+const hitIndexes = new Map<number, number>();
+
+/**
+ * A file can be returned by several independently queried lanes.  Their
+ * scores are calibrated by different models, so comparing scores alone lets
+ * the image lane (which intentionally has a higher display baseline) hide a
+ * stronger textual match.  Keep the user-facing explanation in the stable
+ * order requested by the product: full text, semantic, image, audio.
+ */
+function matchPriority(hit: Hit): number {
+  const reason = hit.reason || "";
+  if (/全文/.test(reason)) return hit.score >= 0.98 ? 4 : 2;
+  if (/名称|路径|拼音|模糊|full/i.test(reason)) return 4;
+  if (/语义|semantic/i.test(reason)) return 3;
+  if (/图像|画面|图片|image/i.test(reason)) return 2;
+  if (/音频|声音|audio/i.test(reason)) return 1;
+  return 0;
+}
+
+function mergeHitDetails(winner: Hit, detail: Hit): Hit {
+  return {
+    ...winner,
+    page: winner.page ?? detail.page,
+    start_seconds: winner.start_seconds ?? detail.start_seconds,
+    end_seconds: winner.end_seconds ?? detail.end_seconds,
+    subtitle: winner.subtitle ?? detail.subtitle,
+    snippet: winner.snippet || detail.snippet,
+  };
+}
+
+function mergeLanePair(left: Hit, right: Hit): Hit {
+  const leftText = /全文/.test(left.reason || "");
+  const rightText = /全文/.test(right.reason || "");
+  const leftSemantic = /语义|semantic/i.test(left.reason || "");
+  const rightSemantic = /语义|semantic/i.test(right.reason || "");
+  const exactText = leftText && left.score >= 0.98 ? left : rightText && right.score >= 0.98 ? right : null;
+
+  // A non-phrase FTS hit says the words occur on this page, not that the
+  // page describes the intended concept. In the mixed view, let the semantic
+  // lane re-rank that evidence instead of preserving FTS priority blindly.
+  if (!exactText && ((leftText && rightSemantic) || (rightText && leftSemantic))) {
+    const textHit = leftText ? left : right;
+    const semanticHit = leftSemantic ? left : right;
+    const winner = {
+      ...semanticHit,
+      score: textHit.score * 0.25 + semanticHit.score * 0.75,
+    };
+    return mergeHitDetails(winner, textHit);
+  }
+
+  const preferRight = matchPriority(right) > matchPriority(left)
+    || (matchPriority(right) === matchPriority(left) && right.score > left.score);
+  return mergeHitDetails(preferRight ? right : left, preferRight ? left : right);
+}
+
+function mergeLaneHits(lanes: Hit[][]): Hit[] {
+  const merged = new Map<number, Hit>();
+  for (const lane of lanes) {
+    for (const hit of lane) {
+      const previous = merged.get(hit.id);
+      if (!previous) {
+        merged.set(hit.id, hit);
+        continue;
+      }
+      merged.set(hit.id, mergeLanePair(previous, hit));
+    }
+  }
+  return [...merged.values()].sort((a, b) => b.score - a.score || a.id - b.id);
+}
+
+// Keep the retrieval lanes independent from the render loop.  Calling all
+// model-backed lanes in one Promise.allSettled burst makes the semantic,
+// image and audio encoders compete for the same GPU/CPU workers, while a
+// long SQLite/vector page can monopolize the browser thread between Vue
+// updates.  A short idle yield between lanes gives the first page and user
+// input priority without changing the total recall or pagination rules.
+function yieldToUi(delay = 0): Promise<void> {
+  return new Promise((resolve) => {
+    const idle = (window as any).requestIdleCallback as
+      | ((callback: () => void, options?: { timeout?: number }) => number)
+      | undefined;
+    if (typeof idle === "function") {
+      idle(() => resolve(), { timeout: Math.max(16, delay + 16) });
+    } else {
+      window.setTimeout(resolve, delay);
+    }
+  });
+}
+
+async function searchSelectedLanes(
+  loadMore: boolean,
+  onPartial?: (hits: Hit[]) => void,
+  onBackgroundDone?: () => void,
+  requestGeneration = searchGeneration,
+): Promise<{ hits: Hit[]; hasMore: boolean }> {
+  let modes = [...selectedSearchModes.value];
+  if (!modes.length) return { hits: [], hasMore: false };
+
+  // Keep the model-free FTS lane on the fast path. Starting all four lanes at
+  // once made the first page wait behind optional CLIP/CLAP or a cold semantic
+  // model, and also made those encoders compete with each other for the GPU.
+  // The full-text page is published first; the semantic/image/audio lanes are
+  // then allowed to run together in the background and merge into the same
+  // result set. Final recall and pagination remain unchanged.
+  const requestLane = async (mode: SearchMode): Promise<Hit[]> => {
+    if (loadMore && laneHasMore.get(mode) === false) return [];
+    const q = buildQuery(mode);
+    q.limit = pageSize.value;
+    q.offset = loadMore ? (laneOffsets.get(mode) ?? 0) : 0;
+    try {
+      const result = mode === "semantic" ? await api.searchSemantic(q) : await api.search(q);
+      laneOffsets.set(mode, (q.offset ?? 0) + result.length);
+      laneHasMore.set(mode, result.length === pageSize.value);
+      return result;
+    } catch (error) {
+      // An unavailable optional lane (for example CLIP/CLAP) should not keep
+      // the background paginator alive forever when another lane succeeded.
+      laneHasMore.set(mode, false);
+      throw error;
+    }
+  };
+
+  const successful: Hit[][] = [];
+  let firstFailure: unknown;
+  // The first page must not wait for a cold semantic/CLIP/CLAP model.  Use
+  // full-text as the fast lane when enabled; if the user disabled it, use the
+  // first selected lane as the fast lane so an explicit single-lane search
+  // keeps its old behavior.
+  const fastMode = modes.find((mode) => mode === "fulltext") ?? modes[0];
+  if (fastMode && !loadMore) {
+    try {
+      const result = await requestLane(fastMode);
+      successful.push(result);
+      onPartial?.(result);
+    } catch (error) {
+      firstFailure = error;
+    }
+  }
+
+  // Optional model lanes start only after the fast page has been handed to the
+  // UI and are run one at a time.  On the initial
+  // request they are detached from the caller: `run()` can clear its loading
+  // state and render the first 500 FTS results immediately.  Pagination is
+  // resumed by `onBackgroundDone` once all lanes have established their
+  // offsets, preventing a second request from duplicating page zero.
+  const backgroundModes = loadMore
+    ? modes
+    : modes.filter((mode) => mode !== fastMode);
+  const runBackground = async () => {
+    const backgroundHits: Hit[][] = [];
+    // One model-backed lane at a time is deliberate.  The previous
+    // Promise.allSettled implementation started three encoders together;
+    // on a single GPU that increased context switching and made both search
+    // and foreground interaction visibly slower.  Semantic is the primary
+    // lane, followed by optional image/audio extensions.  Every completed
+    // page is published immediately, so the user never waits for the slowest
+    // lane before seeing useful results.
+    const priority: SearchMode[] = ["semantic", "image", "audio"];
+    const ordered = [
+      ...priority.filter((mode) => backgroundModes.includes(mode)),
+      ...backgroundModes.filter((mode) => !priority.includes(mode)),
+    ];
+    for (const mode of ordered) {
+      // A new keystroke or scope change supersedes the old request.  Do not
+      // keep waking optional model lanes for a query the user can no longer
+      // see; this was a major source of cumulative GPU/CPU contention during
+      // fast typing.
+      if (requestGeneration !== searchGeneration || disposed) break;
+      await yieldToUi(0);
+      if (requestGeneration !== searchGeneration || disposed) break;
+      try {
+        const result = await requestLane(mode);
+        if (requestGeneration !== searchGeneration || disposed) break;
+        backgroundHits.push(result);
+        onPartial?.(result);
+      } catch (error) {
+        if (firstFailure === undefined) firstFailure = error;
+        // An unavailable optional lane is already marked exhausted by
+        // requestLane; continue with the remaining lanes.
+      }
+    }
+    return backgroundHits;
+  };
+
+  if (!loadMore) {
+    if (backgroundModes.length) {
+      void runBackground()
+        .catch(() => undefined)
+        .finally(() => onBackgroundDone?.());
+    } else {
+      // Defer the callback until after the caller has consumed this return
+      // value; otherwise `run()` would overwrite the callback's hasMore flag
+      // with the initial placeholder before starting pagination.
+      void Promise.resolve().then(() => onBackgroundDone?.());
+    }
+    if (!successful.length) {
+      // A fast-lane failure can still be rescued by an optional lane. Keep
+      // the existing error semantics for the rare case where every lane
+      // failed, while allowing the detached lanes to publish successful hits.
+      if (!backgroundModes.length) throw firstFailure ?? new Error("Search failed");
+    }
+    return {
+      hits: mergeLaneHits(successful),
+      // The detached lanes have not populated their offsets yet. The done
+      // callback sets this flag and starts silent pagination when appropriate.
+      hasMore: false,
+    };
+  }
+
+  const backgroundHits = await runBackground();
+  successful.push(...backgroundHits);
+  if (!successful.length) {
+    throw firstFailure ?? new Error("Search failed");
+  }
+  return {
+    hits: mergeLaneHits(successful),
+    hasMore: modes.some((mode) => laneHasMore.get(mode) !== false),
   };
 }
 
@@ -230,6 +514,8 @@ function matchesKind(hit: Hit, selectedKind: string): boolean {
 
 function resetResults() {
   allHits.length = 0;
+  loadedHitIds.clear();
+  hitIndexes.clear();
   hitBuckets.clear();
   for (const item of FILTER_KINDS) hitBuckets.set(item.v, []);
   hits.value = [];
@@ -244,6 +530,27 @@ function appendResults(results: Hit[]) {
   if (!results.length) return;
   const nextSelected = selectAllActive.value ? new Set(selectedIds.value) : null;
   for (const hit of results) {
+    if (loadedHitIds.has(hit.id)) {
+      const index = hitIndexes.get(hit.id) ?? -1;
+      const previous = index >= 0 ? allHits[index] : undefined;
+      if (!previous) continue;
+      const merged = mergeLanePair(previous, hit);
+      allHits[index] = merged;
+      for (const item of FILTER_KINDS) {
+        const bucket = hitBuckets.get(item.v);
+        if (!bucket) continue;
+        const bucketIndex = bucket.findIndex((entry) => entry.id === hit.id);
+        if (bucketIndex >= 0) {
+          if (matchesKind(merged, item.v)) bucket[bucketIndex] = merged;
+          else bucket.splice(bucketIndex, 1);
+        } else if (matchesKind(merged, item.v)) {
+          bucket.push(merged);
+        }
+      }
+      continue;
+    }
+    loadedHitIds.add(hit.id);
+    hitIndexes.set(hit.id, allHits.length);
     allHits.push(hit);
     for (const item of FILTER_KINDS) {
       if (matchesKind(hit, item.v)) hitBuckets.get(item.v)?.push(hit);
@@ -251,6 +558,12 @@ function appendResults(results: Hit[]) {
     if (nextSelected && matchesKind(hit, selectAllKind.value)) nextSelected.add(hit.id);
   }
   if (nextSelected && nextSelected.size !== selectedIds.value.size) selectedIds.value = nextSelected;
+  if (sort.value === "relevance") {
+    for (const bucket of hitBuckets.values()) {
+      bucket.sort((left, right) => right.score - left.score || left.id - right.id);
+    }
+    syncVisibleHits();
+  }
   loadedResultsRevision.value++;
   const activeBucket = hitBuckets.get(kind.value) ?? [];
   if (activeBucket.length > hits.value.length && hits.value.length < renderLimit.value) syncVisibleHits();
@@ -269,6 +582,14 @@ async function run(loadMore = false) {
   hasMore.value = false;
   renderLimit.value = RESULT_PAGE_SIZE;
   if (!loadMore) {
+    // One selected lane is completed by the awaited request. With multiple
+    // lanes the optional ones run detached after the first page, so retain a
+    // pending marker until their callback drains.
+    backgroundSearchPending.value = selectedSearchModes.value.length > 1;
+  }
+  if (!loadMore) {
+    laneOffsets.clear();
+    laneHasMore.clear();
     selectedIds.value = new Set();
     selectAllActive.value = false;
     resetResults();
@@ -279,22 +600,52 @@ async function run(loadMore = false) {
     if (!text.value.trim()) {
       resetResults();
       hasMore.value = false;
+      // A manual Enter on an empty query can still enter this function while
+      // several retrieval lanes are enabled.  There is no background work in
+      // that case, so never leave the gallery waiting for a callback that will
+      // not be scheduled.
+      backgroundSearchPending.value = false;
+      loading.value = false;
       return;
     }
-    const q = buildQuery();
-    q.limit = pageSize.value;
-    q.offset = loadMore ? allHits.length : 0;
-    const res = semantic.value ? await api.searchSemantic(q) : await api.search(q);
+    const batch = await searchSelectedLanes(loadMore, (partial) => {
+      if (generation !== searchGeneration || disposed) return;
+      if (partial.length) appendResults(partial);
+      // `loading` represents the foreground FTS request only. A cold semantic
+      // model can take much longer to load, so an empty first page must not
+      // leave the whole result view stuck in "searching" while background
+      // lanes run. They publish any later hits incrementally.
+      loading.value = false;
+    }, () => {
+      // The initial request deliberately returns before semantic/image/audio
+      // lanes finish. Once their first pages are merged, resume silent paging
+      // from their established offsets instead of issuing duplicate page-zero
+      // requests.
+      if (loadMore || generation !== searchGeneration || disposed) return;
+      backgroundSearchPending.value = false;
+      hasMore.value = selectedSearchModes.value.some((mode) => laneHasMore.get(mode) !== false);
+      if (hasMore.value) void loadRemaining(generation);
+    }, generation);
     if (generation !== searchGeneration || disposed) return;
-    appendResults(res);
-    hasMore.value = res.length === pageSize.value;
+    appendResults(batch.hits);
+    hasMore.value = batch.hasMore;
+    // Optional lanes are detached on the first page. Never make their cold
+    // model startup part of the foreground loading state.
+    loading.value = false;
     if (!loadMore && hasMore.value) void loadRemaining(generation);
   } catch (e) {
     if (!loadMore) resetResults();
     if (generation !== searchGeneration || disposed) return;
     toast(`${t("搜索失败：")}${e}`, "error");
   } finally {
-    if (!loadMore && generation === searchGeneration) loading.value = false;
+    // `searchSelectedLanes` deliberately detaches semantic/image/audio work
+    // after publishing the foreground full-text page.  The spinner belongs to
+    // that foreground request only; tying it to the detached lanes made an
+    // empty first page appear stuck at "正在检索" while a cold model loaded,
+    // and could leave the state stuck if a background lane was interrupted.
+    if (!loadMore && generation === searchGeneration) {
+      loading.value = false;
+    }
   }
 }
 
@@ -304,18 +655,18 @@ async function loadRemaining(generation: number) {
   loadingMore.value = true;
   try {
     while (hasMore.value && generation === searchGeneration && !disposed) {
-      const q = buildQuery();
-      q.limit = pageSize.value;
-      q.offset = allHits.length;
-      const res = semantic.value ? await api.searchSemantic(q) : await api.search(q);
+      const batch = await searchSelectedLanes(true, undefined, undefined, generation);
       if (generation !== searchGeneration || disposed) return;
-      if (!res.length) {
+      if (!batch.hits.length) {
         hasMore.value = false;
         break;
       }
-      appendResults(res);
-      hasMore.value = res.length === pageSize.value;
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      appendResults(batch.hits);
+      hasMore.value = batch.hasMore;
+      // Let Vue paint and accept input between silent pages.  This is also
+      // where a large vector/SQLite page used to make the gallery feel
+      // frozen even though the first 500 results were already visible.
+      await yieldToUi(8);
     }
   } catch (e) {
     if (generation === searchGeneration && !disposed) toast(`Loading more results failed: ${e}`, "error");
@@ -352,6 +703,7 @@ function schedule() {
   loading.value = false;
   if (!text.value.trim() && !similarMode.value) {
     searched.value = false;
+    backgroundSearchPending.value = false;
     resetResults();
     selected.value = null;
     selectedIds.value = new Set();
@@ -434,7 +786,7 @@ async function doExport() {
   }
 }
 
-watch([text, semantic, fulltext, pinyin, fuzzy, visual, workspaceMode, sort, desc], schedule);
+watch([text, selectedSearchModes, workspaceMode, sort, desc], schedule);
 watch(kind, () => { renderLimit.value = RESULT_PAGE_SIZE; syncVisibleHits(); });
 watch(similarMode, (value) => { if (value) runSimilar(); else if (searched.value) run(); });
 
@@ -459,16 +811,10 @@ onMounted(async () => {
     scopeValue.value = initialScope === "path"
       ? scopeOptions.value.find((item) => item.path?.toLowerCase() === String(workspace.initial_path).toLowerCase())?.value ?? "indexed"
       : initialScope;
-    semantic.value = config.search.use_semantic !== false;
-    fulltext.value = config.search.use_fulltext !== false;
-    pinyin.value = config.search.use_pinyin !== false;
-    fuzzy.value = config.search.use_fuzzy !== false;
-    visual.value = config.model.clip_enabled !== false || config.model.clap_enabled !== false;
     // 默认搜索模式（通用配置）：fulltext / semantic / hybrid
-    const mode = config.ui?.default_search_mode;
-    if (mode === "fulltext") { semantic.value = false; fulltext.value = true; }
-    else if (mode === "semantic") { semantic.value = true; fulltext.value = false; }
-    else if (mode === "hybrid") { semantic.value = true; fulltext.value = true; }
+    // All retrieval lanes start enabled. Users can narrow a query by toggling
+    // individual buttons in the toolbar.
+    selectedSearchModes.value = [...SEARCH_MODES];
     workspaceMode.value = Boolean(config.workspace?.enabled);
     // Migrate the old 1,000-result default. The backend scans up to 50,000
     // candidates, so normal searches no longer stop at the old ceiling.
@@ -496,6 +842,8 @@ onBeforeUnmount(() => {
   disposed = true;
   searchGeneration++;
   window.clearTimeout(searchTimer);
+  window.clearTimeout(mindLoadTimer);
+  mindLoadGeneration++;
   window.clearTimeout(typeTimer);
 });
 
@@ -519,7 +867,7 @@ defineExpose({ run, enterSimilar });
       <span class="triangle triangle-d"></span>
       <span class="triangle triangle-e"></span>
     </div>
-    <section class="hero-search">
+    <section class="hero-search" :class="{ 'scope-open': scopeOpen }">
       <div v-if="!searched" class="hero-copy">
         <div class="brand-name">DeepDark_Oracle</div>
         <h1>{{ typedPrompt }}<span class="caret" aria-hidden="true"></span></h1>
@@ -569,12 +917,10 @@ defineExpose({ run, enterSimilar });
           >{{ t(item.label) }}</button>
         </div>
         <div class="toolbar-spacer"></div>
-        <button class="tool-button" :class="{ active: fulltext }" :title="t('全文检索')" @click="fulltext = !fulltext">{{ t("全文") }}</button>
-        <button class="tool-button" :class="{ active: pinyin }" :title="t('拼音检索')" @click="pinyin = !pinyin">{{ t("拼音") }}</button>
-        <button class="tool-button" :class="{ active: semantic }" :title="t('语义检索')" @click="semantic = !semantic">{{ t("语义") }}</button>
-        <button class="tool-button" :class="{ active: fuzzy }" :title="t('模糊匹配')" @click="fuzzy = !fuzzy">{{ t("模糊") }}</button>
-        <button class="tool-button" :class="{ active: visual }" :title="t('跨模态检索')" @click="visual = !visual">{{ t("找图声") }}</button>
-        <button class="tool-button" :class="{ active: workspaceMode }" :title="t('同时检索工作区目录中尚未入库的文件')" @click="workspaceMode = !workspaceMode">{{ t("工作区") }}</button>
+        <button class="tool-button" :class="{ active: selectedSearchModes.includes('fulltext') }" :title="t('全文检索')" @click="toggleSearchMode('fulltext')">{{ t("全文") }}</button>
+        <button class="tool-button" :class="{ active: selectedSearchModes.includes('semantic') }" :title="t('语义检索')" @click="toggleSearchMode('semantic')">{{ t("语义") }}</button>
+        <button class="tool-button" :class="{ active: selectedSearchModes.includes('image') }" :title="t('图像检索')" @click="toggleSearchMode('image')">{{ t("图像") }}</button>
+        <button class="tool-button" :class="{ active: selectedSearchModes.includes('audio') }" :title="t('音频检索')" @click="toggleSearchMode('audio')">{{ t("音频") }}</button>
         <select v-model="sort" class="sort-select" :disabled="similarMode" :aria-label="t('排序方式')">
           <option v-for="item in SORTS" :key="item.v" :value="item.v">{{ t(item.label) }}</option>
         </select>
@@ -688,6 +1034,7 @@ defineExpose({ run, enterSimilar });
 }
 @media (prefers-reduced-motion: reduce) { .triangle { animation-duration: 1ms; animation-iteration-count: 1; } .toolbar, .result-meta { animation: none; } .query-shell, .hero-search { transition: none; } }
 .hero-search, .toolbar, .result-meta, .results-layout { position: relative; z-index: 1; }
+.hero-search.scope-open { z-index: 100; }
 .toolbar, .result-meta { animation: fade-down .22s ease both; }
 @keyframes fade-down { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
 .hero-search { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 34px; padding: 24px; transition: padding .26s ease, gap .26s ease; }
@@ -700,12 +1047,13 @@ h1 { min-height: 1.4em; margin: 0; color: #111; font-size: 42px; font-weight: 45
 @keyframes blink { 50% { opacity: 0; } }
 .query-wrap { position: relative; width: min(680px, 100%); display: flex; flex-direction: column; gap: 8px; }
 .searched .query-wrap { width: 100%; }
-.scope-wrap { position: relative; z-index: 4; width: 100%; }
-.scope-select { width: 100%; height: 32px; display: flex; align-items: center; gap: 12px; padding: 0 18px; border: 1px solid rgba(17,17,17,.14); border-radius: 18px 18px 0 0; background: linear-gradient(180deg, rgba(17,17,17,.075), rgba(255,255,255,.72)); color: #111; text-align: left; }
+.scope-wrap { position: relative; z-index: 100; width: 100%; }
+.scope-select { position: relative; z-index: 1; width: 100%; height: 32px; display: flex; align-items: center; gap: 12px; padding: 0 18px; border: 0; border-radius: 18px 18px 0 0; background: transparent; background-color: transparent; color: #111; text-align: left; }
+.scope-select::before { content: ""; position: absolute; inset: 0 0 -8px; border: 1px solid rgba(17,17,17,.42); border-bottom: 0; border-radius: 18px 18px 0 0; background: transparent; background-color: transparent; pointer-events: none; -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 45%, rgba(0,0,0,.64) 76%, transparent 100%); mask-image: linear-gradient(to bottom, #000 0%, #000 45%, rgba(0,0,0,.64) 76%, transparent 100%); }
 .scope-caption { flex: none; color: #555; font-size: 11px; }
 .scope-path { flex: 1; min-width: 0; overflow: hidden; color: #111; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .scope-select :deep(svg) { flex: none; }
-.scope-menu { position: absolute; top: 100%; left: 0; right: 0; z-index: 20; max-height: 320px; overflow: auto; padding: 5px; border: 1px solid #111; border-radius: 0 0 4px 4px; background: #fff; box-shadow: 0 12px 28px rgba(0,0,0,.16); }
+.scope-menu { position: absolute; top: 100%; left: 0; right: 0; z-index: 1000; max-height: 320px; overflow: auto; padding: 5px; border: 1px solid #111; border-radius: 0 0 4px 4px; background: #fff; box-shadow: 0 12px 28px rgba(0,0,0,.16); }
 .scope-option, .scope-add { width: 100%; min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 10px; border: 0; background: transparent; color: #111; text-align: left; }
 .scope-option span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scope-option:hover, .scope-option.selected, .scope-add:hover { background: #f1f1f1; }

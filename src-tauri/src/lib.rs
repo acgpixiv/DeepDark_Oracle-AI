@@ -9,6 +9,7 @@ pub mod fileops;
 pub mod index;
 pub mod media;
 pub mod models;
+pub mod ocr;
 pub mod py;
 pub mod scan;
 pub mod search;
@@ -119,10 +120,17 @@ pub fn run() {
                     Ok(emb) => {
                         let emb: Arc<dyn crate::ai::Embedder> = Arc::from(emb);
                         let dim = emb.dim();
+                        let store_dim = crate::state::configured_vector_dim(cfg.index.vector_dim);
                         let info = emb.info();
-                        let shared_media = info.backend == "candle"
-                            && info.modalities.iter().any(|m| matches!(m.as_str(), "image" | "audio" | "video"));
-                        let media_dim = if shared_media { dim } else { 256 };
+                        // Shared media support is a model capability, not a
+                        // backend brand.  llama.cpp GGUF models with an
+                        // adjacent mmproj advertise the same modalities and
+                        // must not silently fall back to the CPU hash encoder
+                        // during startup auto-load.
+                        let shared_media = info
+                            .modalities
+                            .iter()
+                            .any(|m| matches!(m.as_str(), "image" | "audio" | "video"));
                         trace(format!("loaded dim={} backend={}", dim, info.backend));
                         *st.embedder.write() = Arc::clone(&emb);
                         let mut c = st.cfg.read().clone();
@@ -131,7 +139,7 @@ pub fn run() {
                         *st.cfg.write() = c;
                         if let Ok(v) = crate::vector::VectorStore::open(
                             &st.data_dir.join("vectors"),
-                            dim,
+                            store_dim,
                         ) {
                             // 与 model_load 同理：维度变化清空了旧向量，
                             // 但库里 embed_state 仍是 ok，必须标回 pending 才会重建。
@@ -146,12 +154,32 @@ pub fn run() {
                         }
                         let media_dir = st.data_dir.join("vectors_media");
                         let old_media_count = st.media_vectors.read().len();
-                        if let Ok(v) = crate::vector::VectorStore::open(&media_dir, media_dim) {
+                        if let Ok(v) = crate::vector::VectorStore::open(&media_dir, store_dim) {
                             if old_media_count > 0 && v.len() == 0 {
                                 let _ = st.db.reset_states("embed");
                                 let _ = st.db.log("model", "媒体向量空间已切换，已把文件标记为待重新向量化");
                             }
                             *st.media_vectors.write() = Arc::new(v);
+                        }
+                        // Model auto-load may replace the vector stores after
+                        // AppState startup. Restore durable video-window
+                        // embeddings again here; otherwise the freshly opened
+                        // stores contain ordinary file vectors but the
+                        // timestamped video vectors remain only in SQLite and
+                        // video semantic searches silently return no matches
+                        // until the next full indexing run.
+                        let restored_video = {
+                            let primary = st.vectors.read().clone();
+                            let media = st.media_vectors.read().clone();
+                            st.db.restore_video_segment_vectors(&primary, &media)
+                        };
+                        if let Ok(restored) = restored_video {
+                            if restored > 0 {
+                                let _ = st.db.log(
+                                    "model",
+                                    &format!("auto-load restored {restored} persisted video segment vectors"),
+                                );
+                            }
                         }
                         let media_embedder: Arc<dyn crate::ai::Embedder> = if shared_media {
                             Arc::clone(&emb)
@@ -205,6 +233,7 @@ pub fn run() {
             cmd::gpu_refresh_report,
             cmd::model_load,
             cmd::model_deactivate,
+            cmd::ocr_model_deactivate,
             cmd::model_list,
             cmd::model_dir_path,
             cmd::model_delete,
@@ -252,6 +281,7 @@ pub fn run() {
             cmd::extension_install,
             cmd::extension_update,
             cmd::extension_remove,
+            ocr::teleocr_status,
         ])
         .setup(|app| {
             // 主窗口在 setup 里手动创建：`tauri.conf.json` 的 `dataDirectory`
@@ -275,6 +305,7 @@ pub fn run() {
         .run(|app_handle, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 use tauri::Manager;
+                crate::ocr::shutdown();
                 let state = app_handle.state::<Arc<state::AppState>>();
                 if let Some(indexer) = state.indexer() {
                     indexer.stop();

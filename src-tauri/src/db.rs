@@ -2,7 +2,7 @@
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub const FTS_SCHEMA_VERSION: i64 = 3;
@@ -73,6 +73,206 @@ pub struct Activity {
     pub msg: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct VideoSegmentMeta {
+    pub vector_id: i64,
+    pub file_id: i64,
+    pub segment_no: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub subtitle: String,
+}
+
+/// A completed temporal window together with the vector payload and the
+/// identity of the embedding space that produced it.  Keeping the rows in a
+/// small batch lets the indexer commit several windows in one SQLite
+/// transaction while still making every flushed window searchable.
+#[derive(Debug, Clone)]
+pub struct VideoSegmentEmbeddingRow {
+    pub segment: VideoSegmentMeta,
+    pub vector_space: String,
+    pub model_key: String,
+    pub vector: Vec<f32>,
+}
+
+/// A full-text match against the subtitle cues stored inside a video window.
+/// The window still owns the vector, while the search layer can use the
+/// returned cue text to refine the visible timestamp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoSubtitleHit {
+    pub file_id: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub subtitle: String,
+    pub exact_phrase: bool,
+    pub matched_terms: usize,
+}
+
+/// Canonical identity for a temporal vector model.  The token budget is a
+/// quality setting rather than a different embedding space, and modality
+/// reporting order is not stable across backend versions.  Keep the model,
+/// sorted modality set and output width while ignoring those incidental
+/// differences.  Empty legacy keys are handled by callers as compatible.
+fn stable_video_model_key(key: &str) -> String {
+    let key = key.strip_suffix("|video").unwrap_or(key);
+    let mut parts = key.split('|');
+    let model_and_modalities = parts.next().unwrap_or(key).trim();
+    let dim = parts.next().unwrap_or("").trim();
+    // The model identity is often an absolute Windows path (`E:\\models\\...`)
+    // and therefore contains a drive-letter colon.  The delimiter before the
+    // modality set is the *last* colon in this component; using split_once
+    // mis-parsed every such key as model `E` and made persisted video windows
+    // disappear after restart/search.
+    let Some((model, modalities)) = model_and_modalities.rsplit_once(':') else {
+        return format!("{}|{}", model_and_modalities.replace('\\', "/").to_ascii_lowercase(), dim);
+    };
+    let mut set: Vec<String> = modalities
+        .split('-')
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect();
+    set.sort();
+    set.dedup();
+    format!("{}:{}|{}", model.trim().replace('\\', "/").to_ascii_lowercase(), set.join("-"), dim)
+}
+
+/// Input token budgets change detail/latency, not the encoder's vector
+/// coordinate system. Keep image vectors searchable across those presets,
+/// but continue requiring the same model, modalities and physical width.
+pub(crate) fn image_model_key_compatible(wanted: &str, stored: &str) -> bool {
+    image_model_key_compatible_with_legacy(wanted, stored, false)
+}
+
+fn encoder_source_tag(key: &str) -> Option<&str> {
+    key.split('|').find(|part| part.starts_with("encoder="))
+}
+
+pub(crate) fn image_model_key_compatible_with_legacy(
+    wanted: &str,
+    stored: &str,
+    allow_legacy: bool,
+) -> bool {
+    if wanted.trim().is_empty() || stored.trim().is_empty() {
+        return false;
+    }
+    let wanted_tag = encoder_source_tag(wanted);
+    let stored_tag = encoder_source_tag(stored);
+    if wanted_tag == stored_tag && stable_video_model_key(wanted) == stable_video_model_key(stored) {
+        return true;
+    }
+    // Basename-only GGUF keys predate persisted encoder identity. Only an
+    // explicitly adopted legacy store can bridge them to the full source
+    // path; tagged/current records never gain this relaxed compatibility.
+    if !allow_legacy || stored_tag.is_some() {
+        return false;
+    }
+    let wanted_stable = stable_video_model_key(wanted);
+    let stored_stable = stable_video_model_key(stored);
+    let shape = |key: &str| key.rsplit_once(':').map(|(_, shape)| shape.to_string());
+    shape(&wanted_stable) == shape(&stored_stable)
+        && stable_video_model_file(wanted) == stable_video_model_file(stored)
+}
+
+/// Return the stable model family portion of a temporal-vector key.
+///
+/// Model capability discovery is allowed to change between releases (for
+/// example a GGUF projector may start reporting an audio tower after an
+/// upgrade).  That must not make already indexed video windows disappear:
+/// vectors produced by the same model and width are still in the same cosine
+/// space.  The full stable key remains useful for exact resume checks, while
+/// this family key is used as a conservative compatibility fallback.
+fn stable_video_model_family(key: &str) -> String {
+    let key = key.strip_suffix("|video").unwrap_or(key);
+    let model_and_modalities = key.split('|').next().unwrap_or(key).trim();
+    model_and_modalities
+        .rsplit_once(':')
+        .map(|(model, _)| model)
+        .unwrap_or(model_and_modalities)
+        .trim()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+/// Return a path-independent identity for a model key.  The durable key
+/// contains the absolute model path, which is useful for exact resume checks
+/// but changes when an index is moved to another installation or drive.  A
+/// video window vector is still comparable when the same model file is found
+/// at a different path, so use the normalized file name as a conservative
+/// compatibility fallback.  Keep the full family check as the preferred
+/// path; the basename fallback only applies to multimodal keys and is still
+/// guarded by the vector space and dimension checks in the SQL queries.
+fn stable_video_model_file(key: &str) -> String {
+    let key = key.strip_suffix("|video").unwrap_or(key);
+    let model_part = key.split('|').next().unwrap_or(key).trim();
+    let model = model_part
+        .rsplit_once(':')
+        .map(|(model, _)| model)
+        .unwrap_or(model_part)
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    model
+        .rsplit('/')
+        .next()
+        .unwrap_or(&model)
+        .to_string()
+}
+
+/// Return whether a temporal model key advertises a non-text modality.
+/// `|video` is a storage suffix and does not by itself mean that the model
+/// can encode video; a text-only model can still own temporal metadata in
+/// legacy databases.  This guard prevents a text-only query from reusing an
+/// image/audio video vector merely because the model family name matches.
+fn video_model_is_multimodal(key: &str) -> bool {
+    let key = key.strip_suffix("|video").unwrap_or(key);
+    let model_and_modalities = key.split('|').next().unwrap_or(key);
+    let Some((_, modalities)) = model_and_modalities.rsplit_once(':') else {
+        return false;
+    };
+    modalities
+        .split('-')
+        .any(|item| matches!(item.trim().to_ascii_lowercase().as_str(), "image" | "vision" | "audio" | "video" | "media"))
+}
+
+fn video_model_compatible(wanted: &str, stored: &str) -> bool {
+    let wanted_tag = encoder_source_tag(wanted);
+    let stored_tag = encoder_source_tag(stored);
+    if let (Some(wanted_source), Some(stored_source)) = (wanted_tag, stored_tag) {
+        if wanted_source != stored_source {
+            return false;
+        }
+    }
+    if stored.trim().is_empty() {
+        return true;
+    }
+    if stable_video_model_key(stored) == stable_video_model_key(wanted) {
+        return true;
+    }
+    if !video_model_is_multimodal(wanted) || !video_model_is_multimodal(stored) {
+        return false;
+    }
+    stable_video_model_family(stored) == stable_video_model_family(wanted)
+        || (!(wanted_tag.is_some() && stored_tag.is_some())
+            && stable_video_model_file(stored) == stable_video_model_file(wanted))
+}
+
+fn recovery_model_compatible(wanted: Option<&str>, accept_legacy: bool, stored: &str) -> bool {
+    match wanted {
+        None => true,
+        Some(_) if stored.trim().is_empty() => accept_legacy,
+        Some(wanted) if accept_legacy => video_model_compatible(wanted, stored),
+        // New/changed stores have a known source. Recovery must not use the
+        // historical basename fallback: two different model folders can each
+        // contain model.gguf. Match the complete family, physical width and
+        // adapter/native-dimension tag, while ignoring token-budget changes.
+        Some(wanted) => {
+            stable_video_model_family(wanted) == stable_video_model_family(stored)
+                && wanted.split('|').nth(1) == stored.split('|').nth(1)
+                && encoder_source_tag(wanted) == encoder_source_tag(stored)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexRoot {
     pub root: String,
@@ -111,9 +311,16 @@ pub struct Db {
     /// 而目录树面板 / 星系图在用户连续点开几层时会连着调好几次。缓存 3 秒
     /// 既能让连点几乎零成本，索引在后台跑时也只是最多滞后 3 秒。
     dir_rollup_cache: Mutex<Option<(std::time::Instant, std::sync::Arc<Vec<(String, i64, i64)>>)>>,
+    /// Short-lived cache for temporal-vector allow-lists used by semantic
+    /// video queries. Invalidated whenever a video window is written.
+    video_ids_cache: Mutex<HashMap<(String, String, usize), (std::time::Instant, Vec<i64>)>>,
 }
 
 impl Db {
+    fn clear_video_ids_cache(&self) {
+        self.video_ids_cache.lock().clear();
+    }
+
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(d) = path.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -123,13 +330,17 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "cache_size", -32768)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let db = Self { conn: Mutex::new(conn), dir_rollup_cache: Mutex::new(None) };
+        let db = Self {
+            conn: Mutex::new(conn),
+            dir_rollup_cache: Mutex::new(None),
+            video_ids_cache: Mutex::new(HashMap::new()),
+        };
         db.migrate()?;
         Ok(db)
     }
 
     pub fn migrate(&self) -> rusqlite::Result<()> {
-        let c = self.conn.lock();
+        let mut c = self.conn.lock();
         c.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS files(
@@ -217,6 +428,173 @@ impl Db {
             );
             "#,
         )?;
+        // Semantic page vectors are kept separately from the file-level FTS
+        // tables. The table is additive so existing databases and file-level
+        // vectors remain readable after an upgrade.
+        c.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS doc_vector_pages(
+                vector_id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                page_no INTEGER NOT NULL,
+                page_kind TEXT NOT NULL DEFAULT 'page',
+                content_hash TEXT NOT NULL DEFAULT '',
+                UNIQUE(file_id, page_no)
+            );
+            CREATE INDEX IF NOT EXISTS ix_doc_vector_pages_file
+                ON doc_vector_pages(file_id, page_no);
+            CREATE TABLE IF NOT EXISTS doc_image_vectors(
+                vector_id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                page_no INTEGER NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT '',
+                model_key TEXT NOT NULL DEFAULT '',
+                UNIQUE(file_id, page_no)
+            );
+            CREATE INDEX IF NOT EXISTS ix_doc_image_vectors_model ON doc_image_vectors(model_key);
+            CREATE INDEX IF NOT EXISTS ix_doc_image_vectors_file
+                ON doc_image_vectors(file_id, page_no);
+            CREATE TABLE IF NOT EXISTS video_segments(
+                vector_id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                segment_no INTEGER NOT NULL,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL,
+                subtitle TEXT NOT NULL DEFAULT '',
+                subtitle_tokens TEXT NOT NULL DEFAULT '',
+                embedding BLOB,
+                vector_space TEXT NOT NULL DEFAULT 'media',
+                vector_dim INTEGER NOT NULL DEFAULT 0,
+                model_key TEXT NOT NULL DEFAULT '',
+                UNIQUE(file_id, segment_no)
+            );
+            CREATE INDEX IF NOT EXISTS ix_video_segments_file
+                ON video_segments(file_id, segment_no);
+            -- Video searches first narrow by embedding space, dimension and
+            -- encoder identity.  Keep the temporal ordering in the index so
+            -- a large video library does not require a full table scan for
+            -- every semantic query.
+            "#,
+        )?;
+        let _ = c.execute(
+            "ALTER TABLE doc_vector_pages ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Keep a completed temporal vector beside its segment metadata. This
+        // is additive for existing installations; old rows simply have no
+        // embedding and continue to be read through the vector snapshot.
+        for (column, definition) in [
+            ("subtitle_tokens", "TEXT NOT NULL DEFAULT ''"),
+            ("embedding", "BLOB"),
+            ("vector_space", "TEXT NOT NULL DEFAULT 'media'"),
+            ("vector_dim", "INTEGER NOT NULL DEFAULT 0"),
+            ("model_key", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            let sql = format!("ALTER TABLE video_segments ADD COLUMN {column} {definition}");
+            let _ = c.execute(&sql, []);
+        }
+        // Populate the tokenized subtitle column for databases created before
+        // the CJK-aware FTS lane.  This is a one-time migration and keeps the
+        // original subtitle text untouched for display/timestamp refinement.
+        let token_rows = c
+            .prepare("SELECT vector_id,subtitle FROM video_segments WHERE subtitle<>'' AND (subtitle_tokens IS NULL OR subtitle_tokens='')")?
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !token_rows.is_empty() {
+            let tx = c.transaction()?;
+            for (vector_id, subtitle) in token_rows {
+                tx.execute(
+                    "UPDATE video_segments SET subtitle_tokens=?1 WHERE vector_id=?2",
+                    params![crate::util::index_text(&subtitle), vector_id],
+                )?;
+            }
+            tx.commit()?;
+        }
+        // Create these indexes after additive column migration.  Older
+        // installations have a six-column video_segments table, so creating
+        // the indexes in the initial schema batch would abort database open
+        // before the missing columns can be added.
+        c.execute_batch(
+            "CREATE INDEX IF NOT EXISTS ix_video_segments_space_dim_model \
+                 ON video_segments(vector_space, vector_dim, model_key, file_id, segment_no);\
+             CREATE INDEX IF NOT EXISTS ix_video_segments_file_space_dim \
+                 ON video_segments(file_id, vector_space, vector_dim, segment_no);",
+        )?;
+        // Subtitle lookup used to scan every video window with `instr()` on
+        // every query. Keep a content-backed FTS5 index so ordinary ASCII and
+        // whitespace-tokenized subtitle queries are reduced to the matching
+        // windows before the timestamp/ranking logic runs. The external
+        // content table keeps one authoritative copy of the subtitle text;
+        // triggers cover incremental writes and the one-time rebuild restores
+        // rows created by older versions.
+        c.execute_batch(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS video_subtitles_fts USING fts5(
+                subtitle,
+                content='video_segments',
+                content_rowid='vector_id'
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS video_subtitles_tokens_fts USING fts5(
+                subtitle_tokens,
+                content='video_segments',
+                content_rowid='vector_id'
+            );
+            CREATE TRIGGER IF NOT EXISTS video_subtitles_ai AFTER INSERT ON video_segments BEGIN
+                INSERT INTO video_subtitles_fts(rowid, subtitle)
+                VALUES (new.vector_id, new.subtitle);
+            END;
+            CREATE TRIGGER IF NOT EXISTS video_subtitles_ad AFTER DELETE ON video_segments BEGIN
+                INSERT INTO video_subtitles_fts(video_subtitles_fts, rowid, subtitle)
+                VALUES ('delete', old.vector_id, old.subtitle);
+            END;
+            CREATE TRIGGER IF NOT EXISTS video_subtitles_au AFTER UPDATE OF vector_id, subtitle ON video_segments BEGIN
+                INSERT INTO video_subtitles_fts(video_subtitles_fts, rowid, subtitle)
+                VALUES ('delete', old.vector_id, old.subtitle);
+                INSERT INTO video_subtitles_fts(rowid, subtitle)
+                VALUES (new.vector_id, new.subtitle);
+            END;
+            CREATE TRIGGER IF NOT EXISTS video_subtitles_tokens_ai AFTER INSERT ON video_segments BEGIN
+                INSERT INTO video_subtitles_tokens_fts(rowid, subtitle_tokens)
+                VALUES (new.vector_id, new.subtitle_tokens);
+            END;
+            CREATE TRIGGER IF NOT EXISTS video_subtitles_tokens_ad AFTER DELETE ON video_segments BEGIN
+                INSERT INTO video_subtitles_tokens_fts(video_subtitles_tokens_fts, rowid, subtitle_tokens)
+                VALUES ('delete', old.vector_id, old.subtitle_tokens);
+            END;
+            CREATE TRIGGER IF NOT EXISTS video_subtitles_tokens_au AFTER UPDATE OF vector_id, subtitle, subtitle_tokens ON video_segments BEGIN
+                INSERT INTO video_subtitles_tokens_fts(video_subtitles_tokens_fts, rowid, subtitle_tokens)
+                VALUES ('delete', old.vector_id, old.subtitle_tokens);
+                INSERT INTO video_subtitles_tokens_fts(rowid, subtitle_tokens)
+                VALUES (new.vector_id, new.subtitle_tokens);
+            END;
+            "#,
+        )?;
+        // `rebuild` is idempotent for an external-content FTS table.  Older
+        // versions did not have the triggers, and a previous one-time
+        // rebuild could also have happened before a crash.  Compare row
+        // counts so a partially migrated database is repaired once, while a
+        // healthy database does not pay a full rebuild on every launch.
+        let fts_rows: i64 = c
+            .query_row("SELECT count(*) FROM video_subtitles_fts", [], |row| row.get(0))
+            .unwrap_or(0);
+        let video_rows: i64 = c
+            .query_row("SELECT count(*) FROM video_segments", [], |row| row.get(0))
+            .unwrap_or(0);
+        if fts_rows != video_rows {
+            let _ = c.execute(
+                "INSERT INTO video_subtitles_fts(video_subtitles_fts) VALUES('rebuild')",
+                [],
+            );
+        }
+        let token_fts_rows: i64 = c
+            .query_row("SELECT count(*) FROM video_subtitles_tokens_fts", [], |row| row.get(0))
+            .unwrap_or(0);
+        if token_fts_rows != video_rows {
+            let _ = c.execute(
+                "INSERT INTO video_subtitles_tokens_fts(video_subtitles_tokens_fts) VALUES('rebuild')",
+                [],
+            );
+        }
         // 盘符是 `dir` 的纯函数（前两个字符 "E:"）。早期版本想用虚拟生成列
         // `drive` 来承载它，但 `ALTER TABLE ... ADD COLUMN` 在某些 SQLite 构建
         // 上会失败，而失败被 `let _ =` 吞掉 —— 结果是 `drive_kind_stats()` 里
@@ -295,6 +673,26 @@ impl Db {
             "INSERT INTO meta(k,v) VALUES('schema_version',?1) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
             params![FTS_SCHEMA_VERSION.to_string()],
         )?;
+        // Older PDF preflight checks split content streams on whitespace,
+        // missing valid operators such as `)Tj`/`]TJ` and text inside Forms.
+        // Retry only PDFs that were recorded as empty; keep every existing
+        // body/vector in place until its incremental replacement is ready.
+        let pdf_preflight: Option<String> = c.query_row(
+            "SELECT v FROM meta WHERE k='pdf_text_preflight_version'", [], |row| row.get(0),
+        ).optional()?;
+        if pdf_preflight.as_deref() != Some("1") {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE files SET text_state='pending',embed_state='pending' \
+                 WHERE missing=0 AND lower(ext)='pdf' AND text_state='skip' \
+                   AND NOT EXISTS (SELECT 1 FROM docs WHERE rowid=files.id AND length(trim(raw))>0)", []
+            )?;
+            tx.execute(
+                "INSERT INTO meta(k,v) VALUES('pdf_text_preflight_version','1') \
+                 ON CONFLICT(k) DO UPDATE SET v=excluded.v", []
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -316,6 +714,14 @@ impl Db {
     // ---------------- 文件表
     pub fn upsert_file(&self, f: &FileRow) -> rusqlite::Result<i64> {
         let c = self.conn.lock();
+        let previous: Option<(i64, i64)> = c
+            .query_row(
+                "SELECT size,mtime FROM files WHERE path=?1",
+                params![f.path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let changed = previous.is_some_and(|(size, mtime)| size != f.size || mtime != f.mtime);
         c.execute(
             r#"INSERT INTO files(path,dir,name,ext,kind,size,mtime,ctime,text_state,embed_state,category,tags,missing)
                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending','pending',?9,?10,0)
@@ -323,14 +729,21 @@ impl Db {
                  dir=excluded.dir, name=excluded.name, ext=excluded.ext, kind=excluded.kind,
                  size=excluded.size, mtime=excluded.mtime, ctime=excluded.ctime, missing=0,
                  thumb_key=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime THEN files.thumb_key ELSE NULL END,
-                 text_len=0, text_state='pending', embed_state='pending'"#,
+                 text_len=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime THEN files.text_len ELSE 0 END,
+                 text_state=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime THEN files.text_state ELSE 'pending' END,
+                 embed_state=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime THEN files.embed_state ELSE 'pending' END"#,
             params![f.path, f.dir, f.name, f.ext, f.kind, f.size, f.mtime, f.ctime, f.category, f.tags],
         )?;
-        // A changed file must not keep stale full-text content while it waits
-        // for the next incremental indexing pass.
-        c.execute("DELETE FROM docs WHERE rowid=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
-        c.execute("DELETE FROM page_docs WHERE file_id=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
-        c.execute("DELETE FROM doc_pages WHERE file_id=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
+        if changed {
+            // A changed file must not keep stale full-text content while it
+            // waits for the next incremental indexing pass.
+            c.execute("DELETE FROM docs WHERE rowid=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
+            c.execute("DELETE FROM page_docs WHERE file_id=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
+            c.execute("DELETE FROM doc_pages WHERE file_id=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
+            // Old temporal windows are invalid after the source changes.
+            c.execute("DELETE FROM video_segments WHERE file_id=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
+            c.execute("DELETE FROM doc_image_vectors WHERE file_id=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
+        }
         c.query_row("SELECT id FROM files WHERE path=?1", params![f.path], |row| row.get(0))
     }
 
@@ -459,6 +872,13 @@ impl Db {
             params![new_path, dir, name, ext, id],
         )?;
         tx.execute("UPDATE docs SET name=?1 WHERE rowid=?2", params![name, id])?;
+        // Page-level FTS stores a copy of the file name for ranking and
+        // filename searches. Keep it in lockstep with the file-level docs
+        // row so a rename cannot leave stale page hits behind.
+        tx.execute(
+            "UPDATE page_docs SET name=?1 WHERE file_id=?2",
+            params![name, id.to_string()],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -519,6 +939,9 @@ impl Db {
             tx.execute("DELETE FROM docs WHERE rowid=?1", params![id])?;
             tx.execute("DELETE FROM page_docs WHERE file_id=?1", params![id.to_string()])?;
             tx.execute("DELETE FROM doc_pages WHERE file_id=?1", params![id])?;
+            tx.execute("DELETE FROM doc_vector_pages WHERE file_id=?1", params![id])?;
+            tx.execute("DELETE FROM video_segments WHERE file_id=?1", params![id])?;
+            tx.execute("DELETE FROM doc_image_vectors WHERE file_id=?1", params![id])?;
             tx.execute("DELETE FROM files WHERE id=?1", params![id])?;
         }
         tx.commit()?;
@@ -568,6 +991,9 @@ impl Db {
             tx.execute("DELETE FROM docs WHERE rowid=?1", params![id])?;
             tx.execute("DELETE FROM page_docs WHERE file_id=?1", params![id.to_string()])?;
             tx.execute("DELETE FROM doc_pages WHERE file_id=?1", params![id])?;
+            tx.execute("DELETE FROM doc_vector_pages WHERE file_id=?1", params![id])?;
+            tx.execute("DELETE FROM video_segments WHERE file_id=?1", params![id])?;
+            tx.execute("DELETE FROM doc_image_vectors WHERE file_id=?1", params![id])?;
             tx.execute("DELETE FROM files WHERE id=?1", params![id])?;
         }
         tx.execute(
@@ -581,11 +1007,12 @@ impl Db {
     // ---------------- 全文索引
     /// 写入正文。docs.rowid 恒等于 files.id，重复写入即整行替换。
     pub fn set_doc(&self, file_id: i64, name: &str, body: &str, raw: &str) -> rusqlite::Result<()> {
-        let c = self.conn.lock();
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
         // FTS5 虚表对 INSERT OR REPLACE 的支持依赖 conflict 支持，直接
         // 先删后插最稳，也顺便让 rowid 不会漂移。
-        c.execute("DELETE FROM docs WHERE rowid=?1", params![file_id])?;
-        c.execute(
+        tx.execute("DELETE FROM docs WHERE rowid=?1", params![file_id])?;
+        tx.execute(
             "INSERT INTO docs(rowid, name, body, raw) VALUES(?1,?2,?3,?4)",
             params![file_id, name, body, raw],
         )?;
@@ -593,25 +1020,25 @@ impl Db {
         // emitted by the PDF/PPTX extractors; long unpaged Office/text files
         // are split into stable bounded chunks so every document has a useful
         // page number without changing the existing file-level FTS contract.
-        c.execute("DELETE FROM page_docs WHERE file_id=?1", params![file_id.to_string()])?;
-        c.execute("DELETE FROM doc_pages WHERE file_id=?1", params![file_id])?;
+        tx.execute("DELETE FROM page_docs WHERE file_id=?1", params![file_id.to_string()])?;
+        tx.execute("DELETE FROM doc_pages WHERE file_id=?1", params![file_id])?;
         for (page_no, page) in page_chunks(raw).into_iter().enumerate() {
             let page_no = page_no as i64 + 1;
             let page_body = crate::util::index_text(&page);
-            c.execute(
+            tx.execute(
                 "INSERT INTO doc_pages(file_id,page_no,body,raw) VALUES(?1,?2,?3,?4)",
                 params![file_id, page_no, page_body, page],
             )?;
-            c.execute(
+            tx.execute(
                 "INSERT INTO page_docs(file_id,page_no,name,body,raw) VALUES(?1,?2,?3,?4,?5)",
                 params![file_id.to_string(), page_no.to_string(), name, page_body, page],
             )?;
         }
-        c.execute(
+        tx.execute(
             "UPDATE files SET text_len=?1, text_state='ok' WHERE id=?2",
             params![raw.chars().count() as i64, file_id],
         )?;
-        Ok(())
+        tx.commit()
     }
 
     /// Search the page-level FTS index. The caller can use `page_no` to
@@ -629,10 +1056,864 @@ impl Db {
         rows.collect()
     }
 
+    /// Return the strongest matching logical page for each document. Scoring
+    /// pages independently prevents terms scattered across different pages
+    /// from being presented as one exact full-text match for a PDF/document.
+    pub fn search_pages_fts_relevance(
+        &self,
+        expr: &str,
+        query: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(i64, i64, f64, bool, usize)>> {
+        let mut args: Vec<rusqlite::types::Value> = vec![
+            expr.to_string().into(),
+            query.to_string().into(),
+        ];
+        let compact_expr = |column: &str| {
+            format!(
+                "lower(replace(replace(replace(replace(replace({column},' ',''),char(9),''),char(10),''),char(13),''),char(12288),''))"
+            )
+        };
+        let compact_raw = compact_expr("p.raw");
+        let compact_body = compact_expr("p.body");
+        let compact_query = "lower(replace(replace(replace(replace(replace(?2,' ',''),char(9),''),char(10),''),char(13),''),char(12288),''))";
+        let mut term_checks = Vec::with_capacity(terms.len());
+        for (index, term) in terms.iter().enumerate() {
+            let parameter = index + 3;
+            term_checks.push(format!(
+                "CASE WHEN instr({compact_body}, lower(?{parameter})) > 0 OR instr({compact_raw}, lower(?{parameter})) > 0 THEN 1 ELSE 0 END"
+            ));
+            args.push(term.clone().into());
+        }
+        let matched_terms = if term_checks.is_empty() {
+            "0".to_string()
+        } else {
+            term_checks.join(" + ")
+        };
+        let limit_parameter = terms.len() + 3;
+        args.push((limit as i64).into());
+        let sql = format!(
+            "WITH page_hits AS (\
+                 SELECT CAST(p.file_id AS INTEGER) AS file_id, \
+                        CAST(p.page_no AS INTEGER) AS page_no, \
+                        bm25(page_docs,3.0,1.0,0.0) AS rank, \
+                        (instr(lower(p.raw), lower(?2)) > 0 \
+                         OR instr(lower(p.body), lower(?2)) > 0 \
+                         OR instr({compact_raw}, {compact_query}) > 0 \
+                         OR instr({compact_body}, {compact_query}) > 0) AS exact_phrase, \
+                        ({matched_terms}) AS matched_terms \
+                 FROM page_docs p \
+                 JOIN files f ON f.id=CAST(p.file_id AS INTEGER) AND f.missing=0 \
+                 WHERE page_docs MATCH ?1\
+             ), ranked_pages AS (\
+                 SELECT file_id,page_no,rank,exact_phrase,matched_terms, \
+                        ROW_NUMBER() OVER (PARTITION BY file_id \
+                            ORDER BY exact_phrase DESC, matched_terms DESC, rank ASC, page_no ASC) AS page_rank \
+                 FROM page_hits\
+             ) \
+             SELECT file_id,page_no,rank,exact_phrase,matched_terms \
+             FROM ranked_pages WHERE page_rank=1 \
+             ORDER BY exact_phrase DESC,matched_terms DESC,rank ASC,file_id ASC \
+             LIMIT ?{limit_parameter}"
+        );
+        let c = self.conn.lock();
+        let mut statement = c.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
     pub fn get_doc_raw(&self, file_id: i64) -> rusqlite::Result<Option<String>> {
         let c = self.conn.lock();
         c.query_row("SELECT raw FROM docs WHERE rowid=?1", params![file_id], |r| r.get(0))
             .optional()
+    }
+
+    /// Fetch document bodies for a result page in bounded batches. Search used
+    /// to call `get_doc_raw` once per hit while building snippets, which meant
+    /// a 500-result first page acquired the SQLite mutex 500 times. Keeping
+    /// this lookup batched makes snippets an O(1) number of DB round trips and
+    /// leaves the expensive vector/FTS work unaffected.
+    pub fn doc_raw_by_ids(&self, ids: &[i64]) -> HashMap<i64, String> {
+        let mut out = HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return out;
+        }
+        let c = self.conn.lock();
+        for batch in ids.chunks(400) {
+            let placeholders = batch
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT rowid, raw FROM docs WHERE rowid IN ({placeholders})");
+            let Ok(mut statement) = c.prepare(&sql) else { continue };
+            let Ok(rows) = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            }) else { continue };
+            for row in rows.flatten() {
+                out.insert(row.0, row.1);
+            }
+        }
+        out
+    }
+
+    /// Return the stable logical pages already materialized by `set_doc`.
+    /// The page number is one-based and applies equally to PDF pages, PPTX
+    /// slides, explicit DOCX page breaks, and bounded fallback chunks.
+    pub fn doc_page_texts(&self, file_id: i64) -> rusqlite::Result<Vec<(i64, String)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT page_no, raw FROM doc_pages WHERE file_id=?1 ORDER BY page_no",
+        )?;
+        let rows = st.query_map(params![file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Get semantic page-vector IDs before replacing a document's mapping.
+    /// The caller removes obsolete slots from the in-memory vector store.
+    pub fn doc_page_vector_ids(&self, file_id: i64) -> rusqlite::Result<Vec<i64>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT vector_id FROM doc_vector_pages WHERE file_id=?1 ORDER BY page_no",
+        )?;
+        let rows = st.query_map(params![file_id], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    pub fn doc_page_vector_records(
+        &self,
+        file_id: i64,
+    ) -> rusqlite::Result<Vec<(i64, i64, String, String)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT vector_id,page_no,page_kind,content_hash FROM doc_vector_pages WHERE file_id=?1 ORDER BY page_no",
+        )?;
+        let rows = st.query_map(params![file_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Replace the page-to-vector mapping after page vectors have been
+    /// generated. This table is additive and safe for older databases.
+    pub fn replace_doc_vector_pages(
+        &self,
+        file_id: i64,
+        pages: &[(i64, i64, &str)],
+    ) -> rusqlite::Result<()> {
+        let pages: Vec<(i64, i64, &str, String)> = pages
+            .iter()
+            .map(|(vector_id, page_no, page_kind)| (*vector_id, *page_no, *page_kind, String::new()))
+            .collect();
+        self.replace_doc_vector_pages_with_hashes(file_id, &pages)
+    }
+
+    pub fn replace_doc_vector_pages_with_hashes(
+        &self,
+        file_id: i64,
+        pages: &[(i64, i64, &str, String)],
+    ) -> rusqlite::Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute(
+            "DELETE FROM doc_vector_pages WHERE file_id=?1",
+            params![file_id],
+        )?;
+        {
+            let mut st = tx.prepare(
+                "INSERT INTO doc_vector_pages(vector_id,file_id,page_no,page_kind,content_hash) VALUES(?1,?2,?3,?4,?5)",
+            )?;
+            for (vector_id, page_no, page_kind, content_hash) in pages {
+                st.execute(params![vector_id, file_id, page_no, page_kind, content_hash])?;
+            }
+        }
+        tx.commit()
+    }
+
+    pub fn doc_vector_page_source(&self, vector_id: i64) -> rusqlite::Result<Option<(i64, i64, String)>> {
+        let c = self.conn.lock();
+        c.query_row(
+            "SELECT file_id,page_no,page_kind FROM doc_vector_pages WHERE vector_id=?1",
+            params![vector_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+    }
+
+    /// Resolve synthetic document-page vector IDs in bounded batches. Search
+    /// frequently examines hundreds of candidates; doing one SQLite query per
+    /// candidate causes lock contention and turns result assembly into an N+1
+    /// workload.
+    pub fn doc_vector_page_sources(&self, vector_ids: &[i64]) -> HashMap<i64, (i64, i64, String)> {
+        let mut out = HashMap::with_capacity(vector_ids.len());
+        for batch in vector_ids.chunks(400) {
+            if batch.is_empty() {
+                continue;
+            }
+            let ids = batch.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT vector_id,file_id,page_no,page_kind FROM doc_vector_pages WHERE vector_id IN ({ids})"
+            );
+            let c = self.conn.lock();
+            let Ok(mut st) = c.prepare(&sql) else { continue };
+            let Ok(rows) = st.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)))
+            }) else { continue };
+            for row in rows.flatten() {
+                out.insert(row.0, row.1);
+            }
+        }
+        out
+    }
+
+    pub fn doc_image_vector_ids(&self, file_id: i64) -> rusqlite::Result<Vec<i64>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare("SELECT vector_id FROM doc_image_vectors WHERE file_id=?1 ORDER BY page_no")?;
+        let rows = st.query_map(params![file_id], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    pub fn doc_image_vector_ids_for_model(&self, model_key: &str) -> rusqlite::Result<Vec<i64>> {
+        self.doc_image_vector_ids_for_model_with_legacy(model_key, false)
+    }
+
+    pub fn doc_image_vector_ids_for_model_with_legacy(
+        &self,
+        model_key: &str,
+        allow_legacy: bool,
+    ) -> rusqlite::Result<Vec<i64>> {
+        let c = self.conn.lock();
+        let keys = {
+            let mut statement = c.prepare("SELECT DISTINCT model_key FROM doc_image_vectors")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut ids = Vec::new();
+        let mut st = c.prepare("SELECT vector_id FROM doc_image_vectors WHERE model_key=?1 ORDER BY vector_id")?;
+        for key in keys.into_iter().filter(|key| image_model_key_compatible_with_legacy(model_key, key, allow_legacy)) {
+            let rows = st.query_map(params![key], |row| row.get::<_, i64>(0))?;
+            ids.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    pub fn doc_image_vector_records(
+        &self,
+        file_id: i64,
+    ) -> rusqlite::Result<Vec<(i64, i64, String, String)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT vector_id,page_no,content_hash,model_key FROM doc_image_vectors WHERE file_id=?1 ORDER BY page_no",
+        )?;
+        let rows = st.query_map(params![file_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        rows.collect()
+    }
+
+    pub fn replace_doc_image_vectors(
+        &self,
+        file_id: i64,
+        pages: &[(i64, i64, String, String)],
+    ) -> rusqlite::Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM doc_image_vectors WHERE file_id=?1", params![file_id])?;
+        let mut st = tx.prepare(
+            "INSERT INTO doc_image_vectors(vector_id,file_id,page_no,content_hash,model_key) VALUES(?1,?2,?3,?4,?5)",
+        )?;
+        for (vector_id, page_no, content_hash, model_key) in pages {
+            st.execute(params![vector_id, file_id, page_no, content_hash, model_key])?;
+        }
+        drop(st);
+        tx.commit()
+    }
+
+    /// Insert or replace only the supplied PDF image pages.  Image vectors
+    /// arrive in bounded chunks from the decoder queue, so replacing a whole
+    /// document on every chunk would delete pages that have already been
+    /// committed.  The unique `(file_id,page_no)` key makes this operation
+    /// idempotent and safe to resume after cancellation.
+    pub fn upsert_doc_image_vectors(
+        &self,
+        file_id: i64,
+        pages: &[(i64, i64, String, String)],
+    ) -> rusqlite::Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let mut st = tx.prepare(
+            "INSERT INTO doc_image_vectors(vector_id,file_id,page_no,content_hash,model_key) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(file_id,page_no) DO UPDATE SET vector_id=excluded.vector_id, content_hash=excluded.content_hash, model_key=excluded.model_key",
+        )?;
+        for (vector_id, page_no, content_hash, model_key) in pages {
+            st.execute(params![vector_id, file_id, page_no, content_hash, model_key])?;
+        }
+        drop(st);
+        tx.commit()
+    }
+
+    pub fn doc_image_vector_source(&self, vector_id: i64) -> rusqlite::Result<Option<(i64, i64)>> {
+        let c = self.conn.lock();
+        c.query_row(
+            "SELECT file_id,page_no FROM doc_image_vectors WHERE vector_id=?1",
+            params![vector_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+    }
+
+    pub fn doc_image_vector_source_with_model(
+        &self,
+        vector_id: i64,
+    ) -> rusqlite::Result<Option<(i64, i64, String)>> {
+        let c = self.conn.lock();
+        c.query_row(
+            "SELECT file_id,page_no,model_key FROM doc_image_vectors WHERE vector_id=?1",
+            params![vector_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+    }
+
+    /// Batched variant of `doc_image_vector_source_with_model` used by search
+    /// result assembly to avoid one SQLite round trip per vector candidate.
+    pub fn doc_image_vector_sources_with_model(
+        &self,
+        vector_ids: &[i64],
+    ) -> HashMap<i64, (i64, i64, String)> {
+        let mut out = HashMap::with_capacity(vector_ids.len());
+        for batch in vector_ids.chunks(400) {
+            if batch.is_empty() {
+                continue;
+            }
+            let ids = batch.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT vector_id,file_id,page_no,model_key FROM doc_image_vectors WHERE vector_id IN ({ids})"
+            );
+            let c = self.conn.lock();
+            let Ok(mut st) = c.prepare(&sql) else { continue };
+            let Ok(rows) = st.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)))
+            }) else { continue };
+            for row in rows.flatten() {
+                out.insert(row.0, row.1);
+            }
+        }
+        out
+    }
+
+    pub fn replace_video_segments(
+        &self,
+        file_id: i64,
+        segments: &[VideoSegmentMeta],
+    ) -> rusqlite::Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM video_segments WHERE file_id=?1", params![file_id])?;
+        {
+            let mut st = tx.prepare(
+                "INSERT INTO video_segments(vector_id,file_id,segment_no,start_ms,end_ms,subtitle,subtitle_tokens) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            )?;
+            for segment in segments {
+                st.execute(params![
+                    segment.vector_id,
+                    file_id,
+                    segment.segment_no,
+                    segment.start_ms,
+                    segment.end_ms,
+                    segment.subtitle,
+                    crate::util::index_text(&segment.subtitle),
+                ])?;
+            }
+        }
+        let result = tx.commit();
+        if result.is_ok() {
+            self.clear_video_ids_cache();
+        }
+        result
+    }
+
+    /// Persist one completed temporal window without replacing earlier
+    /// windows. This lets long video indexing survive cancellation and makes
+    /// already finished segments available to search immediately.
+    pub fn upsert_video_segment(&self, segment: &VideoSegmentMeta) -> rusqlite::Result<()> {
+        let c = self.conn.lock();
+        let result = c.execute(
+            "INSERT INTO video_segments(vector_id,file_id,segment_no,start_ms,end_ms,subtitle,subtitle_tokens) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7) \
+             ON CONFLICT(file_id,segment_no) DO UPDATE SET \
+             vector_id=excluded.vector_id,start_ms=excluded.start_ms,end_ms=excluded.end_ms,subtitle=excluded.subtitle,subtitle_tokens=excluded.subtitle_tokens",
+            params![
+                segment.vector_id,
+                segment.file_id,
+                segment.segment_no,
+                segment.start_ms,
+                segment.end_ms,
+                segment.subtitle,
+                crate::util::index_text(&segment.subtitle),
+            ],
+        );
+        drop(c);
+        if result.is_ok() {
+            self.clear_video_ids_cache();
+        }
+        result.map(|_| ())
+    }
+
+    /// Atomically save the searchable vector and its temporal metadata. The
+    /// vector payload is a compact little-endian f32 blob. `vector_space`
+    /// distinguishes the primary embedding space from the fallback media
+    /// space so startup recovery restores it to the correct store.
+    pub fn upsert_video_segment_embedding(
+        &self,
+        segment: &VideoSegmentMeta,
+        vector_space: &str,
+        model_key: &str,
+        vector: &[f32],
+    ) -> rusqlite::Result<()> {
+        let mut embedding = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
+        for value in vector {
+            embedding.extend_from_slice(&value.to_le_bytes());
+        }
+        let c = self.conn.lock();
+        c.execute(
+            "INSERT INTO video_segments(\
+                vector_id,file_id,segment_no,start_ms,end_ms,subtitle,subtitle_tokens,embedding,vector_space,vector_dim,model_key\
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+             ON CONFLICT(file_id,segment_no) DO UPDATE SET \
+                vector_id=excluded.vector_id,start_ms=excluded.start_ms,end_ms=excluded.end_ms,\
+                subtitle=excluded.subtitle,subtitle_tokens=excluded.subtitle_tokens,embedding=excluded.embedding,\
+                vector_space=excluded.vector_space,vector_dim=excluded.vector_dim,\
+                model_key=excluded.model_key",
+            params![
+                segment.vector_id,
+                segment.file_id,
+                segment.segment_no,
+                segment.start_ms,
+                segment.end_ms,
+                segment.subtitle,
+                crate::util::index_text(&segment.subtitle),
+                embedding,
+                vector_space,
+                vector.len() as i64,
+                model_key,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Batch variant of [`upsert_video_segment_embedding`].  Video decoding
+    /// and inference are intentionally kept outside the transaction; callers
+    /// can flush a small group (normally 4–8 windows) so completed windows
+    /// remain visible to search without paying one fsync per 30-second
+    /// segment.
+    pub fn upsert_video_segment_embeddings_batch(
+        &self,
+        rows: &[VideoSegmentEmbeddingRow],
+    ) -> rusqlite::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        {
+            let mut st = tx.prepare(
+                "INSERT INTO video_segments(\
+                    vector_id,file_id,segment_no,start_ms,end_ms,subtitle,subtitle_tokens,embedding,vector_space,vector_dim,model_key\
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                 ON CONFLICT(file_id,segment_no) DO UPDATE SET \
+                    vector_id=excluded.vector_id,start_ms=excluded.start_ms,end_ms=excluded.end_ms,\
+                    subtitle=excluded.subtitle,subtitle_tokens=excluded.subtitle_tokens,embedding=excluded.embedding,\
+                    vector_space=excluded.vector_space,vector_dim=excluded.vector_dim,\
+                    model_key=excluded.model_key",
+            )?;
+            for row in rows {
+                let mut embedding = Vec::with_capacity(
+                    row.vector.len() * std::mem::size_of::<f32>(),
+                );
+                for value in &row.vector {
+                    embedding.extend_from_slice(&value.to_le_bytes());
+                }
+                st.execute(params![
+                    row.segment.vector_id,
+                    row.segment.file_id,
+                    row.segment.segment_no,
+                    row.segment.start_ms,
+                    row.segment.end_ms,
+                    row.segment.subtitle,
+                    crate::util::index_text(&row.segment.subtitle),
+                    embedding,
+                    row.vector_space,
+                    row.vector.len() as i64,
+                    row.model_key,
+                ])?;
+            }
+        }
+        let result = tx.commit();
+        if result.is_ok() {
+            self.clear_video_ids_cache();
+        }
+        result
+    }
+
+    /// Return the temporal windows that already have a durable embedding.
+    /// These rows are kept when an indexing run is cancelled so a resumed run
+    /// can skip work that has already been encoded.
+    pub fn completed_video_segments(
+        &self,
+        file_id: i64,
+        vector_space: &str,
+        model_key: &str,
+        vector_dim: usize,
+    ) -> rusqlite::Result<std::collections::HashSet<i64>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT segment_no FROM video_segments \
+             WHERE file_id=?1 AND vector_space=?2 AND model_key=?3 AND vector_dim=?4 \
+               AND embedding IS NOT NULL AND length(embedding)>0",
+        )?;
+        let rows = st.query_map(params![file_id, vector_space, model_key, vector_dim as i64], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        rows.collect()
+    }
+
+    /// Compatibility form of [`completed_video_segments`] used by search
+    /// scopes.  Changing a media token-budget setting does not change the
+    /// model's output space, so older completed windows remain searchable.
+    pub fn completed_video_segments_compatible(
+        &self,
+        file_id: i64,
+        vector_space: &str,
+        model_key: &str,
+        vector_dim: usize,
+    ) -> rusqlite::Result<std::collections::HashSet<i64>> {
+        let wildcard_model = model_key.trim().is_empty();
+        let wanted_key = stable_video_model_key(model_key);
+        let wanted_family = stable_video_model_family(model_key);
+        let c = self.conn.lock();
+        // Older releases persisted temporal vectors before the `|video`
+        // suffix was added to the model identity (and a few very old rows
+        // have an empty model_key).  Keep those durable windows searchable
+        // when the current model/key is otherwise compatible.  The vector
+        // dimension and space guards still prevent mixing text/media stores
+        // or different output widths.
+        let mut st = c.prepare(
+            "SELECT segment_no,model_key FROM video_segments \
+             WHERE file_id=?1 AND vector_space=?2 AND vector_dim=?3 \
+               AND embedding IS NOT NULL AND length(embedding)>0",
+        )?;
+        let rows = st.query_map(params![file_id, vector_space, vector_dim as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        rows.filter_map(|row| match row {
+            Ok((segment, stored))
+                if wildcard_model
+                    || video_model_compatible(
+                    model_key,
+                    stored.as_deref().unwrap_or_default(),
+                )
+                    || (stable_video_model_key(stored.as_deref().unwrap_or_default()) == wanted_key
+                        && stable_video_model_family(stored.as_deref().unwrap_or_default()) == wanted_family) =>
+            {
+                Some(Ok(segment))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+    }
+
+    /// Return all durable video-window vector IDs for one embedding identity.
+    ///
+    /// Explicit image/audio searches often skip loading the complete files
+    /// table when no structural filters are active. In that fast path the
+    /// caller still needs a precise allow-list for synthetic video IDs;
+    /// querying it directly avoids accidentally treating an empty file-row
+    /// list as "no video vectors".
+    pub fn video_segment_vector_ids_for_model(
+        &self,
+        vector_space: &str,
+        model_key: &str,
+        vector_dim: usize,
+    ) -> rusqlite::Result<Vec<i64>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT vector_id FROM video_segments \
+             WHERE vector_space=?1 AND model_key=?2 AND vector_dim=?3 \
+               AND embedding IS NOT NULL AND length(embedding)>0 \
+             ORDER BY file_id,segment_no",
+        )?;
+        let rows = st.query_map(
+            params![vector_space, model_key, vector_dim as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        rows.collect()
+    }
+
+    /// Return temporal video vectors for the same model, modality set and
+    /// output dimension even when the media token budget changed.  The token
+    /// budget is an indexing quality/throughput setting, not a different
+    /// embedding space; keeping it in the durable key is useful for exact
+    /// resume checks, but an exact-key search would make all older videos
+    /// disappear after the user changes that setting.
+    ///
+    /// The key format is `<model>:<modalities>|<dim>|<budget>|video`.  Match
+    /// the stable `<model>:<modalities>|<dim>` prefix and the `|video` suffix,
+    /// while retaining the vector dimension and space guards.
+    pub fn video_segment_vector_ids_for_compatible_model(
+        &self,
+        vector_space: &str,
+        model_key: &str,
+        vector_dim: usize,
+    ) -> rusqlite::Result<Vec<i64>> {
+        let cache_key = (vector_space.to_string(), model_key.to_string(), vector_dim);
+        {
+            let mut cache = self.video_ids_cache.lock();
+            if let Some((created, ids)) = cache.get(&cache_key).cloned() {
+                if created.elapsed() <= std::time::Duration::from_secs(2) {
+                    return Ok(ids);
+                }
+                cache.remove(&cache_key);
+            }
+        }
+        let wildcard_model = model_key.trim().is_empty();
+        let wanted_key = stable_video_model_key(model_key);
+        let wanted_family = stable_video_model_family(model_key);
+        let c = self.conn.lock();
+        // Include legacy rows written without the `|video` suffix.  Very old
+        // installs also have no durable embedding blob (the vector lived only
+        // in the flat vector snapshot), with vector_dim=0/model_key=''.  The
+        // caller verifies the returned synthetic ID exists in the selected
+        // VectorStore, so admitting that legacy shape restores compatibility
+        // without comparing vectors from an unknown dimension.
+        let mut st = c.prepare(
+            "SELECT vector_id,model_key FROM video_segments \
+             WHERE vector_space=?1 AND (\
+                 (vector_dim=?2 AND embedding IS NOT NULL AND length(embedding)>0)\
+                 OR (vector_dim=0 AND (embedding IS NULL OR length(embedding)=0)\
+                     AND (model_key IS NULL OR trim(model_key)=''))\
+             ) \
+             ORDER BY file_id,segment_no",
+        )?;
+        let rows = st.query_map(params![vector_space, vector_dim as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let ids = rows.filter_map(|row| match row {
+            Ok((vector_id, stored))
+                if wildcard_model
+                    || video_model_compatible(
+                    model_key,
+                    stored.as_deref().unwrap_or_default(),
+                )
+                    || (stable_video_model_key(stored.as_deref().unwrap_or_default()) == wanted_key
+                        && stable_video_model_family(stored.as_deref().unwrap_or_default()) == wanted_family) =>
+            {
+                Some(Ok(vector_id))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.video_ids_cache
+            .lock()
+            .insert(cache_key, (std::time::Instant::now(), ids.clone()));
+        Ok(ids)
+    }
+
+    /// Restore video vectors whose SQLite payload is newer than the last
+    /// vector-store checkpoint. Existing keys are left untouched, so recovery
+    /// never duplicates or overwrites a valid snapshot entry.
+    pub fn restore_video_segment_vectors(
+        &self,
+        primary: &crate::vector::VectorStore,
+        media: &crate::vector::VectorStore,
+    ) -> Result<usize, String> {
+        let primary_key = primary.encoder_model_key();
+        let media_key = media.encoder_model_key();
+        let primary_legacy = primary.accepts_unmarked_vectors();
+        let media_legacy = media.accepts_unmarked_vectors();
+        let rows = {
+            let c = self.conn.lock();
+            let mut st = c
+                .prepare(
+                    "SELECT vector_id,vector_space,vector_dim,embedding,model_key \
+                     FROM video_segments WHERE embedding IS NOT NULL",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = st
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+        };
+
+        let mut restored = 0usize;
+        let mut primary_changed = false;
+        let mut media_changed = false;
+        for (vector_id, space, stored_dim, bytes, model_key) in rows {
+            if bytes.is_empty() || bytes.len() % std::mem::size_of::<f32>() != 0 {
+                continue;
+            }
+            let store = if space == "primary" { primary } else { media };
+            let (wanted, legacy) = if space == "primary" {
+                (primary_key.as_deref(), primary_legacy)
+            } else {
+                (media_key.as_deref(), media_legacy)
+            };
+            if !recovery_model_compatible(wanted, legacy, &model_key) {
+                continue;
+            }
+            if stored_dim != store.dim() as i64 || store.has(vector_id) {
+                continue;
+            }
+            let vector = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<_>>();
+            if vector.len() != store.dim() || vector.iter().any(|value| !value.is_finite()) {
+                continue;
+            }
+            store.add(vector_id, &vector);
+            restored += 1;
+            if space == "primary" {
+                primary_changed = true;
+            } else {
+                media_changed = true;
+            }
+        }
+        if primary_changed {
+            primary.save().map_err(|error| error.to_string())?;
+        }
+        if media_changed {
+            media.save().map_err(|error| error.to_string())?;
+        }
+        Ok(restored)
+    }
+
+    /// Restore only one video's durable windows after an in-place resume.
+    /// Unlike the startup-wide restore this keeps an indexing pass O(windows
+    /// in this file), rather than rescanning and re-saving every video in the
+    /// database after each completed file.
+    pub fn restore_video_segment_vectors_for_file(
+        &self,
+        file_id: i64,
+        primary: &crate::vector::VectorStore,
+        media: &crate::vector::VectorStore,
+    ) -> Result<usize, String> {
+        let primary_key = primary.encoder_model_key();
+        let media_key = media.encoder_model_key();
+        let primary_legacy = primary.accepts_unmarked_vectors();
+        let media_legacy = media.accepts_unmarked_vectors();
+        let rows = {
+            let c = self.conn.lock();
+            let mut st = c.prepare(
+                "SELECT vector_id,vector_space,vector_dim,embedding,model_key \
+                 FROM video_segments WHERE file_id=?1 AND embedding IS NOT NULL",
+            ).map_err(|error| error.to_string())?;
+            let rows = st.query_map(params![file_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            }).map_err(|error| error.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| error.to_string())?
+        };
+        let mut restored = 0usize;
+        let mut primary_changed = false;
+        let mut media_changed = false;
+        for (vector_id, space, stored_dim, bytes, model_key) in rows {
+            let store = if space == "primary" { primary } else { media };
+            let (wanted, legacy) = if space == "primary" {
+                (primary_key.as_deref(), primary_legacy)
+            } else {
+                (media_key.as_deref(), media_legacy)
+            };
+            if !recovery_model_compatible(wanted, legacy, &model_key) {
+                continue;
+            }
+            if bytes.is_empty() || stored_dim != store.dim() as i64 || store.has(vector_id)
+                || bytes.len() != store.dim() * std::mem::size_of::<f32>()
+            {
+                continue;
+            }
+            let vector = bytes.chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<_>>();
+            if vector.iter().any(|value| !value.is_finite()) {
+                continue;
+            }
+            store.add(vector_id, &vector);
+            restored += 1;
+            if space == "primary" { primary_changed = true; } else { media_changed = true; }
+        }
+        if primary_changed { primary.save().map_err(|error| error.to_string())?; }
+        if media_changed { media.save().map_err(|error| error.to_string())?; }
+        Ok(restored)
+    }
+
+    pub fn video_segment_by_vector_id(
+        &self,
+        vector_id: i64,
+    ) -> rusqlite::Result<Option<(i64, i64, i64, String)>> {
+        let c = self.conn.lock();
+        c.query_row(
+            "SELECT file_id,start_ms,end_ms,subtitle FROM video_segments WHERE vector_id=?1",
+            params![vector_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+    }
+
+    /// Batched variant of `video_segment_by_vector_id` for semantic and
+    /// cross-modal searches. The vector store may return many temporal
+    /// windows, so resolving them one by one is disproportionately expensive.
+    pub fn video_segments_by_vector_ids(
+        &self,
+        vector_ids: &[i64],
+    ) -> HashMap<i64, (i64, i64, i64, String)> {
+        let mut out = HashMap::with_capacity(vector_ids.len());
+        for batch in vector_ids.chunks(400) {
+            if batch.is_empty() {
+                continue;
+            }
+            let ids = batch.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT vector_id,file_id,start_ms,end_ms,subtitle FROM video_segments WHERE vector_id IN ({ids})"
+            );
+            let c = self.conn.lock();
+            let Ok(mut st) = c.prepare(&sql) else { continue };
+            let Ok(rows) = st.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?)))
+            }) else { continue };
+            for row in rows.flatten() {
+                out.insert(row.0, row.1);
+            }
+        }
+        out
     }
 
     /// FTS 检索，返回 (file_id, bm25 分数)，分数越小越相关，这里转成升序。
@@ -651,6 +1932,294 @@ impl Db {
         rows.collect()
     }
 
+    /// Return full-text hits together with phrase exactness and how many
+    /// normalized query terms occur in the indexed body. BM25 is useful for
+    /// ordering, but its corpus-relative values are not a user-facing
+    /// relevance score.
+    pub fn search_fts_relevance(
+        &self,
+        expr: &str,
+        query: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(i64, f64, bool, usize)>> {
+        let mut args: Vec<rusqlite::types::Value> = vec![
+            expr.to_string().into(),
+            query.to_string().into(),
+        ];
+        // Keep both the original and a whitespace-free representation. PDF
+        // extraction often splits a CJK phrase across line breaks, while the
+        // FTS body stores CJK bigrams separated by spaces.
+        let compact_expr = |column: &str| {
+            format!(
+                "lower(replace(replace(replace(replace(replace({column},' ',''),char(9),''),char(10),''),char(13),''),char(12288),''))"
+            )
+        };
+        let compact_raw = compact_expr("raw");
+        let compact_body = compact_expr("body");
+        let compact_query = "lower(replace(replace(replace(replace(replace(?2,' ',''),char(9),''),char(10),''),char(13),''),char(12288),''))";
+        let mut term_checks = Vec::with_capacity(terms.len());
+        for (index, term) in terms.iter().enumerate() {
+            let parameter = index + 3;
+            term_checks.push(format!(
+                "CASE WHEN instr({compact_body}, lower(?{parameter})) > 0 OR instr({compact_raw}, lower(?{parameter})) > 0 THEN 1 ELSE 0 END"
+            ));
+            args.push(term.clone().into());
+        }
+        let matched_terms = if term_checks.is_empty() {
+            "0".to_string()
+        } else {
+            term_checks.join(" + ")
+        };
+        let limit_parameter = terms.len() + 3;
+        args.push((limit as i64).into());
+        let sql = format!(
+            "SELECT docs.rowid, bm25(docs,2.0,1.0,0.0), \
+             (instr(lower(raw), lower(?2)) > 0 \
+                OR instr(lower(body), lower(?2)) > 0 \
+                OR instr({compact_raw}, {compact_query}) > 0 \
+                OR instr({compact_body}, {compact_query}) > 0), ({matched_terms}) \
+             FROM docs JOIN files f ON f.id=docs.rowid AND f.missing=0 \
+             WHERE docs MATCH ?1 ORDER BY 2 LIMIT ?{limit_parameter}"
+        );
+        let c = self.conn.lock();
+        let mut statement = c.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, usize>(3)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Search timestamped video subtitles through the maintained FTS5 table.
+    ///
+    /// Subtitle text is persisted as part of each 30-second window and may
+    /// contain cue markers that the search layer turns into an exact time.
+    /// A literal fallback is retained for CJK/one-character queries, because
+    /// SQLite's default unicode61 tokenizer intentionally does not split
+    /// every ideographic phrase into independent terms.
+    pub fn search_video_subtitle_relevance(
+        &self,
+        query: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<VideoSubtitleHit>> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Keep a literal fallback for one-character/ASCII queries whose
+        // tokenizer intentionally omits short words.  Returning early for an
+        // empty term list made subtitle-only video windows impossible to find
+        // for inputs such as "x", "A", or punctuation-separated labels.
+        // The fallback is still parameterized and is only used for the
+        // subtitle table; normal document FTS keeps its existing token rules.
+        let fallback_term;
+        let terms: &[String] = if terms.is_empty() {
+            fallback_term = query.trim().to_lowercase();
+            std::slice::from_ref(&fallback_term)
+        } else {
+            terms
+        };
+        // Quote each term before passing it to MATCH.  This prevents user
+        // punctuation from becoming FTS operators and lets SQLite use its
+        // inverted index instead of scanning every 30-second window.
+        let fts_terms = terms
+            .iter()
+            .map(|term| {
+                let escaped = term.replace('"', "\"\"");
+                format!("\"{escaped}\"")
+            })
+            .filter(|term| term.len() > 2)
+            .collect::<Vec<_>>();
+        let fts_expr = if fts_terms.is_empty() {
+            format!("\"{}\"", query.replace('"', "\"\""))
+        } else {
+            fts_terms.join(" OR ")
+        };
+
+        let mut fts_args: Vec<rusqlite::types::Value> = vec![query.to_string().into()];
+        let mut term_checks = Vec::with_capacity(terms.len());
+        for (index, term) in terms.iter().enumerate() {
+            let parameter = index + 2;
+            term_checks.push(format!(
+                "CASE WHEN instr(lower(vs.subtitle), lower(?{parameter})) > 0 THEN 1 ELSE 0 END"
+            ));
+            fts_args.push(term.clone().into());
+        }
+        let matched_terms = if term_checks.is_empty() {
+            "0".to_string()
+        } else {
+            term_checks.join(" + ")
+        };
+        // Parameters: ?1=query, ?2..terms, ?N=FTS expression, ?N+1=limit.
+        let fts_parameter = terms.len() + 2;
+        let limit_parameter = terms.len() + 3;
+        fts_args.push(fts_expr.clone().into());
+        fts_args.push((limit as i64).into());
+        let fts_sql = format!(
+            "SELECT vs.file_id,vs.start_ms,vs.end_ms,vs.subtitle, \
+                    (instr(lower(vs.subtitle), lower(?1)) > 0) AS exact_phrase, \
+                    ({matched_terms}) AS matched_terms, \
+                    bm25(video_subtitles_tokens_fts) AS rank \
+             FROM video_subtitles_tokens_fts \
+             JOIN video_segments vs ON vs.vector_id=video_subtitles_tokens_fts.rowid \
+             JOIN files f ON f.id=vs.file_id AND f.missing=0 \
+             WHERE video_subtitles_tokens_fts MATCH ?{fts_parameter} \
+             ORDER BY exact_phrase DESC, matched_terms DESC, rank ASC, \
+                      length(vs.subtitle) ASC, vs.file_id ASC, vs.segment_no ASC \
+             LIMIT ?{limit_parameter}"
+        );
+        let fts_rows = {
+            let c = self.conn.lock();
+            let mut statement = c.prepare(&fts_sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(fts_args), |row| {
+                Ok(VideoSubtitleHit {
+                    file_id: row.get(0)?,
+                    start_ms: row.get(1)?,
+                    end_ms: row.get(2)?,
+                    subtitle: row.get(3)?,
+                    exact_phrase: row.get(4)?,
+                    matched_terms: row.get(5)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        // The tokenized table was added after the original subtitle FTS table.
+        // Some upgraded databases can therefore have a missing/empty
+        // `subtitle_tokens` value even though the raw subtitle index is
+        // healthy.  Also query the raw index when the tokenized result did
+        // not produce an exact phrase or complete term coverage: a common
+        // token can otherwise fill the LIMIT and hide the window containing
+        // the user's specific phrase.  Both sides are indexed FTS queries;
+        // this is still bounded and avoids a video-table scan.
+        let needs_raw_fallback = fts_rows.is_empty()
+            || !fts_rows.iter().any(|hit| {
+                hit.exact_phrase || (terms.len() > 1 && hit.matched_terms >= terms.len())
+            });
+        let fts_rows = if needs_raw_fallback {
+            let raw_parameter = terms.len() + 2;
+            let raw_limit_parameter = terms.len() + 3;
+            let raw_sql = format!(
+                "SELECT vs.file_id,vs.start_ms,vs.end_ms,vs.subtitle, \
+                        (instr(lower(vs.subtitle), lower(?1)) > 0) AS exact_phrase, \
+                        ({matched_terms}) AS matched_terms, \
+                        bm25(video_subtitles_fts) AS rank \
+                 FROM video_subtitles_fts \
+                 JOIN video_segments vs ON vs.vector_id=video_subtitles_fts.rowid \
+                 JOIN files f ON f.id=vs.file_id AND f.missing=0 \
+                 WHERE video_subtitles_fts MATCH ?{raw_parameter} \
+                 ORDER BY exact_phrase DESC, matched_terms DESC, rank ASC, \
+                          length(vs.subtitle) ASC, vs.file_id ASC, vs.segment_no ASC \
+                 LIMIT ?{raw_limit_parameter}"
+            );
+            let mut raw_args: Vec<rusqlite::types::Value> = vec![query.to_string().into()];
+            for term in terms {
+                raw_args.push(term.clone().into());
+            }
+            raw_args.push(fts_expr.clone().into());
+            raw_args.push((limit as i64).into());
+            let c = self.conn.lock();
+            let mut statement = c.prepare(&raw_sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(raw_args), |row| {
+                Ok(VideoSubtitleHit {
+                    file_id: row.get(0)?,
+                    start_ms: row.get(1)?,
+                    end_ms: row.get(2)?,
+                    subtitle: row.get(3)?,
+                    exact_phrase: row.get(4)?,
+                    matched_terms: row.get(5)?,
+                })
+            })?;
+            let raw_rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            if fts_rows.is_empty() {
+                raw_rows
+            } else {
+                // Keep the strongest row for each temporal window, then
+                // apply the same ordering/limit as the individual FTS query.
+                let mut merged = fts_rows;
+                let mut seen = merged
+                    .iter()
+                    .map(|hit| (hit.file_id, hit.start_ms, hit.end_ms))
+                    .collect::<HashSet<_>>();
+                for hit in raw_rows {
+                    if seen.insert((hit.file_id, hit.start_ms, hit.end_ms)) {
+                        merged.push(hit);
+                    }
+                }
+                merged.sort_by(|a, b| {
+                    b.exact_phrase
+                        .cmp(&a.exact_phrase)
+                        .then_with(|| b.matched_terms.cmp(&a.matched_terms))
+                        .then_with(|| a.subtitle.len().cmp(&b.subtitle.len()))
+                        .then_with(|| a.file_id.cmp(&b.file_id))
+                        .then_with(|| a.start_ms.cmp(&b.start_ms))
+                });
+                merged.truncate(limit);
+                merged
+            }
+        } else {
+            fts_rows
+        };
+        // FTS is authoritative for normal ASCII/word queries. A compatibility
+        // literal scan is useful for CJK and one-character queries because
+        // unicode61 does not split every ideographic phrase. For a multi-word
+        // ASCII query with no FTS hit, scanning every video window is both
+        // unnecessary and a major source of search latency on large indexes.
+        let query_has_cjk = query.chars().any(|character| matches!(
+            character as u32,
+            0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x2fa1f
+        ));
+        let allow_literal_fallback = query_has_cjk || query.trim().chars().count() <= 1;
+        if !fts_rows.is_empty() || !allow_literal_fallback {
+            return Ok(fts_rows);
+        }
+
+        let mut args: Vec<rusqlite::types::Value> = vec![query.to_string().into()];
+        let compact_subtitle = "lower(replace(replace(replace(replace(replace(vs.subtitle,' ',''),char(9),''),char(10),''),char(13),''),char(12288),''))";
+        let compact_query = "lower(replace(replace(replace(replace(replace(?1,' ',''),char(9),''),char(10),''),char(13),''),char(12288),''))";
+        let mut term_checks = Vec::with_capacity(terms.len());
+        for (index, term) in terms.iter().enumerate() {
+            let parameter = index + 2;
+            term_checks.push(format!(
+                "CASE WHEN instr(lower(vs.subtitle), lower(?{parameter})) > 0 OR instr({compact_subtitle}, lower(?{parameter})) > 0 THEN 1 ELSE 0 END"
+            ));
+            args.push(term.clone().into());
+        }
+        let matched_terms = term_checks.join(" + ");
+        let limit_parameter = terms.len() + 2;
+        args.push((limit as i64).into());
+        let sql = format!(
+            "SELECT vs.file_id,vs.start_ms,vs.end_ms,vs.subtitle, \
+                    (instr(lower(vs.subtitle), lower(?1)) > 0 OR instr({compact_subtitle}, {compact_query}) > 0) AS exact_phrase, \
+                    ({matched_terms}) AS matched_terms \
+             FROM video_segments vs \
+             JOIN files f ON f.id=vs.file_id AND f.missing=0 \
+             WHERE instr(lower(vs.subtitle), lower(?1)) > 0 \
+                OR instr({compact_subtitle}, {compact_query}) > 0 \
+                OR ({matched_terms}) > 0 \
+             ORDER BY exact_phrase DESC, matched_terms DESC, length(vs.subtitle) ASC, \
+                      vs.file_id ASC, vs.segment_no ASC \
+             LIMIT ?{limit_parameter}"
+        );
+        let c = self.conn.lock();
+        let mut statement = c.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
+            Ok(VideoSubtitleHit {
+                file_id: row.get(0)?,
+                start_ms: row.get(1)?,
+                end_ms: row.get(2)?,
+                subtitle: row.get(3)?,
+                exact_phrase: row.get(4)?,
+                matched_terms: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn set_state(&self, file_id: i64, what: &str, value: &str) -> rusqlite::Result<()> {
         let col = match what {
             "text" => "text_state",
@@ -660,6 +2229,40 @@ impl Db {
         let c = self.conn.lock();
         c.execute(&format!("UPDATE files SET {col}=?1 WHERE id=?2"), params![value, file_id])?;
         Ok(())
+    }
+
+    /// Update one indexing state for many files in a single transaction.
+    ///
+    /// Index checkpoints can contain hundreds of completed files. Calling
+    /// `set_state` for every id would acquire the SQLite mutex and commit a
+    /// separate write for each file, which turns a fast model batch into a
+    /// long sequence of synchronous disk writes. The caller may pass duplicate
+    /// ids (for example when text and media lanes finish together); SQLite
+    /// safely handles those, while the transaction keeps the operation atomic.
+    pub fn set_state_batch(
+        &self,
+        file_ids: &[i64],
+        what: &str,
+        value: &str,
+    ) -> rusqlite::Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+        let col = match what {
+            "text" => "text_state",
+            "embed" => "embed_state",
+            _ => return Ok(()),
+        };
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let sql = format!("UPDATE files SET {col}=?1 WHERE id=?2");
+        {
+            let mut stmt = tx.prepare(&sql)?;
+            for &file_id in file_ids {
+                stmt.execute(params![value, file_id])?;
+            }
+        }
+        tx.commit()
     }
 
     /// 把全部（未缺失）文件的状态标回 `pending`，用于强制重建。
@@ -1045,9 +2648,21 @@ impl Db {
             r#"SELECT kind,COUNT(*),COALESCE(SUM(size),0),
                COALESCE(SUM(CASE WHEN text_state='ok' THEN 1 ELSE 0 END),0),
                COALESCE(SUM(CASE WHEN embed_state='ok' THEN 1 ELSE 0 END),0),
-               COALESCE(SUM(CASE WHEN text_state!='pending' AND embed_state!='pending' THEN 1 ELSE 0 END),0),
-               COALESCE(SUM(CASE WHEN text_state IN ('pending','fail') THEN 1 ELSE 0 END),0),
-               COALESCE(SUM(CASE WHEN embed_state IN ('pending','fail') THEN 1 ELSE 0 END),0)
+               -- Progress is file based, but only indexable kinds have a
+               -- pending state that can hold the bar back. Archives and
+               -- unknown extensions are deliberately skipped by the worker;
+               -- count them as terminal so root progress agrees with the
+               -- same kind scope used by index_progress_in_roots().
+               COALESCE(SUM(CASE WHEN kind NOT IN ('text','document','image','audio','video')
+                                  OR ((kind IN ('image','audio','video') OR text_state!='pending')
+                                      AND embed_state!='pending')
+                                 THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN kind IN ('text','document','image','audio','video')
+                                  AND text_state IN ('pending','fail')
+                                 THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN kind IN ('text','document','image','audio','video')
+                                  AND embed_state IN ('pending','fail')
+                                 THEN 1 ELSE 0 END),0)
                FROM files
                WHERE missing=0 AND (path=?1 COLLATE NOCASE OR (path COLLATE NOCASE>=?2 AND path COLLATE NOCASE<?3))
                GROUP BY kind ORDER BY 2 DESC"#,
@@ -1112,7 +2727,7 @@ impl Db {
     pub fn clear_all(&self) -> rusqlite::Result<()> {
         let c = self.conn.lock();
         c.execute_batch(
-            "DELETE FROM files; DELETE FROM docs; DELETE FROM page_docs; DELETE FROM doc_pages; DELETE FROM index_roots; DELETE FROM activity;",
+            "DELETE FROM files; DELETE FROM docs; DELETE FROM page_docs; DELETE FROM doc_pages; DELETE FROM doc_vector_pages; DELETE FROM doc_image_vectors; DELETE FROM video_segments; DELETE FROM index_roots; DELETE FROM activity;",
         )?;
         Ok(())
     }
@@ -1395,6 +3010,49 @@ impl Db {
         out
     }
 
+    /// Return active file IDs for a small set of media kinds without loading
+    /// the full file metadata rows. This is used to build modality-specific
+    /// vector allow-lists when a search has no structural filters.
+    pub fn active_file_ids_by_kinds(&self, kinds: &[&str]) -> rusqlite::Result<Vec<i64>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..kinds.len()).map(|index| format!("?{}", index + 1)).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id FROM files WHERE missing=0 AND kind IN ({placeholders}) ORDER BY id"
+        );
+        let c = self.conn.lock();
+        let mut st = c.prepare(&sql)?;
+        let params = kinds.iter().map(|kind| rusqlite::types::Value::Text((*kind).to_string()));
+        let rows = st.query_map(rusqlite::params_from_iter(params), |row| row.get::<_, i64>(0))?;
+        rows.collect()
+    }
+
+    /// Return the file IDs that have materialized logical pages. Search uses
+    /// this to keep page-aware FTS authoritative even when the bounded page
+    /// result set does not contain a particular file.
+    pub fn paged_file_ids(&self, ids: &[i64]) -> HashSet<i64> {
+        let mut out = HashSet::new();
+        if ids.is_empty() {
+            return out;
+        }
+        let c = self.conn.lock();
+        for batch in ids.chunks(400) {
+            let placeholders = batch.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT DISTINCT file_id FROM doc_pages WHERE file_id IN ({placeholders})"
+            );
+            if let Ok(mut st) = c.prepare(&sql) {
+                if let Ok(rows) = st.query_map([], |row| row.get::<_, i64>(0)) {
+                    for id in rows.flatten() {
+                        out.insert(id);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// 盘符聚合：磁盘盘符 → (文件数, 总字节)。星图的恒星层用它。
     ///
     /// 直接用表达式 `substr(dir,1,2)` 而不是生成列，配合
@@ -1591,7 +3249,10 @@ fn pending_cond(what: &str) -> String {
     let state = match what {
         "text" => "text_state IN ('pending','fail')",
         "embed" => "embed_state IN ('pending','fail')",
-        _ => "(text_state IN ('pending','fail') OR embed_state IN ('pending','fail'))",
+        // Media has no text extraction stage.  Queueing auto work on
+        // text_state would re-run every already-embedded video/image on each
+        // incremental pass and also keep its progress denominator pending.
+        _ => "((kind IN ('image','audio','video') AND embed_state IN ('pending','fail')) OR (kind IN ('text','document') AND (text_state IN ('pending','fail') OR embed_state IN ('pending','fail'))))",
     };
     format!("{scope} AND {state}")
 }
@@ -1602,7 +3263,12 @@ fn progress_conds(what: &str) -> (&'static str, &'static str) {
     let done = match what {
         "text" => "text_state!='pending'",
         "embed" => "embed_state!='pending'",
-        _ => "text_state!='pending' AND embed_state!='pending'",
+        // Media files (images, audio and video) have no正文 extraction
+        // stage.  Requiring text_state here leaves a successfully embedded
+        // video at 0% forever when the caller runs the normal `auto` pass.
+        // Count those files as complete once their embedding stage is
+        // terminal; documents/text still require both stages.
+        _ => "((kind IN ('image','audio','video') OR text_state!='pending') AND embed_state!='pending')",
     };
     (scope, done)
 }
@@ -1684,6 +3350,66 @@ mod index_progress_tests {
     use super::*;
 
     #[test]
+    fn pdf_preflight_upgrade_retries_only_empty_pdfs_once() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut empty = FileRow::new("C:\\docs\\empty.pdf");
+        empty.kind = "document".into();
+        let empty_id = db.upsert_file(&empty).unwrap();
+        let mut good = FileRow::new("C:\\docs\\good.pdf");
+        good.kind = "document".into();
+        let good_id = db.upsert_file(&good).unwrap();
+        let raw = "活塞环正常正文";
+        db.set_doc(good_id, &good.name, &crate::util::index_text(raw), raw).unwrap();
+        db.set_state(good_id, "embed", "ok").unwrap();
+        db.set_state(empty_id, "text", "skip").unwrap();
+        db.set_state(empty_id, "embed", "ok").unwrap();
+        db.set_meta("pdf_text_preflight_version", "0").unwrap();
+
+        db.migrate().unwrap();
+        let repaired = db.get_by_id(empty_id).unwrap().unwrap();
+        assert_eq!(repaired.text_state, "pending");
+        assert_eq!(repaired.embed_state, "pending");
+        assert_eq!(db.get_doc_raw(good_id).unwrap().as_deref(), Some(raw));
+        assert_eq!(db.get_by_id(good_id).unwrap().unwrap().embed_state, "ok");
+
+        db.set_state(empty_id, "text", "skip").unwrap();
+        db.set_state(empty_id, "embed", "skip").unwrap();
+        db.migrate().unwrap();
+        assert_eq!(db.get_by_id(empty_id).unwrap().unwrap().text_state, "skip");
+    }
+
+    #[test]
+    fn image_queries_keep_same_encoder_across_budget_presets() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let id = db.upsert_file(&FileRow::new("C:\\docs\\images.pdf")).unwrap();
+        let old_key = "C:\\models\\embedding.gguf:image-text|768|280";
+        let new_key = "C:\\models\\embedding.gguf:text-image|768|560";
+        db.replace_doc_image_vectors(id, &[
+            (-100, 1, "first".into(), old_key.into()),
+            (-101, 2, "second".into(), new_key.into()),
+            (-102, 3, "other".into(), "C:\\models\\other.gguf:image-text|768|560".into()),
+        ]).unwrap();
+        assert_eq!(db.doc_image_vector_ids_for_model(new_key).unwrap(), vec![-101, -100]);
+        assert!(!image_model_key_compatible("C:\\models\\embedding.gguf:image-text|512|560", old_key));
+        assert!(!image_model_key_compatible(new_key, ""));
+        let current = "C:\\models\\embedding.gguf:image-text|768|560|encoder=llama.cpp:768";
+        assert!(db.doc_image_vector_ids_for_model(current).unwrap().is_empty());
+        assert_eq!(db.doc_image_vector_ids_for_model_with_legacy(current, true).unwrap(), vec![-101, -100]);
+        assert!(image_model_key_compatible_with_legacy(
+            current, "embedding.gguf:image-text|768|280", true,
+        ));
+        assert!(!image_model_key_compatible_with_legacy(
+            current, "embedding.gguf:image-text|768|280", false,
+        ));
+        assert!(!image_model_key_compatible_with_legacy(
+            current, "D:\\different\\embedding.gguf:image-text|768|280|encoder=llama.cpp:768", true,
+        ));
+        assert!(!image_model_key_compatible_with_legacy(
+            current, "C:\\models\\embedding.gguf:image-text|768|280|encoder=candle:768", true,
+        ));
+    }
+
+    #[test]
     fn progress_counts_attempted_files_once_and_persists_task_kind() {
         let db = Db::open(Path::new(":memory:")).unwrap();
         // FileRow::new leaves kind at "other"; scanning is what assigns a real
@@ -1718,6 +3444,161 @@ mod index_progress_tests {
 
         db.set_meta("index_progress_what", "embed").unwrap();
         assert_eq!(db.get_meta("index_progress_what").unwrap().as_deref(), Some("embed"));
+    }
+
+    #[test]
+    fn auto_progress_counts_media_after_embedding_without_text_stage() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut video = FileRow::new("C:\\media\\clip.mp4");
+        video.kind = "video".into();
+        let id = db.upsert_file(&video).unwrap();
+        // Video has no正文 extraction. A successful temporal embedding must
+        // still advance the normal auto-index progress to 100%.
+        db.set_state(id, "embed", "ok").unwrap();
+        assert_eq!(db.index_progress("auto").unwrap(), (1, 1));
+        assert_eq!(db.index_progress_in_roots("auto", &["C:\\media".to_string()]).unwrap(), (1, 1));
+        assert!(db.pending_ids("auto", 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn compatible_video_lookup_survives_media_budget_changes() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut video = FileRow::new("C:\\media\\budget-change.mp4");
+        video.kind = "video".into();
+        let file_id = db.upsert_file(&video).unwrap();
+        let segment = VideoSegmentMeta {
+            vector_id: crate::ai::video_segment_id(file_id, 0),
+            file_id,
+            segment_no: 0,
+            start_ms: 0,
+            end_ms: 30_000,
+            subtitle: "engine".into(),
+        };
+        db.upsert_video_segment_embedding(
+            &segment,
+            "primary",
+            "gemma:image-video|768|280|video",
+            &[1.0, 0.0],
+        )
+        .unwrap();
+
+        let ids = db
+            .video_segment_vector_ids_for_compatible_model(
+                "primary",
+                "gemma:image-video|768|1120|video",
+                2,
+            )
+            .unwrap();
+        assert_eq!(ids, vec![segment.vector_id]);
+        assert!(db
+            .completed_video_segments_compatible(
+                file_id,
+                "primary",
+                "gemma:image-video|768|1120|video",
+                2,
+            )
+            .unwrap()
+            .contains(&0));
+        assert!(db
+            .video_segment_vector_ids_for_compatible_model(
+                "primary",
+                "gemma:text-only|768|1120|video",
+                2,
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn compatible_video_lookup_preserves_windows_model_paths() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut video = FileRow::new("E:\\media\\clip.mp4");
+        video.kind = "video".into();
+        let file_id = db.upsert_file(&video).unwrap();
+        let segment = VideoSegmentMeta {
+            vector_id: crate::ai::video_segment_id(file_id, 0),
+            file_id,
+            segment_no: 0,
+            start_ms: 0,
+            end_ms: 30_000,
+            subtitle: "engine".into(),
+        };
+        db.upsert_video_segment_embedding(
+            &segment,
+            "primary",
+            r"E:\models\embeddinggemma.gguf:image-video|768|280|video",
+            &[1.0, 0.0],
+        )
+        .unwrap();
+
+        // The drive-letter colon must not be mistaken for the model-key
+        // delimiter.  A changed token budget remains compatible, while a
+        // text-only model with the same path does not.
+        assert_eq!(
+            db.video_segment_vector_ids_for_compatible_model(
+                "primary",
+                r"E:\models\embeddinggemma.gguf:video-image|768|1120|video",
+                2,
+            )
+            .unwrap(),
+            vec![segment.vector_id]
+        );
+        assert!(db
+            .video_segment_vector_ids_for_compatible_model(
+                "primary",
+                r"E:\models\embeddinggemma.gguf:text|768|1120|video",
+                2,
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn compatible_video_lookup_survives_model_directory_move() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut video = FileRow::new("C:\\media\\moved.mp4");
+        video.kind = "video".into();
+        let file_id = db.upsert_file(&video).unwrap();
+        let segment = VideoSegmentMeta {
+            vector_id: crate::ai::video_segment_id(file_id, 0),
+            file_id,
+            segment_no: 0,
+            start_ms: 0,
+            end_ms: 30_000,
+            subtitle: "engine".into(),
+        };
+        db.upsert_video_segment_embedding(
+            &segment,
+            "media",
+            r"E:\old-install\embeddinggemma-2.gguf:image-video|768|280|video",
+            &[1.0, 0.0],
+        )
+        .unwrap();
+
+        // Moving the application/model directory must not hide existing
+        // temporal vectors.  The model filename, space and dimension still
+        // identify the same embedding family.
+        assert_eq!(
+            db.video_segment_vector_ids_for_compatible_model(
+                "media",
+                r"F:\new-install\embeddinggemma-2.gguf:video-image|768|1120|video",
+                2,
+            )
+            .unwrap(),
+            vec![segment.vector_id]
+        );
+    }
+
+    #[test]
+    fn state_batch_updates_all_rows_atomically() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let first = db.upsert_file(&FileRow::new("C:\\docs\\batch-a.txt")).unwrap();
+        let second = db.upsert_file(&FileRow::new("C:\\docs\\batch-b.txt")).unwrap();
+
+        db.set_state_batch(&[first, second, first], "embed", "ok").unwrap();
+
+        assert_eq!(db.get_by_id(first).unwrap().unwrap().embed_state, "ok");
+        assert_eq!(db.get_by_id(second).unwrap().unwrap().embed_state, "ok");
     }
 
     #[test]
@@ -1791,6 +3672,428 @@ mod index_progress_tests {
     }
 
     #[test]
+    fn rename_updates_page_filename_terms() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let id = db.upsert_file(&FileRow::new("C:\\docs\\oldfile.pdf")).unwrap();
+        db.set_doc(id, "oldfile.pdf", "body", "body").unwrap();
+
+        assert_eq!(db.search_pages_fts("oldfile", 10).unwrap().len(), 1);
+        db.rename_file("C:\\docs\\oldfile.pdf", "C:\\docs\\newfile.pdf")
+            .unwrap();
+
+        assert!(db.search_pages_fts("oldfile", 10).unwrap().is_empty());
+        assert_eq!(db.search_pages_fts("newfile", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_text_relevance_reports_exact_phrase_and_term_coverage() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let exact = db.upsert_file(&FileRow::new("C:\\docs\\exact.txt")).unwrap();
+        let partial = db.upsert_file(&FileRow::new("C:\\docs\\partial.txt")).unwrap();
+        db.set_doc(exact, "exact.txt", "engine flywheel crank", "engine flywheel crank")
+            .unwrap();
+        db.set_doc(partial, "partial.txt", "engine only", "engine only")
+            .unwrap();
+
+        let hits = db
+            .search_fts_relevance(
+                "\"engine\" OR \"flywheel\"",
+                "engine flywheel",
+                &["engine".into(), "flywheel".into()],
+                10,
+            )
+            .unwrap();
+        let exact_hit = hits.iter().find(|hit| hit.0 == exact).unwrap();
+        let partial_hit = hits.iter().find(|hit| hit.0 == partial).unwrap();
+        assert!(exact_hit.2);
+        assert_eq!(exact_hit.3, 2);
+        assert!(!partial_hit.2);
+        assert_eq!(partial_hit.3, 1);
+    }
+
+    #[test]
+    fn full_text_relevance_excludes_missing_files() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let present = db.upsert_file(&FileRow::new("C:\\docs\\present.txt")).unwrap();
+        let missing = db.upsert_file(&FileRow::new("C:\\docs\\missing.txt")).unwrap();
+        db.set_doc(present, "present.txt", "needle", "needle").unwrap();
+        db.set_doc(missing, "missing.txt", "needle", "needle").unwrap();
+        db.conn.lock().execute("UPDATE files SET missing=1 WHERE id=?1", params![missing]).unwrap();
+
+        let hits = db.search_fts_relevance("needle", "needle", &["needle".into()], 10).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![present]);
+    }
+
+    #[test]
+    fn video_subtitle_full_text_returns_best_cues_and_skips_missing_files() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut video = FileRow::new("C:\\media\\spoken.mp4");
+        video.kind = "video".into();
+        let video_id = db.upsert_file(&video).unwrap();
+        db.replace_video_segments(
+            video_id,
+            &[
+                VideoSegmentMeta {
+                    vector_id: -2_000_001,
+                    file_id: video_id,
+                    segment_no: 0,
+                    start_ms: 0,
+                    end_ms: 30_000,
+                    subtitle: "[00:01.000-00:03.000] engine only".into(),
+                },
+                VideoSegmentMeta {
+                    vector_id: -2_000_002,
+                    file_id: video_id,
+                    segment_no: 1,
+                    start_ms: 30_000,
+                    end_ms: 60_000,
+                    subtitle: "[00:31.000-00:33.000] flywheel engine".into(),
+                },
+                VideoSegmentMeta {
+                    vector_id: -2_000_003,
+                    file_id: video_id,
+                    segment_no: 2,
+                    start_ms: 60_000,
+                    end_ms: 90_000,
+                    subtitle: "[01:01.000-01:03.000] engine flywheel".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let mut missing = FileRow::new("C:\\media\\missing.mp4");
+        missing.kind = "video".into();
+        let missing_id = db.upsert_file(&missing).unwrap();
+        db.replace_video_segments(
+            missing_id,
+            &[VideoSegmentMeta {
+                vector_id: -2_000_004,
+                file_id: missing_id,
+                segment_no: 0,
+                start_ms: 0,
+                end_ms: 30_000,
+                subtitle: "engine flywheel".into(),
+            }],
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .execute("UPDATE files SET missing=1 WHERE id=?1", params![missing_id])
+            .unwrap();
+
+        let hits = db
+            .search_video_subtitle_relevance(
+                "engine flywheel",
+                &["engine".into(), "flywheel".into()],
+                10,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].file_id, video_id);
+        assert!(hits[0].exact_phrase);
+        assert_eq!(hits[0].matched_terms, 2);
+        assert_eq!(hits[0].start_ms, 60_000);
+        assert_eq!(hits[1].matched_terms, 2);
+        assert!(!hits.iter().any(|hit| hit.file_id == missing_id));
+    }
+
+    #[test]
+    fn video_subtitle_full_text_uses_cjk_token_index() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut video = FileRow::new("C:\\media\\cn.mp4");
+        video.kind = "video".into();
+        let video_id = db.upsert_file(&video).unwrap();
+        db.replace_video_segments(
+            video_id,
+            &[VideoSegmentMeta {
+                vector_id: -2_100_001,
+                file_id: video_id,
+                segment_no: 0,
+                start_ms: 0,
+                end_ms: 30_000,
+                subtitle: "[00:04.000-00:06.000] 活塞开始运动".into(),
+            }],
+        )
+        .unwrap();
+
+        let hits = db
+            .search_video_subtitle_relevance("活塞", &["活塞".into()], 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file_id, video_id);
+        assert!(hits[0].exact_phrase);
+    }
+
+    #[test]
+    fn video_subtitle_full_text_falls_back_to_raw_index_after_token_index_gap() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut video = FileRow::new("C:\\media\\legacy-subtitles.mp4");
+        video.kind = "video".into();
+        let video_id = db.upsert_file(&video).unwrap();
+        db.replace_video_segments(
+            video_id,
+            &[VideoSegmentMeta {
+                vector_id: -2_200_001,
+                file_id: video_id,
+                segment_no: 0,
+                start_ms: 30_000,
+                end_ms: 60_000,
+                subtitle: "[00:31.000-00:33.000] engine starts".into(),
+            }],
+        )
+        .unwrap();
+        // Simulate a database upgraded from the version before the tokenized
+        // subtitle FTS table. The raw subtitle index is still valid.
+        db.conn
+            .lock()
+            .execute("DELETE FROM video_subtitles_tokens_fts", [])
+            .unwrap();
+        let hits = db
+            .search_video_subtitle_relevance("engine starts", &["engine".into(), "starts".into()], 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file_id, video_id);
+        assert_eq!(hits[0].start_ms, 30_000);
+    }
+
+    #[test]
+    fn video_subtitle_full_text_merges_raw_phrase_when_token_index_has_only_common_terms() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut video = FileRow::new("C:\\media\\common-and-specific.mp4");
+        video.kind = "video".into();
+        let video_id = db.upsert_file(&video).unwrap();
+        db.replace_video_segments(
+            video_id,
+            &[
+                VideoSegmentMeta {
+                    vector_id: -2_210_001,
+                    file_id: video_id,
+                    segment_no: 0,
+                    start_ms: 0,
+                    end_ms: 30_000,
+                    subtitle: "engine running".into(),
+                },
+                VideoSegmentMeta {
+                    vector_id: -2_210_002,
+                    file_id: video_id,
+                    segment_no: 1,
+                    start_ms: 30_000,
+                    end_ms: 60_000,
+                    subtitle: "engine flywheel calibration".into(),
+                },
+            ],
+        )
+        .unwrap();
+        // Leave a common-token row in the tokenized index while removing the
+        // exact phrase row. The raw index still has the complete subtitle.
+        db.conn
+            .lock()
+            .execute(
+                "DELETE FROM video_subtitles_tokens_fts WHERE rowid=?1",
+                params![-2_210_002i64],
+            )
+            .unwrap();
+        let hits = db
+            .search_video_subtitle_relevance(
+                "engine flywheel",
+                &["engine".into(), "flywheel".into()],
+                10,
+            )
+            .unwrap();
+        assert!(hits.iter().any(|hit| {
+            hit.start_ms == 30_000 && hit.exact_phrase && hit.matched_terms == 2
+        }));
+    }
+
+    #[test]
+    fn semantic_page_and_video_metadata_replace_atomically() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let file_id = db.upsert_file(&FileRow::new("C:\\docs\\paged.pdf")).unwrap();
+        db.replace_doc_vector_pages_with_hashes(
+            file_id,
+            &[
+                (11, 1, "page", "page-one-hash".into()),
+                (12, 2, "page", "page-two-hash".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.doc_page_vector_ids(file_id).unwrap(), vec![11, 12]);
+        assert_eq!(
+            db.doc_vector_page_source(12).unwrap(),
+            Some((file_id, 2, "page".into()))
+        );
+        assert_eq!(
+            db.doc_page_vector_records(file_id).unwrap(),
+            vec![
+                (11, 1, "page".into(), "page-one-hash".into()),
+                (12, 2, "page".into(), "page-two-hash".into()),
+            ]
+        );
+
+        db.replace_video_segments(
+            file_id,
+            &[VideoSegmentMeta {
+                vector_id: -1_000_001,
+                file_id,
+                segment_no: 0,
+                start_ms: 0,
+                end_ms: 30_000,
+                subtitle: "spoken words".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            db.video_segment_by_vector_id(-1_000_001).unwrap(),
+            Some((file_id, 0, 30_000, "spoken words".into()))
+        );
+
+        db.upsert_file(&FileRow::new("C:\\docs\\paged.pdf")).unwrap();
+        // Keep page mappings and completed temporal windows available for
+        // content-hash/resumable reuse during the next indexing pass. They
+        // are atomically replaced only when a source file actually changes
+        // or a fresh page/segment result is committed.
+        assert_eq!(db.doc_page_vector_ids(file_id).unwrap(), vec![11, 12]);
+        assert_eq!(
+            db.video_segment_by_vector_id(-1_000_001).unwrap(),
+            Some((file_id, 0, 30_000, "spoken words".into()))
+        );
+    }
+
+    #[test]
+    fn completed_video_vectors_restore_only_missing_keys_and_remain_idempotent() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut file = FileRow::new("C:\\media\\long.mp4");
+        file.kind = "video".into();
+        let file_id = db.upsert_file(&file).unwrap();
+        let segment = VideoSegmentMeta {
+            vector_id: crate::ai::video_segment_id(file_id, 0),
+            file_id,
+            segment_no: 0,
+            start_ms: 0,
+            end_ms: 30_000,
+            subtitle: "first window".into(),
+        };
+        db.upsert_video_segment_embedding(&segment, "primary", "test-model", &[1.0, 0.0])
+            .unwrap();
+
+        let root = std::env::temp_dir().join(format!(
+            "deepdark-video-vector-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let primary_dir = root.join("primary");
+        let media_dir = root.join("media");
+        let primary = crate::vector::VectorStore::open(&primary_dir, 2).unwrap();
+        let media = crate::vector::VectorStore::open(&media_dir, 2).unwrap();
+        assert_eq!(db.restore_video_segment_vectors(&primary, &media).unwrap(), 1);
+        assert_eq!(primary.get(segment.vector_id), Some(vec![1.0, 0.0]));
+        assert_eq!(media.len(), 0);
+        assert_eq!(db.restore_video_segment_vectors(&primary, &media).unwrap(), 0);
+        assert_eq!(primary.len(), 1, "restoring twice must not duplicate the segment");
+
+        // A key already present in the vector snapshot is left alone, even if
+        // the metadata row was subsequently updated. Recovery only backfills
+        // missing keys; the normal indexing checkpoint owns updates.
+        let mut updated = segment.clone();
+        updated.subtitle = "replacement window".into();
+        db.upsert_video_segment_embedding(&updated, "primary", "test-model", &[0.0, 1.0])
+            .unwrap();
+        assert_eq!(db.restore_video_segment_vectors(&primary, &media).unwrap(), 0);
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary.get(segment.vector_id), Some(vec![1.0, 0.0]));
+
+        let reopened = crate::vector::VectorStore::open(&primary_dir, 2).unwrap();
+        assert_eq!(reopened.get(segment.vector_id), Some(vec![1.0, 0.0]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn video_recovery_does_not_reintroduce_a_previous_models_same_width_vectors() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut file = FileRow::new("C:\\media\\switch.mp4");
+        file.kind = "video".into();
+        let file_id = db.upsert_file(&file).unwrap();
+        let old_key = "C:\\old\\model.gguf:image-text-video|2|280|encoder=llama.cpp:2|video";
+        let new_key = "D:\\new\\model.gguf:image-text-video|2|280|encoder=llama.cpp:2|video";
+        for (segment_no, key) in [(0, old_key), (1, new_key), (2, "")] {
+            let segment = VideoSegmentMeta {
+                vector_id: crate::ai::video_segment_id(file_id, segment_no),
+                file_id,
+                segment_no: segment_no as i64,
+                start_ms: segment_no as i64 * 30_000,
+                end_ms: (segment_no as i64 + 1) * 30_000,
+                subtitle: "window".into(),
+            };
+            db.upsert_video_segment_embedding(&segment, "primary", key, &[1.0, 0.0]).unwrap();
+        }
+        let root = std::env::temp_dir().join(format!(
+            "deepdark-video-model-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let primary = crate::vector::VectorStore::open(&root.join("primary"), 2).unwrap();
+        let media = crate::vector::VectorStore::open(&root.join("media"), 2).unwrap();
+        primary.bind_encoder(crate::vector::EncoderIdentity::new("llama.cpp", "C:/old/model.gguf", 2), old_key.into()).unwrap();
+        assert_eq!(db.restore_video_segment_vectors(&primary, &media).unwrap(), 1);
+        primary.bind_encoder(crate::vector::EncoderIdentity::new("llama.cpp", "D:/new/model.gguf", 2), new_key.into()).unwrap();
+        assert_eq!(db.restore_video_segment_vectors(&primary, &media).unwrap(), 1);
+        assert!(!primary.has(crate::ai::video_segment_id(file_id, 0)));
+        assert!(primary.has(crate::ai::video_segment_id(file_id, 1)));
+        assert!(!primary.has(crate::ai::video_segment_id(file_id, 2)));
+        primary.clear().unwrap();
+        assert_eq!(db.restore_video_segment_vectors_for_file(file_id, &primary, &media).unwrap(), 1);
+        assert_eq!(db.restore_video_segment_vectors_for_file(file_id, &primary, &media).unwrap(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn video_segment_blob_columns_migrate_from_the_legacy_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "deepdark-video-schema-migration-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE video_segments(\
+                       vector_id INTEGER PRIMARY KEY,file_id INTEGER NOT NULL,\
+                       segment_no INTEGER NOT NULL,start_ms INTEGER NOT NULL,\
+                       end_ms INTEGER NOT NULL,subtitle TEXT NOT NULL DEFAULT '',\
+                       UNIQUE(file_id,segment_no));\
+                     INSERT INTO video_segments VALUES(-1000001,1,0,0,30000,'legacy');",
+                )
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.video_segment_by_vector_id(-1_000_001).unwrap(),
+            Some((1, 0, 30_000, "legacy".into()))
+        );
+        let c = db.conn.lock();
+        let columns = c
+            .prepare("PRAGMA table_info(video_segments)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "embedding"));
+        assert!(columns.iter().any(|column| column == "vector_space"));
+        assert!(columns.iter().any(|column| column == "vector_dim"));
+        drop(c);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn index_root_stats_are_isolated_for_similar_roots() {
         let db = Db::open(Path::new(":memory:")).unwrap();
         let roots = vec!["C:\\docs-a\\".to_string(), "C:\\docs-b".to_string()];
@@ -1826,5 +4129,25 @@ mod index_progress_tests {
         let stats = db.index_roots().unwrap();
         assert_eq!(stats[0].discovered_files, 9);
         assert_eq!(stats[0].discovered_bytes, 99);
+    }
+
+    #[test]
+    fn root_progress_does_not_hold_on_unindexable_kinds() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.sync_index_roots(&["C:\\media".to_string()], &[]).unwrap();
+
+        let mut video = FileRow::new("C:\\media\\clip.mp4");
+        video.kind = "video".into();
+        video.id = db.upsert_file(&video).unwrap();
+        let mut archive = FileRow::new("C:\\media\\bundle.zip");
+        archive.kind = "archive".into();
+        archive.id = db.upsert_file(&archive).unwrap();
+        db.set_state(video.id, "text", "skip").unwrap();
+        db.set_state(video.id, "embed", "ok").unwrap();
+
+        let roots = db.index_roots().unwrap();
+        assert_eq!(roots[0].files, 2);
+        assert_eq!(roots[0].completed, 2);
+        assert_eq!(roots[0].embed_pending, 0);
     }
 }

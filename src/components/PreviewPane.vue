@@ -21,7 +21,13 @@ const thumbUrl = computed(() => {
   // （索引时写的是 `<fid>.jpg`），这里不能拿布尔值当文件名拼。
   if (!h || !h.thumb || !props.thumbDir) return "";
   const sep = props.thumbDir.includes("\\") ? "\\" : "/";
-  return convertFileSrc(`${props.thumbDir}${sep}${h.id}.jpg`);
+  // Page-level PDF results persist their rendered page independently. Keep
+  // the legacy file thumbnail for older index rows without a page number.
+  const page = h.page != null && Number.isFinite(Number(h.page))
+    ? Math.max(1, Math.floor(Number(h.page)))
+    : undefined;
+  const file = page ? `${h.id}_p${page}.jpg` : (h.thumb_key || `${h.id}.jpg`);
+  return convertFileSrc(`${props.thumbDir}${sep}${file}`);
 });
 
 const fileUrl = computed(() => {

@@ -1641,6 +1641,26 @@ impl<'a> Processor<'a> {
                         _ => { panic!("unexpected Tj operand {:?}", operation) }
                     }
                 }
+                "'" | "\"" => {
+                    // PDF's quote operators move to the next text line and
+                    // show a string; the double quote also sets word and
+                    // character spacing. They are common in valid text PDFs.
+                    let double_quote = operation.operator == "\"";
+                    let expected_operands = if double_quote { 3 } else { 1 };
+                    if operation.operands.len() != expected_operands {
+                        continue;
+                    }
+                    if double_quote {
+                        gs.ts.word_spacing = as_num(&operation.operands[0]);
+                        gs.ts.character_spacing = as_num(&operation.operands[1]);
+                    }
+                    tlm = tlm.pre_transform(&Transform2D::create_translation(0., -gs.ts.leading));
+                    gs.ts.tm = tlm;
+                    output.end_line()?;
+                    if let Object::String(ref text, _) = operation.operands[expected_operands - 1] {
+                        show_text(&mut gs, text, &tlm, &flip_ctm, output)?;
+                    }
+                }
                 "Tc" => {
                     gs.ts.character_spacing = as_num(&operation.operands[0]);
                 }

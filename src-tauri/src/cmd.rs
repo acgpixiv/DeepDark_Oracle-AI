@@ -45,6 +45,10 @@ pub fn save_config(
     state: State<'_, Arc<AppState>>,
     cfg: serde_json::Value,
 ) -> Result<(), String> {
+    // Do not block the UI behind a model load, or let a concurrent save be
+    // overwritten by the configuration snapshot used to construct a model.
+    let _runtime_change = state.model_change_lock.try_lock()
+        .ok_or_else(|| "模型配置正在应用，请稍后再保存设置".to_string())?;
     // 采用 JSON 深合并而不是整体覆盖：前端只改一个字段时
     // （例如只传 {"scan":{"roots":[...]}}）不能把模型路径等其他配置清空。
     let previous_cfg = state.cfg.read().clone();
@@ -57,27 +61,8 @@ pub fn save_config(
         new_cfg.index.vector_dim = 768;
     }
     normalize_workspace_config(&mut new_cfg.workspace);
-    let previous_model_cfg = previous_cfg.model.clone();
-    let updated_model_cfg = new_cfg.model.clone();
-    let cross_modal_settings_changed = previous_model_cfg.clip_enabled != updated_model_cfg.clip_enabled
-        || previous_model_cfg.clip_dir != updated_model_cfg.clip_dir
-        || previous_model_cfg.clap_enabled != updated_model_cfg.clap_enabled
-        || previous_model_cfg.clap_dir != updated_model_cfg.clap_dir
-        || previous_model_cfg.n_threads != updated_model_cfg.n_threads;
-    let stale_disabled_runtime = (!updated_model_cfg.clip_enabled && state.clip.read().is_some())
-        || (!updated_model_cfg.clap_enabled && state.clap.read().is_some());
-    let _cross_modal_change = if cross_modal_settings_changed || stale_disabled_runtime {
-        if state.model_transition.load(Ordering::Acquire) {
-            return Err("模型正在切换，请稍后再保存跨模态模型设置".into());
-        }
-        let guard = state.model_change_lock.lock();
-        if state.model_transition.load(Ordering::Acquire) {
-            return Err("模型正在切换，请稍后再保存跨模态模型设置".into());
-        }
-        Some(guard)
-    } else {
-        None
-    };
+    let (index_settings_changed, model_settings_changed) =
+        index_runtime_settings_changed(&previous_cfg, &new_cfg);
 
     let autostart_before = state.cfg.read().ui.autostart;
 
@@ -132,31 +117,52 @@ pub fn save_config(
     if autostart_before != new_cfg.ui.autostart {
         apply_autostart(new_cfg.ui.autostart, &state.app_dir);
     }
-    let vector_dim_changed = previous_cfg.index.vector_dim != new_cfg.index.vector_dim;
     *state.cfg.write() = new_cfg;
     state.clear_search_cache();
-    state.sync_cross_modal_config(&previous_model_cfg, &updated_model_cfg);
-    if vector_dim_changed {
-        let dim = state.cfg.read().index.vector_dim;
-        if state.reopen_vector_stores(dim)? {
-            let _ = state.db.reset_states("embed");
-            let _ = state.db.log(
-                "model",
-                &format!("索引库维度已切换为 {dim}，旧向量保留在原文件中，等待重新建立索引"),
-            );
-        }
+    // Indexer/model settings are immutable snapshots. Applying only the CPU
+    // pool and batch counter here left every other saved control ineffective;
+    // rebuilding here instead would interrupt an active pass. Defer both to
+    // the next explicit indexing request.
+    if index_settings_changed {
+        state.index_settings_dirty.store(true, Ordering::Release);
     }
-    if vector_dim_changed {
-        // Rebind the indexer to the newly opened stores. The old indexer owns
-        // Arcs to the previous stores and would otherwise continue writing to
-        // the old physical dimension after a configuration change.
-        let _ = state.rebuild_indexer();
-    } else if let Some(indexer) = state.indexer() {
-        let cfg = state.cfg.read();
-        indexer.set_batch_size(crate::ai::effective_batch_size(&cfg.model, cfg.index.batch_size));
-        indexer.set_worker_threads(crate::ai::effective_parallel_threads(&cfg.model));
+    if model_settings_changed {
+        state.model_settings_dirty.store(true, Ordering::Release);
     }
     Ok(())
+}
+
+fn index_runtime_settings_changed(previous: &AppConfig, current: &AppConfig) -> (bool, bool) {
+    let before = &previous.model;
+    let after = &current.model;
+    let workers_changed = before.n_threads != after.n_threads
+        || before.parallel_mode != after.parallel_mode
+        || before.parallel_threads != after.parallel_threads;
+    let ocr_changed = before.teleocr_model_dir != after.teleocr_model_dir
+        || before.teleocr_python_path != after.teleocr_python_path
+        || before.teleocr_code_dir != after.teleocr_code_dir;
+    let model_changed = workers_changed
+        || before.embed_model != after.embed_model
+        || before.gpu_device != after.gpu_device
+        || before.context_size != after.context_size
+        || before.clip_enabled != after.clip_enabled
+        || before.clip_dir != after.clip_dir
+        || before.clap_enabled != after.clap_enabled
+        || before.clap_dir != after.clap_dir
+        || previous.index.batch_size != current.index.batch_size
+        || previous.index.image_token_budget != current.index.image_token_budget
+        || previous.index.pdf_image_token_budget != current.index.pdf_image_token_budget
+        || previous.index.video_token_budget != current.index.video_token_budget
+        || previous.index.vision_encoder != current.index.vision_encoder
+        || previous.index.audio_encoder != current.index.audio_encoder
+        || previous.index.video_index_audio != current.index.video_index_audio
+        || previous.index.audio_seconds != current.index.audio_seconds
+        || previous.index.video_frame_interval != current.index.video_frame_interval
+        || previous.index.video_max_frames != current.index.video_max_frames
+        || previous.index.image_max_side != current.index.image_max_side;
+    let index_changed = model_changed || ocr_changed
+        || serde_json::to_value(&previous.index).ok() != serde_json::to_value(&current.index).ok();
+    (index_changed, model_changed)
 }
 
 fn normalize_workspace_config(workspace: &mut crate::config::WorkspaceConfig) {
@@ -240,14 +246,23 @@ fn merge_json(dst: &mut serde_json::Value, src: &serde_json::Value) {
 pub async fn search(app: tauri::AppHandle, q: SearchQuery) -> Vec<Hit> {
     let state = Arc::clone(app.state::<Arc<AppState>>().inner());
     let worker_state = Arc::clone(&state);
-    tauri::async_runtime::spawn_blocking(move || search_inner(&worker_state, q))
+    let started = std::time::Instant::now();
+    let result = tauri::async_runtime::spawn_blocking(move || search_inner(&worker_state, q))
         .await
         .unwrap_or_else(|error| {
             let _ = state
                 .db
                 .log("error", &format!("搜索任务失败：{error}"));
             Vec::new()
-        })
+        });
+    let elapsed = started.elapsed().as_millis();
+    if elapsed >= 100 {
+        let _ = state.db.log(
+            "perf",
+            &format!("index_timing|file=search|stage=search|ms={elapsed}"),
+        );
+    }
+    result
 }
 
 fn search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Vec<Hit> {
@@ -282,99 +297,89 @@ fn search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Vec<Hit> {
             let wants_image = fallback.search_mode.as_deref() == Some("image");
             let wants_audio = fallback.search_mode.as_deref() == Some("audio");
 
-            // The indexer deliberately unloads the heavyweight runtime after
-            // a completed pass.  Explicit image/audio searches still need the
-            // selected multimodal encoder for a text query (including video
-            // windows), but the old branch treated the temporary hash
-            // embedder as a permanent text-only backend and skipped that
-            // lane altogether.  Restore the last configured model lazily,
-            // exactly like the semantic lane, before inspecting capabilities.
-            if state.embedder.read().info().backend.eq_ignore_ascii_case("hash") {
-                let cfg = state.cfg.read().clone();
-                let previous = if cfg.model.embed_model.trim().is_empty() {
-                    cfg.model.last_embed_model.clone()
-                } else {
-                    cfg.model.embed_model.clone()
-                };
-                if !previous.trim().is_empty() {
-                    if let Err(error) = model_load_inner(state, "auto".into(), Some(previous)) {
-                        let _ = state
-                            .db
-                            .log("error", &format!("按需恢复多模态模型失败：{error}"));
-                    }
-                }
-            }
-
             // Dedicated CLIP/CLAP is authoritative unless the current primary
             // embedder explicitly advertises the requested shared modality.
-            // Avoid loading and encoding with a text-only primary model: this
-            // used to duplicate query work and delayed every image/audio hit.
-            let shared_modality = {
-                let info = state.embedder.read().info();
-                let wanted = if wants_image { "image" } else { "audio" };
-                info.modalities.iter().any(|modality| modality == wanted)
-            };
-            let primary_hits = if shared_modality {
-                // The shared model lane and the optional CLIP/CLAP lane are
-                // merged below.  Keep the shared call strictly on its own
-                // vector space; `state.search` otherwise derives a CLIP/CLAP
-                // query from `cross_modal` and the same extension is searched
-                // a second time by `fallback` below.
-                q.cross_modal = Some(false);
-                match semantic_search_inner(state, q) {
-                    Ok(hits) => hits,
-                    Err(error) => {
-                        let _ = state.db.log(
-                            "error",
-                            &format!("共享模态查询不可用，继续使用独立跨模态通道：{error}"),
-                        );
-                        Vec::new()
-                    }
-                }
-            } else {
-                // A text-only primary model can still have a real media
-                // embedder which produced timestamped video windows.  Route
-                // this explicit lane through the semantic helper so it can
-                // issue one compatible media-space query.  Do not do this
-                // for the hash fallback: it has no semantic video space and
-                // would only add latency and noise.
-                let media_embedder = state.media_embedder.read().clone();
-                let media_info = media_embedder.info();
-                let media_store_ready = !state.media_vectors.read().is_empty();
-                if !media_info.backend.eq_ignore_ascii_case("hash") && media_store_ready {
-                    let cfg = state.cfg.read().clone();
-                    let media_key = crate::index::embedder_model_key(
-                        media_embedder.as_ref(),
-                        &cfg.index,
-                    );
-                    // Image/audio lanes can be dispatched together by the UI.
-                    // Reuse the same media-space query embedding across those
-                    // requests instead of launching another model forward for
-                    // every lane or every pagination pass.
-                    let media_cache_key = format!("{media_key}|media-query|{}", q.text.trim());
-                    match state.cached_aux_query(media_cache_key, || {
-                        media_embedder
-                            .embed_text(&q.text, true)
-                            .map_err(|error| format!("media query embedding failed: {error}"))
-                    }) {
-                        Ok(media_vec) => {
-                            let mut media_query = q.clone();
-                            media_query.query_vector = Some(media_vec);
-                            media_query.vector_space = Some("media".into());
-                            media_query.vector_model_key = Some(media_key);
-                            media_query.cross_modal = Some(false);
-                            media_query.use_semantic = Some(true);
-                            state.search(&mut media_query)
+            // Inspect capabilities under the lifecycle lock: the idle monitor
+            // can replace the active model with hash even after a lazy load.
+            // A missing primary model must still allow a CLIP/CLAP-only setup.
+            let primary_hits = match lock_search_model(state, false) {
+                Ok((ownership, embedder)) => {
+                    let info = embedder.info();
+                    let wanted = if wants_image { "image" } else { "audio" };
+                    let shared_modality = info.modalities.iter().any(|modality| modality == wanted);
+                    if shared_modality {
+                        // The shared model lane and the optional CLIP/CLAP lane are
+                        // merged below.  Keep the shared call strictly on its own
+                        // vector space; `state.search` otherwise derives a CLIP/CLAP
+                        // query from `cross_modal` and the same extension is searched
+                        // a second time by `fallback` below.
+                        drop(embedder);
+                        drop(ownership);
+                        q.cross_modal = Some(false);
+                        match semantic_search_inner(state, q.clone()) {
+                            Ok(hits) => hits,
+                            Err(error) => {
+                                let _ = state.db.log(
+                                    "error",
+                                    &format!("共享模态查询不可用，继续使用独立跨模态通道：{error}"),
+                                );
+                                Vec::new()
+                            }
                         }
-                        Err(error) => {
-                            let _ = state.db.log(
-                                "error",
-                                &format!("媒体视频查询不可用，继续使用独立跨模态通道：{error}"),
+                    } else {
+                        // A text-only primary model can still have a real media
+                        // embedder which produced timestamped video windows.  Route
+                        // this explicit lane through the semantic helper so it can
+                        // issue one compatible media-space query.  Do not do this
+                        // for the hash fallback: it has no semantic video space and
+                        // would only add latency and noise.
+                        let media_embedder = state.media_embedder.read().clone();
+                        let media_info = media_embedder.info();
+                        let media_store_ready = !state.media_vectors.read().is_empty();
+                        if !media_info.backend.eq_ignore_ascii_case("hash") && media_store_ready {
+                            let mut cfg = state.cfg.read().clone();
+                            cfg.index.vector_dim = state.media_vectors.read().dim();
+                            let media_key = crate::index::embedder_model_key(
+                                media_embedder.as_ref(),
+                                &cfg.index,
                             );
+                            // Image/audio lanes can be dispatched together by the UI.
+                            // Reuse the same media-space query embedding across those
+                            // requests instead of launching another model forward for
+                            // every lane or every pagination pass.
+                            let media_cache_key = format!("{media_key}|media-query|{}", q.text.trim());
+                            match state.cached_aux_query(media_cache_key, || {
+                                media_embedder
+                                    .embed_text(&q.text, true)
+                                    .map_err(|error| format!("media query embedding failed: {error}"))
+                            }) {
+                                Ok(media_vec) => {
+                                    let mut media_query = q.clone();
+                                    media_query.query_vector = Some(media_vec);
+                                    media_query.vector_space = Some("media".into());
+                                    media_query.vector_model_key = Some(media_key);
+                                    media_query.cross_modal = Some(false);
+                                    media_query.use_semantic = Some(true);
+                                    state.search(&mut media_query)
+                                }
+                                Err(error) => {
+                                    let _ = state.db.log(
+                                        "error",
+                                        &format!("媒体视频查询不可用，继续使用独立跨模态通道：{error}"),
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        } else {
                             Vec::new()
                         }
                     }
-                } else {
+                }
+                Err(error) => {
+                    let _ = state.db.log(
+                        "error",
+                        &format!("按需恢复多模态模型失败，继续独立跨模态检索：{error}"),
+                    );
                     Vec::new()
                 }
             };
@@ -383,16 +388,22 @@ fn search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Vec<Hit> {
             // Do not cold-load an optional extension when its durable vector
             // store is empty. Shared primary vectors are handled above.
             fallback.cross_modal = Some(need_clip || need_clap);
-            if need_clip || need_clap {
-                if let Err(error) = state.ensure_cross_modal_for_search(need_clip, need_clap) {
-                    let _ = state.db.log(
-                        "error",
-                        &format!("跨模态检索未能启用：{error}"),
-                    );
-                }
-            }
             let cross_modal_hits = if need_clip || need_clap {
-                state.search(&mut fallback)
+                match lock_prepared_search_runtime(
+                    state,
+                    || state.ensure_cross_modal_for_search(need_clip, need_clap),
+                    || {
+                        let cfg = state.cfg.read();
+                        (!need_clip || (cfg.model.clip_enabled && state.clip.read().is_some()))
+                            && (!need_clap || (cfg.model.clap_enabled && state.clap.read().is_some()))
+                    },
+                ) {
+                    Ok(_ownership) => state.search(&mut fallback),
+                    Err(error) => {
+                        let _ = state.db.log("error", &format!("跨模态检索未能启用：{error}"));
+                        Vec::new()
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -433,6 +444,7 @@ fn search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Vec<Hit> {
     }
 }
 
+#[allow(dead_code)]
 fn should_auto_semantic_fallback(q: &SearchQuery, lexical_is_empty: bool, query_has_cjk: bool) -> bool {
     q.search_mode.is_none()
         && !q.text.trim().is_empty()
@@ -440,23 +452,35 @@ fn should_auto_semantic_fallback(q: &SearchQuery, lexical_is_empty: bool, query_
 }
 
 /// Decide whether the default hybrid lane should pay the cost of embedding a
-/// query after the model-free FTS pass.  CJK queries need semantic fallback
-/// when FTS has no result (to bridge Chinese -> English), or when all lexical
-/// results are only weak partial matches. An exact full-text/name score of
-/// 1.0 is already authoritative; re-running the model in that case made
-/// ordinary Chinese searches wait for model loading and a full vector scan.
+/// query after the model-free FTS pass.  A lexical hit is not sufficient to
+/// suppress the semantic lane: a filename or weak subtitle hit can coexist
+/// with a much better visual/audio video-window hit.  Only an exact lexical
+/// hit is authoritative.  This keeps the fast FTS result while still allowing
+/// the video/media vector lane to recover content that is not present in text.
 fn should_auto_semantic_fallback_for_hits(
     q: &SearchQuery,
     hits: &[Hit],
     query_has_cjk: bool,
 ) -> bool {
-    if !should_auto_semantic_fallback(q, hits.is_empty(), query_has_cjk) {
+    if q.search_mode.is_some() || q.text.trim().is_empty() {
         return false;
     }
-    if !query_has_cjk || hits.is_empty() {
-        return true;
-    }
-    !hits.iter().any(|hit| hit.score >= 0.995)
+    // Keep the default search model-free whenever the lexical lane already
+    // returned a strong ordinary-file result. The previous rule also skipped
+    // semantic recovery when a weak video filename/subtitle hit was mixed
+    // with unrelated ordinary files. That made a specific visual/audio
+    // concept inside a video disappear behind a cheap lexical neighbour.
+    // Recover such a video only when there is no exact non-video hit; an exact
+    // document match remains authoritative and avoids a cold model load.
+    let has_exact_non_video = hits.iter().any(|hit| {
+        hit.score >= 0.995 && !hit.kind.eq_ignore_ascii_case("video")
+    });
+    let has_weak_video = hits.iter().any(|hit| {
+        hit.kind.eq_ignore_ascii_case("video") && hit.score < 0.995
+    });
+    hits.is_empty()
+        || (query_has_cjk && !hits.iter().any(|hit| hit.score >= 0.995))
+        || (has_weak_video && !has_exact_non_video)
 }
 
 fn merge_search_lanes(primary: Vec<Hit>, cross_modal: Vec<Hit>) -> Vec<Hit> {
@@ -548,6 +572,122 @@ mod search_mode_tests {
     }
 
     #[test]
+    fn cold_semantic_query_returns_hits_and_does_not_lock_model_replacement() {
+        use crate::ai::{EmbedInfo, Embedder};
+        use std::path::Path;
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        struct QueryEncoder(std::sync::Weak<crate::state::AppState>);
+        impl Embedder for QueryEncoder {
+            fn info(&self) -> EmbedInfo {
+                EmbedInfo {
+                    backend: "test".into(), model: "test-query-encoder".into(), dim: 768,
+                    device: "CPU".into(), modalities: vec!["text".into()],
+                    ready: true, detail: String::new(),
+                }
+            }
+            fn dim(&self) -> usize { 768 }
+            fn embed_text(&self, _: &str, _: bool) -> Result<Vec<f32>, String> {
+                // Inference owns an Arc snapshot, not AppState's read lock.
+                // Otherwise switching a busy model blocks the state/UI lock.
+                assert!(self.0.upgrade().unwrap().embedder.try_write().is_some());
+                let mut vector = vec![0.0; 768];
+                vector[0] = 1.0;
+                Ok(vector)
+            }
+            fn embed_image(&self, _: &Path) -> Result<Vec<f32>, String> { unreachable!() }
+            fn embed_audio(&self, _: &Path) -> Result<Vec<f32>, String> { unreachable!() }
+            fn embed_video(&self, _: &Path) -> Result<Vec<f32>, String> { unreachable!() }
+        }
+
+        let (state, root) = crate::state::test_support::state();
+        *state.embedder.write() = Arc::new(QueryEncoder(Arc::downgrade(&state)));
+        let mut row = crate::db::FileRow::new("C:\\documents\\engine.pdf");
+        row.kind = "document".into();
+        let id = state.db.upsert_file(&row).unwrap();
+        let raw = "发动机活塞环检修";
+        state.db.set_doc(id, &row.name, &crate::util::index_text(raw), raw).unwrap();
+        let encoder = state.embedder.read().clone();
+        let vector = encoder.embed_text("seed", false).unwrap();
+        state.vectors.read().add(id, &vector);
+        let query = SearchQuery {
+            text: "活塞环".into(), search_mode: Some("semantic".into()),
+            scope: Some("all".into()), workspace: Some(false), ..Default::default()
+        };
+        let (send, receive) = mpsc::channel();
+        let worker_state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let cold = super::semantic_search_inner(&worker_state, query.clone());
+            let warm = super::semantic_search_inner(&worker_state, query);
+            send.send((cold, warm)).unwrap();
+        });
+        let (cold, warm) = receive.recv_timeout(Duration::from_secs(3)).expect("cold semantic query deadlocked");
+        for hits in [cold.unwrap(), warm.unwrap()] {
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].id, id);
+            assert_eq!(hits[0].page, Some(1));
+        }
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extension_search_retries_unload_after_preparation_and_pins_the_runtime() {
+        use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
+        use std::time::Duration;
+
+        let (state, root) = crate::state::test_support::state();
+        let ready = Arc::new(AtomicBool::new(false));
+        let (unload, unload_requested) = mpsc::channel();
+        let (unloaded, unload_finished) = mpsc::channel();
+        let unload_state = Arc::clone(&state);
+        let unload_ready = Arc::clone(&ready);
+        let worker = std::thread::spawn(move || {
+            unload_requested.recv_timeout(Duration::from_secs(3)).unwrap();
+            let ownership = unload_state.model_change_lock.lock();
+            unload_ready.store(false, Ordering::Release);
+            drop(ownership);
+            unloaded.send(()).unwrap();
+        });
+        let mut preparations = 0;
+        let ownership = super::lock_prepared_search_runtime(
+            &state,
+            || {
+                preparations += 1;
+                ready.store(true, Ordering::Release);
+                if preparations == 1 {
+                    // Deterministically unload in the gap after ensure says
+                    // ready and before the search acquires ownership.
+                    unload.send(()).unwrap();
+                    unload_finished.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+                Ok(())
+            },
+            || ready.load(Ordering::Acquire),
+        ).unwrap();
+        assert_eq!(preparations, 2, "lost runtime must be prepared again");
+        assert!(state.model_change_lock.try_lock().is_none(), "runtime must stay pinned through search");
+        drop(ownership);
+        assert!(state.model_change_lock.try_lock().is_some());
+        worker.join().unwrap();
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn optional_primary_model_does_not_block_extension_only_search() {
+        let (state, root) = crate::state::test_support::state();
+        let (ownership, encoder) = super::lock_search_model(&state, false).unwrap();
+        assert_eq!(encoder.info().backend, "hash");
+        assert!(state.model_change_lock.try_lock().is_none());
+        drop((ownership, encoder));
+        assert!(super::lock_search_model(&state, true).is_err());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn hybrid_fallback_remains_available_for_cjk_and_empty_lexical_results() {
         let cjk = SearchQuery {
             text: "活塞".into(),
@@ -577,6 +717,39 @@ mod search_mode_tests {
     }
 
     #[test]
+    fn hybrid_weak_video_hit_keeps_temporal_semantic_recall() {
+        let english = SearchQuery {
+            text: "red car driving".into(),
+            ..Default::default()
+        };
+        let mut video = hit(3, 0.72, None, "文件名匹配");
+        video.kind = "video".into();
+        assert!(should_auto_semantic_fallback_for_hits(&english, &[video.clone()], false));
+
+        let ordinary = hit(4, 0.72, None, "文件名匹配");
+        assert!(!should_auto_semantic_fallback_for_hits(
+            &english,
+            &[ordinary.clone()],
+            false
+        ));
+
+        let ordinary_and_video = vec![video, ordinary];
+        assert!(should_auto_semantic_fallback_for_hits(
+            &english,
+            &ordinary_and_video,
+            false
+        ));
+
+        let exact_document = hit(5, 1.0, None, "全文匹配");
+        let ordinary_and_weak_video = vec![exact_document, hit(6, 0.72, None, "文件名匹配")];
+        assert!(!should_auto_semantic_fallback_for_hits(
+            &english,
+            &ordinary_and_weak_video,
+            false
+        ));
+    }
+
+    #[test]
     fn explicit_image_lanes_merge_pdf_page_hits_and_keep_the_best_page() {
         let hits = merge_search_lanes(
             vec![hit(1, 0.78, Some(2), "图像相似"), hit(2, 0.74, None, "图像相似")],
@@ -603,24 +776,25 @@ pub async fn search_semantic(app: tauri::AppHandle, q: SearchQuery) -> Result<Ve
         .map_err(|error| format!("语义检索任务失败：{error}"))?
 }
 
-fn semantic_search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Result<Vec<Hit>, String> {
-    let text = q.text.clone();
-    if text.trim().is_empty() {
-        return Ok(vec![]);
-    }
-    // This helper is also used by the default hybrid path when lexical/FTS
-    // retrieval falls back to embeddings.  Mark that fallback as an explicit
-    // semantic lane before entering SearchEngine: otherwise it performs the
-    // broad 50k-row filename/path candidate scan and a second lexical pass
-    // even though the caller has already decided to use vectors.  Explicit
-    // image/audio/full-text modes remain untouched.
-    if q.search_mode.is_none() {
-        q.search_mode = Some("semantic".into());
-    }
-    // The normal search command stays model-free. An explicit semantic request
-    // is the point at which we lazily restore the last selected model, so a
-    // fresh application launch does not spend time or VRAM initializing AI.
-    if state.embedder.read().info().backend == "hash" {
+/// Keep the encoder and its stores stable through capability detection and
+/// query execution. Optional primary-model callers can still use CLIP/CLAP
+/// without configuring an embedding model.
+fn lock_search_model(
+    state: &Arc<AppState>,
+    require_model: bool,
+) -> Result<(parking_lot::MutexGuard<'_, ()>, Arc<dyn crate::ai::Embedder>), String> {
+    loop {
+        if state.model_transition.load(Ordering::Acquire) {
+            return Err("模型正在切换，请稍后重试检索".into());
+        }
+        let ownership = state.model_change_lock.lock();
+        if state.model_transition.load(Ordering::Acquire) {
+            return Err("模型正在切换，请稍后重试检索".into());
+        }
+        let encoder = Arc::clone(&state.embedder.read());
+        if encoder.info().backend != "hash" {
+            return Ok((ownership, encoder));
+        }
         let cfg = state.cfg.read().clone();
         let previous = if cfg.model.embed_model.trim().is_empty() {
             cfg.model.last_embed_model.clone()
@@ -628,13 +802,54 @@ fn semantic_search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Result<Ve
             cfg.model.embed_model.clone()
         };
         if previous.trim().is_empty() {
+            if !require_model {
+                return Ok((ownership, encoder));
+            }
             return Err("未配置可用于语义检索的嵌入模型".into());
         }
+        // Loading owns the same lifecycle lock; release it before waking the
+        // previous model, then validate the active runtime again on return.
+        drop(ownership);
         model_load_inner(state, "auto".into(), Some(previous))?;
     }
-    let embedder = state.embedder.read();
+}
+
+/// Preparation may itself need the lifecycle lock. Reacquire it afterwards
+/// and recheck readiness so an unload in that gap cannot erase a search lane.
+fn lock_prepared_search_runtime<'a>(
+    state: &'a AppState,
+    mut prepare: impl FnMut() -> Result<(), String>,
+    ready: impl Fn() -> bool,
+) -> Result<parking_lot::MutexGuard<'a, ()>, String> {
+    loop {
+        prepare()?;
+        let ownership = state.model_change_lock.lock();
+        if state.model_transition.load(Ordering::Acquire) {
+            return Err("模型正在切换，请稍后重试检索".into());
+        }
+        if ready() {
+            return Ok(ownership);
+        }
+        drop(ownership);
+    }
+}
+
+fn semantic_search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Result<Vec<Hit>, String> {
+    let text = q.text.clone();
+    if text.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    // The hybrid fallback has already tried lexical retrieval. Keep explicit
+    // image/audio modes and use a vector-only semantic pass for the rest.
+    if q.search_mode.is_none() {
+        q.search_mode = Some("semantic".into());
+    }
+    let (_query_model, embedder) = lock_search_model(state, true)?;
     let info = embedder.info();
-    let index_cfg = state.cfg.read().index.clone();
+    let mut index_cfg = state.cfg.read().index.clone();
+    // Saved settings are applied to the next indexing pass. Until then query
+    // the physical store's active width, including its image page mappings.
+    index_cfg.vector_dim = state.vectors.read().dim();
     // The UI may issue semantic, image, and audio requests concurrently for
     // one query. Those lanes share the primary text embedding, so reuse a
     // bounded in-process result instead of serializing the same GPU forward
@@ -648,49 +863,13 @@ fn semantic_search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Result<Ve
     // Fast path for a warm query. The search page can dispatch semantic,
     // image, and audio lanes together, so a cold cache must also coordinate
     // those callers: only the first caller runs the GPU forward and the rest
-    // wait for the same result. Different query keys never share a flight and
-    // therefore remain concurrent.
-    let vec = if let Some(cached) = state.query_vectors.lock().get(&cache_key).cloned() {
-        cached
-    } else {
-        let (flight, owner, cached) = {
-            let mut flights = state.query_vector_inflight.lock();
-            if let Some(existing) = flights.get(&cache_key) {
-                (Some(Arc::clone(existing)), false, None)
-            } else if let Some(cached) = state.query_vectors.lock().get(&cache_key).cloned() {
-                (None, false, Some(cached))
-            } else {
-                let created = Arc::new(std::sync::OnceLock::new());
-                flights.insert(cache_key.clone(), Arc::clone(&created));
-                (Some(created), true, None)
-            }
-        };
-        if let Some(cached) = cached {
-            cached
-        } else {
-            let flight = flight.expect("query embedding flight is initialized");
-            let result = flight.get_or_init(|| {
-                let result = embedder.embed_text(&text, true).map_err(|e| e.to_string());
-                if let Ok(encoded) = &result {
-                    let mut cache = state.query_vectors.lock();
-                    // Keep memory bounded even when users search many distinct
-                    // phrases. This cache is only a short-lived warm-query aid.
-                    if cache.len() >= 128 {
-                        if let Some(oldest) = cache.keys().next().cloned() {
-                            cache.remove(&oldest);
-                        }
-                    }
-                    cache.insert(cache_key.clone(), encoded.clone());
-                }
-                result
-            });
-            let result = result.clone();
-            if owner {
-                state.query_vector_inflight.lock().remove(&cache_key);
-            }
-            result?
-        }
-    };
+    // wait for the same result. Different queries retain independent keys.
+    // Never keep an `if let` cache-lock temporary alive across its `else`:
+    // a cold query would acquire the same mutex again and deadlock. Share
+    // the same short-lock/single-flight path used by the auxiliary encoders.
+    let vec = state.cached_aux_query(cache_key, || {
+        embedder.embed_text(&text, true).map_err(|e| e.to_string())
+    })?;
     q.query_vector = Some(vec);
     if info
         .modalities
@@ -702,14 +881,13 @@ fn semantic_search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Result<Ve
         // the same stable identity used by the indexer so video windows and
         // PDF image pages from stale encoders cannot crowd the current query's
         // top-k candidates.
-        let cfg = state.cfg.read().clone();
         q.vector_model_key = Some(crate::index::embedder_model_key(
             embedder.as_ref(),
-            &cfg.index,
+            &index_cfg,
         ));
     }
     q.use_semantic = Some(true);
-    if matches!(q.search_mode.as_deref(), Some("image" | "audio")) {
+    if q.cross_modal.is_none() && matches!(q.search_mode.as_deref(), Some("image" | "audio")) {
         q.cross_modal = Some(true);
     }
     let primary_hits = state.search(&mut q);
@@ -810,12 +988,24 @@ fn semantic_search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Result<Ve
         // Reuse the media-space query vector just like the primary query
         // cache so a single keystroke does not launch a second forward pass
         // for every lane.
-        let media_cache_key = format!("{media_key}|media-query|{}", text.trim());
-        let media_vec = state.cached_aux_query(media_cache_key, || {
-            media_embedder
-                .embed_text(&text, true)
-                .map_err(|error| format!("media query embedding failed: {error}"))
-        })?;
+        // When the primary and media lanes use the same encoder identity and
+        // dimension, the primary query vector is already valid for the media
+        // store.  Re-encoding the same text here added a second GPU forward
+        // to every semantic search and was especially visible after the
+        // indexer had unloaded/reloaded the model.  Keep the dedicated cache
+        // path for legacy indexes produced by a different media encoder.
+        let media_vec = if media_key == primary_key
+            && q.query_vector.as_ref().is_some_and(|vector| vector.len() == media_dim)
+        {
+            q.query_vector.clone().expect("query vector checked above")
+        } else {
+            let media_cache_key = format!("{media_key}|media-query|{}", text.trim());
+            state.cached_aux_query(media_cache_key, || {
+                media_embedder
+                    .embed_text(&text, true)
+                    .map_err(|error| format!("media query embedding failed: {error}"))
+            })?
+        };
         let mut media_query = q.clone();
         media_query.query_vector = Some(media_vec);
         media_query.vector_space = Some("media".into());
@@ -1051,9 +1241,15 @@ pub struct ScanProgress {
 /// work has been checkpointed. This monitor is detached from the UI/scan
 /// thread, so changing views does not affect indexing progress.
 fn schedule_runtime_model_release(state: Arc<AppState>, indexer: Arc<crate::index::Indexer>) {
+    // A monitor must not keep an obsolete indexer (and both of its native
+    // model contexts) alive for the entire idle grace period after a switch.
+    let indexer = Arc::downgrade(&indexer);
     std::thread::spawn(move || {
         loop {
-            if !indexer.is_idle() {
+            let Some(current) = indexer.upgrade() else { break };
+            let idle = current.is_idle();
+            drop(current);
+            if !idle {
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 continue;
             }
@@ -1066,8 +1262,10 @@ fn schedule_runtime_model_release(state: Arc<AppState>, indexer: Arc<crate::inde
             // and a newly queued batch cancels the release through the idle
             // check below.
             std::thread::sleep(std::time::Duration::from_secs(10));
-            if indexer.is_idle() {
-                state.release_runtime_model_if_idle(&indexer);
+            if let Some(current) = indexer.upgrade() {
+                if current.is_idle() {
+                    state.release_runtime_model_if_idle(&current);
+                }
             }
             break;
         }
@@ -1123,8 +1321,8 @@ pub fn start_scan(
         Some("embed") | Some("auto") => true,
         _ => cfg.index.auto_embed,
     };
-    if !scan_only && needs_embedding {
-        if let Err(error) = ensure_index_model(state) {
+    if !scan_only {
+        if let Err(error) = prepare_index_runtime(state, needs_embedding) {
             state.scan_busy.store(false, Ordering::SeqCst);
             return Err(error);
         }
@@ -1241,7 +1439,10 @@ pub fn scan_start(
 pub async fn scan_cancel(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let state = Arc::clone(state.inner());
     request_active_cancel(&state, true);
-    wait_active_cancelled(&state, true).await
+    // Native inference is cooperatively cancellable between forward calls.
+    // Return immediately so the UI can poll the worker instead of waiting on
+    // a potentially long in-flight CUDA call.
+    Ok(())
 }
 
 fn request_active_cancel(state: &Arc<AppState>, cancel_scan: bool) {
@@ -1249,7 +1450,9 @@ fn request_active_cancel(state: &Arc<AppState>, cancel_scan: bool) {
         state.scan_cancel.store(true, Ordering::SeqCst);
     }
     if let Some(indexer) = state.indexer() {
-        indexer.cancel_pending();
+        if !indexer.is_idle() {
+            indexer.cancel_pending();
+        }
     }
 }
 
@@ -1288,6 +1491,132 @@ mod model_transition_tests {
         assert!(is_expected_index_enqueue_cancellation(INDEX_ENQUEUE_CANCELLED));
         assert!(!is_expected_index_enqueue_cancellation("database unavailable"));
     }
+
+    #[test]
+    fn concurrent_lazy_model_load_reuses_an_already_prepared_model() {
+        use crate::ai::{EmbedInfo, Embedder};
+        use std::path::Path;
+        use std::sync::{Arc, Barrier};
+        struct PreparedEncoder(String);
+        impl Embedder for PreparedEncoder {
+            fn info(&self) -> EmbedInfo {
+                EmbedInfo {
+                    backend: "llama.cpp".into(), model: self.0.clone(), dim: 768,
+                    device: "CPU".into(), modalities: vec!["text".into()],
+                    ready: true, detail: String::new(),
+                }
+            }
+            fn dim(&self) -> usize { 768 }
+            fn embed_text(&self, _: &str, _: bool) -> Result<Vec<f32>, String> { unreachable!() }
+            fn embed_image(&self, _: &Path) -> Result<Vec<f32>, String> { unreachable!() }
+            fn embed_audio(&self, _: &Path) -> Result<Vec<f32>, String> { unreachable!() }
+            fn embed_video(&self, _: &Path) -> Result<Vec<f32>, String> { unreachable!() }
+        }
+        let (state, root) = crate::state::test_support::state();
+        let model_path = root.join("prepared.gguf");
+        // This intentionally is not a native model. Re-entering the expensive
+        // load path instead of reusing the prepared runtime would fail.
+        std::fs::write(&model_path, b"prepared runtime fixture").unwrap();
+        let path = model_path.to_string_lossy().to_string();
+        state.cfg.write().model.embed_model = path.clone();
+        let encoder: Arc<dyn Embedder> = Arc::new(PreparedEncoder(path.clone()));
+        *state.embedder.write() = Arc::clone(&encoder);
+        let barrier = Arc::new(Barrier::new(8));
+        let jobs: Vec<_> = (0..8).map(|_| {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                super::model_load_inner(&state, "auto".into(), Some(path)).unwrap()
+            })
+        }).collect();
+        for job in jobs {
+            assert_eq!(job.join().unwrap().backend, "llama.cpp");
+        }
+        assert!(Arc::ptr_eq(&encoder, &state.embedder.read()));
+        assert!(state.indexer().is_none(), "a reused model must not replace the indexer");
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn switching_an_idle_runtime_does_not_turn_next_task_into_a_resume() {
+        let (state, root) = crate::state::test_support::state();
+        let previous = state.rebuild_indexer();
+        previous.restore_elapsed_millis(123_000);
+        super::quiesce_before_model_change(&state, true).await.unwrap();
+        assert!(!previous.snapshot().cancelled, "completed idle work is not a cancelled task");
+        let replacement = state.rebuild_indexer();
+        assert_eq!(replacement.snapshot().elapsed_seconds, 123);
+        replacement.enqueue(vec![], "all").unwrap();
+        assert!(replacement.snapshot().elapsed_seconds < 5, "a new task must reset the old elapsed time");
+        replacement.stop();
+        drop(previous);
+        drop(replacement);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Opt-in native integration check. Paths are supplied by the developer;
+    /// all configuration, documents and vector stores live in a fresh fixture.
+    #[cfg(all(feature = "llama", feature = "candle"))]
+    #[test]
+    #[ignore = "requires DDO_TEST_GGUF_MODEL and DDO_TEST_SAFETENSORS_MODEL"]
+    fn native_gguf_to_safetensors_indexes_searches_and_keeps_progress() {
+        let gguf = std::env::var("DDO_TEST_GGUF_MODEL").expect("set DDO_TEST_GGUF_MODEL");
+        let safe = std::env::var("DDO_TEST_SAFETENSORS_MODEL").expect("set DDO_TEST_SAFETENSORS_MODEL");
+        let (state, root) = crate::state::test_support::state();
+        {
+            let mut cfg = state.cfg.write();
+            cfg.model.context_size = 8192;
+            cfg.model.gpu_device = std::env::var("DDO_TEST_GPU_DEVICE").unwrap_or_else(|_| "auto".into());
+            cfg.index.batch_size = 4;
+            cfg.index.vector_dim = 768;
+        }
+        let body = "An engine piston moves inside the cylinder and transfers combustion force to the crankshaft.";
+        let document = root.join("engine.txt");
+        std::fs::write(&document, body).unwrap();
+        let mut file = crate::db::FileRow::new(&document.to_string_lossy());
+        file.kind = "text".into();
+        file.size = body.len() as i64;
+        let file_id = state.db.upsert_file(&file).unwrap();
+        let query = crate::search::SearchQuery {
+            text: "engine piston cylinder combustion crankshaft".into(),
+            search_mode: Some("semantic".into()),
+            scope: Some("all".into()), workspace: Some(false), ..Default::default()
+        };
+        for (path, backend) in [(gguf, "llama.cpp"), (safe, "candle")] {
+            let started = std::time::Instant::now();
+            let info = super::model_load_inner(&state, "auto".into(), Some(path)).unwrap();
+            assert_eq!(info.backend, backend);
+            assert_eq!(info.dim, 768);
+            eprintln!("native model {backend}: device={} load={:.2}s", info.device, started.elapsed().as_secs_f64());
+            let indexer = state.indexer().unwrap();
+            assert_eq!(indexer.enqueue_all_pending("auto"), 1);
+            assert!(indexer.wait_idle(120), "native indexing timed out for {backend}");
+            let completed = indexer.snapshot();
+            assert_eq!(completed.emb_fail, 0);
+            assert_eq!(completed.emb_done, 1);
+            let hits = super::semantic_search_inner(&state, query.clone()).unwrap();
+            assert!(hits.iter().any(|hit| hit.id == file_id), "{backend} semantic results: {hits:?}");
+            state.release_runtime_model_if_idle(&indexer);
+            drop(indexer);
+            assert_eq!(state.indexer().unwrap().snapshot().emb_done, completed.emb_done);
+            // Waking the model for a query must neither clear counters nor
+            // lose the persisted vectors that were just indexed.
+            let hits = super::semantic_search_inner(&state, query.clone()).unwrap();
+            assert!(hits.iter().any(|hit| hit.id == file_id));
+            assert_eq!(state.indexer().unwrap().snapshot().emb_done, completed.emb_done);
+        }
+        assert!(root.join("vectors/previous-models").is_dir());
+        let mut fulltext = query;
+        fulltext.search_mode = Some("fulltext".into());
+        assert!(state.search(&mut fulltext).iter().any(|hit| hit.id == file_id));
+        state.indexer().unwrap().stop();
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// A model must not be replaced while a scan can still enqueue work or while
@@ -1304,7 +1633,9 @@ async fn wait_active_cancelled(state: &Arc<AppState>, cancel_scan: bool) -> Resu
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     if let Some(indexer) = state.indexer() {
-        indexer.cancel_pending();
+        if !indexer.is_idle() {
+            indexer.cancel_pending();
+        }
         while !indexer.is_idle() {
             if tokio::time::Instant::now() >= deadline {
                 return Err("模型当前推理尚未结束；任务已请求暂停，请稍后重试停用模型".into());
@@ -1363,6 +1694,11 @@ pub fn index_start(
     force: Option<bool>,
     roots: Option<Vec<String>>,
 ) -> Result<usize, String> {
+    if state.scan_busy.load(Ordering::Acquire) {
+        return Err("扫描正在进行，请等待扫描完成后再开始索引".into());
+    }
+    let what = what.unwrap_or_else(|| "auto".into());
+    prepare_index_runtime(state.inner(), what != "text")?;
     // Serialize enqueueing with model replacement. A deactivation sets the
     // transition flag first, then uses this lock as a barrier before its final
     // cancellation pass.
@@ -1374,7 +1710,6 @@ pub fn index_start(
         Some(i) => i,
         None => state.rebuild_indexer(),
     };
-    let what = what.unwrap_or_else(|| "auto".into());
     let scan = state.cfg.read().scan.clone();
     let configured = !scan.roots.is_empty();
     let enabled: Vec<String> = scan.roots.iter()
@@ -1432,7 +1767,7 @@ pub fn index_start(
 pub async fn index_cancel(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let state = Arc::clone(state.inner());
     request_active_cancel(&state, false);
-    wait_active_cancelled(&state, false).await
+    Ok(())
 }
 
 #[tauri::command]
@@ -1525,19 +1860,36 @@ pub fn model_info(state: State<'_, Arc<AppState>>) -> ModelInfoOut {
 }
 
 #[tauri::command]
-pub fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option<String>) -> Result<ModelInfoOut, String> {
-    model_load_inner(state.inner(), backend, path)
+pub async fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option<String>) -> Result<ModelInfoOut, String> {
+    let state = Arc::clone(state.inner());
+    let _transition = ModelTransitionGuard::begin(&state.model_transition)?;
+    quiesce_before_model_change(&state, true).await?;
+    let work_state = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        model_load_inner_impl(&work_state, backend, path, true)
+    })
+    .await
+    .map_err(|error| format!("模型加载任务失败: {error}"))?
 }
 
 /// Load an embedding model for an explicit UI/indexing request. Keeping this
 /// separate from the Tauri wrapper lets the indexer perform a lazy reload
 /// without pretending that opening the application needs a model.
 pub fn model_load_inner(state: &Arc<AppState>, backend: String, path: Option<String>) -> Result<ModelInfoOut, String> {
+    model_load_inner_impl(state, backend, path, false)
+}
+
+fn model_load_inner_impl(
+    state: &Arc<AppState>,
+    backend: String,
+    path: Option<String>,
+    transition_owner: bool,
+) -> Result<ModelInfoOut, String> {
     // Keep concurrent loads serialized for their full lifetime. The second
     // transition check below discards an expensive load if deactivation began
     // while the backend was initializing.
     let _model_change = state.model_change_lock.lock();
-    if state.model_transition.load(Ordering::Acquire) {
+    if state.model_transition.load(Ordering::Acquire) && !transition_owner {
         return Err("模型正在停用，已取消本次加载".into());
     }
     let mut cfg = state.cfg.read().clone();
@@ -1562,10 +1914,63 @@ pub fn model_load_inner(state: &Arc<AppState>, backend: String, path: Option<Str
     } else {
         return Err(format!("无法识别模型格式：{}（需要 GGUF 或 safetensors）", requested));
     };
+    // Several cold search lanes can observe the lazy hash placeholder before
+    // any of them acquires model_change_lock. Recheck under that lock so the
+    // second lane reuses the model just loaded by the first one.
+    let active = state.embedder.read().info();
+    let same_backend = (mode == "llama" && active.backend == "llama.cpp")
+        || (mode == "candle" && active.backend == "candle");
+    let same_path = resolved.as_ref().is_some_and(|resolved| {
+        let resolved = if mode == "candle" && resolved.is_file() {
+            resolved.parent().unwrap_or(resolved.as_path())
+        } else {
+            resolved.as_path()
+        };
+        active.model.replace('\\', "/").eq_ignore_ascii_case(&resolved.to_string_lossy().replace('\\', "/"))
+    });
+    if same_backend && same_path && active.ready
+        && !state.model_settings_dirty.load(Ordering::Acquire)
+    {
+        return Ok(ModelInfoOut {
+            backend: active.backend,
+            model: active.model,
+            dim: active.dim,
+            device: active.device,
+            modalities: active.modalities,
+            ready: active.ready,
+            detail: active.detail,
+            clip: state.clip.read().as_ref().map(|model| model.describe()).unwrap_or_default(),
+            clap: state.clap.read().as_ref().map(|model| model.describe()).unwrap_or_default(),
+        });
+    }
     cfg.model.embed_model = if mode == "hash" { String::new() } else { resolved_s.clone().unwrap_or(requested.clone()) };
     if mode != "hash" {
         cfg.model.last_embed_model = cfg.model.embed_model.clone();
     }
+    // Stop/join the old consumer and release its contexts before allocating
+    // the replacement model. Previously GGUF and Candle coexisted here until
+    // after the new CUDA allocation, causing long driver stalls or OOMs.
+    if let Some(previous) = state.indexer() {
+        if !previous.is_idle() {
+            previous.cancel_pending();
+        }
+        previous.stop();
+    }
+    let old_embedder = std::mem::replace(
+        &mut *state.embedder.write(),
+        Arc::new(crate::ai::hash::HashEmbedder::new()),
+    );
+    let old_media = std::mem::replace(
+        &mut *state.media_embedder.write(),
+        Arc::new(crate::ai::hash::HashEmbedder::new()),
+    );
+    let old_clip = state.clip.write().take();
+    let old_clap = state.clap.write().take();
+    state.rebuild_indexer();
+    // Native CUDA destruction can take seconds. Never run it while holding
+    // AppState's model/indexer RwLocks: model_info and progress polling need
+    // those locks to keep the settings window responsive.
+    drop((old_embedder, old_media, old_clip, old_clap));
     let emb: Arc<dyn crate::ai::Embedder> = match mode {
         "llama" => {
             #[cfg(feature = "llama")]
@@ -1579,7 +1984,9 @@ pub fn model_load_inner(state: &Arc<AppState>, backend: String, path: Option<Str
                     cfg.index.video_token_budget,
                     cfg.index.audio_seconds,
                     cfg.index.video_frame_interval,
-                )?;
+                )?
+                .with_image_budgets(cfg.index.image_token_budget, cfg.index.pdf_image_token_budget)
+                .with_encoders(cfg.index.vision_encoder, cfg.index.audio_encoder, cfg.index.video_index_audio);
                 Arc::new(e)
             }
             #[cfg(not(feature = "llama"))]
@@ -1646,10 +2053,77 @@ pub fn model_load_inner(state: &Arc<AppState>, backend: String, path: Option<Str
     } else {
         Arc::new(crate::ai::hash::HashEmbedder::new())
     };
-    if state.model_transition.load(Ordering::Acquire) {
+    if state.model_transition.load(Ordering::Acquire) && !transition_owner {
         return Err("模型正在停用，已取消本次加载".into());
     }
-    let _ = cfg.save(&crate::config::config_path(Some(&state.app_dir)));
+    // Model identity is independent of the configured storage width. A
+    // 768-D GGUF vector cannot safely be searched with an unrelated 768-D
+    // Safetensors query vector. Canonicalize Safetensors files to their model
+    // directory so selecting model.safetensors and selecting its folder agree.
+    let identity_model = resolved.as_ref().map(|model| {
+        let model = if mode == "candle" && model.is_file() {
+            model.parent().unwrap_or(model.as_path())
+        } else {
+            model.as_path()
+        };
+        model.to_string_lossy().to_string()
+    }).unwrap_or_else(|| info.model.clone());
+    let primary_identity = crate::vector::EncoderIdentity::new(
+        &info.backend, &identity_model, info.dim,
+    );
+    let media_info = media_embedder.info();
+    let media_identity = if shared_media {
+        primary_identity.clone()
+    } else {
+        crate::vector::EncoderIdentity::new(&media_info.backend, &media_info.model, media_info.dim)
+    };
+    let vec_dir = state.data_dir.join("vectors");
+    let old_count = state.vectors.read().len();
+    let vectors = crate::vector::VectorStore::open(&vec_dir, store_dim)
+        .map_err(|error| format!("打开文本向量库失败: {error}"))?;
+    let primary_binding = vectors.bind_encoder(
+        primary_identity,
+        crate::index::embedder_model_key(emb.as_ref(), &cfg.index),
+    ).map_err(|error| format!("绑定文本向量模型失败: {error}"))?;
+    let media_dir = state.data_dir.join("vectors_media");
+    let old_media_count = state.media_vectors.read().len();
+    let media_vectors = crate::vector::VectorStore::open(&media_dir, store_dim)
+        .map_err(|error| format!("打开媒体向量库失败: {error}"))?;
+    let media_binding = media_vectors.bind_encoder(
+        media_identity,
+        crate::index::embedder_model_key(media_embedder.as_ref(), &cfg.index),
+    ).map_err(|error| format!("绑定媒体向量模型失败: {error}"))?;
+    if primary_binding.changed || media_binding.changed
+        || (old_count > 0 && vectors.is_empty())
+        || (old_media_count > 0 && media_vectors.is_empty())
+    {
+        state.db.reset_states("embed")
+            .map_err(|error| format!("标记待重建向量失败: {error}"))?;
+        let _ = state.db.log("model", &format!(
+            "编码模型或维度已变化，正文保留、向量标记为待重建；原向量备份：文本={}，媒体={}",
+            primary_binding.backup.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "无".into()),
+            media_binding.backup.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "无".into()),
+        ));
+    }
+    if primary_binding.legacy || media_binding.legacy {
+        let _ = state.db.log("model", "旧向量库没有模型身份记录，已兼容接管；无法证明其历史模型一致性，如相关性异常请重新建立向量索引");
+    }
+    // Lazy model recovery reopens both vector stores. Video windows are also
+    // checkpointed in SQLite, so restore them here as well; otherwise a
+    // semantic search immediately after model reload can miss timestamped
+    // video content until another indexing run writes the flat store.
+    {
+        if let Ok(restored) = state.db.restore_video_segment_vectors(&vectors, &media_vectors) {
+            if restored > 0 {
+                let _ = state.db.log(
+                    "model",
+                    &format!("model reload restored {restored} persisted video segment vectors"),
+                );
+            }
+        }
+    }
+    cfg.save(&state.data_dir.join("config.json"))
+        .map_err(|error| format!("保存模型配置失败: {error}"))?;
     *state.cfg.write() = cfg;
     // Cross-modal encoders are opt-in and are loaded only after the user
     // explicitly chooses a model or starts indexing.
@@ -1661,47 +2135,13 @@ pub fn model_load_inner(state: &Arc<AppState>, backend: String, path: Option<Str
     *state.clip.write() = clip;
     *state.clap.write() = clap;
     *state.embedder.write() = emb;
-    // 维度变了，向量库需要重建
-    let vec_dir = state.data_dir.join("vectors");
-    let old_count = state.vectors.read().len();
-    if let Ok(v) = crate::vector::VectorStore::open(&vec_dir, store_dim) {
-        // 换模型后维度变化会让旧的向量文件被丢弃。此时 embed_state 还是 ok，
-        // 不重置就会「重建索引排队 0 个」——用户以为重建了，其实一条都没跑。
-        let new_count = v.len();
-        if old_count > 0 && new_count == 0 {
-            let _ = state.db.reset_states("embed");
-            let _ = state.db.log("model", "嵌入维度变化，已把全部文件标记为待重新向量化");
-        }
-        *state.vectors.write() = Arc::new(v);
-    }
-    let media_dir = state.data_dir.join("vectors_media");
-    let old_media_count = state.media_vectors.read().len();
-    if let Ok(v) = crate::vector::VectorStore::open(&media_dir, store_dim) {
-        if old_media_count > 0 && v.len() == 0 {
-            let _ = state.db.reset_states("embed");
-            let _ = state.db.log("model", "媒体向量空间已切换，已把文件标记为待重新向量化");
-        }
-        *state.media_vectors.write() = Arc::new(v);
-    }
-    // Lazy model recovery reopens both vector stores. Video windows are also
-    // checkpointed in SQLite, so restore them here as well; otherwise a
-    // semantic search immediately after model reload can miss timestamped
-    // video content until another indexing run writes the flat store.
-    {
-        let primary = state.vectors.read().clone();
-        let media = state.media_vectors.read().clone();
-        if let Ok(restored) = state.db.restore_video_segment_vectors(&primary, &media) {
-            if restored > 0 {
-                let _ = state.db.log(
-                    "model",
-                    &format!("model reload restored {restored} persisted video segment vectors"),
-                );
-            }
-        }
-    }
+    *state.vectors.write() = Arc::new(vectors);
+    *state.media_vectors.write() = Arc::new(media_vectors);
     *state.media_embedder.write() = media_embedder;
     state.clear_search_cache();
     let _ = state.rebuild_indexer();
+    state.index_settings_dirty.store(false, Ordering::Release);
+    state.model_settings_dirty.store(false, Ordering::Release);
     let i = state.embedder.read().info();
     let clip = state.clip.read().as_ref().map(|m| m.describe()).unwrap_or_default();
     let clap = state.clap.read().as_ref().map(|m| m.describe()).unwrap_or_default();
@@ -1733,10 +2173,127 @@ pub fn ensure_index_model(state: &Arc<AppState>) -> Result<(), String> {
         return Ok(());
     }
     let active = state.embedder.read().info();
-    if active.ready && active.backend != "hash" {
+    if active.ready && active.backend != "hash"
+        && !state.model_settings_dirty.load(Ordering::Acquire)
+    {
         return Ok(());
     }
+    if state.indexer().is_some_and(|indexer| !indexer.is_idle()) {
+        return Err("当前索引任务仍在运行，新模型参数将在下次建立索引时生效".into());
+    }
     model_load_inner(state, "auto".into(), Some(path)).map(|_| ())
+}
+
+/// Apply saved settings once, immediately before admitting a new indexing
+/// pass. Text-only requests refresh extraction/OCR settings without loading a
+/// GPU model; model construction changes stay pending for a vector request.
+fn prepare_index_runtime(state: &Arc<AppState>, needs_embedding: bool) -> Result<(), String> {
+    loop {
+        if needs_embedding {
+            ensure_index_model(state)?;
+        }
+        let model_change = state.model_change_lock.lock();
+        if state.model_transition.load(Ordering::Acquire) {
+            return Err("模型正在切换，请稍后再开始索引".into());
+        }
+        let cfg = state.cfg.read().clone();
+        // A save can win the short gap between lazy model preparation and
+        // acquiring this lock. Retry with that newer configuration before
+        // admitting work, rather than pairing a new Indexer with an old GPU
+        // runtime. The no-model case intentionally keeps the lazy flag.
+        let has_model = !cfg.model.embed_model.trim().is_empty()
+            || !cfg.model.last_embed_model.trim().is_empty();
+        if needs_embedding && has_model && state.model_settings_dirty.load(Ordering::Acquire) {
+            drop(model_change);
+            continue;
+        }
+        let pending = state.index_settings_dirty.load(Ordering::Acquire);
+        let current = state.indexer();
+        let dim = cfg.index.vector_dim;
+        let stores_match = state.vectors.read().dim() == dim
+            && state.media_vectors.read().dim() == dim
+            && state.clip_vectors.read().dim() == dim
+            && state.audio_vectors.read().dim() == dim;
+        if !pending && current.is_some() && stores_match {
+            return Ok(());
+        }
+        if current.as_ref().is_some_and(|indexer| !indexer.is_idle()) {
+            return Err("当前索引任务仍在运行，新索引参数将在下次建立索引时生效".into());
+        }
+        if state.reopen_vector_stores(dim)? {
+            state.db.reset_states("embed").map_err(|error| format!("更新索引维度失败：{error}"))?;
+            let _ = state.db.log(
+                "model",
+                &format!("索引库维度已切换为 {dim}，旧向量保留在原文件中，等待重新建立索引"),
+            );
+        }
+        let _ = state.rebuild_indexer();
+        state.index_settings_dirty.store(false, Ordering::Release);
+        return Ok(());
+    }
+}
+
+#[cfg(test)]
+mod index_settings_tests {
+    use super::{index_runtime_settings_changed, prepare_index_runtime};
+    use crate::config::AppConfig;
+    use std::sync::{atomic::Ordering, Arc};
+
+    #[test]
+    fn unrelated_preferences_do_not_reload_indexing_or_model() {
+        let before = AppConfig::default();
+        let mut after = before.clone();
+        after.ui.professional_mode = true;
+        after.search.semantic_floor = 0.6;
+        after.scan.roots.push("C:\\docs".into());
+        assert_eq!(index_runtime_settings_changed(&before, &after), (false, false));
+    }
+
+    #[test]
+    fn extraction_and_dimension_changes_only_rebind_indexer() {
+        let before = AppConfig::default();
+        let mut after = before.clone();
+        after.index.max_text_chars = 500_000;
+        assert_eq!(index_runtime_settings_changed(&before, &after), (true, false));
+        after = before.clone();
+        after.index.vector_dim = 512;
+        assert_eq!(index_runtime_settings_changed(&before, &after), (true, false));
+        after = before.clone();
+        after.model.teleocr_model_dir = "C:\\models\\ocr".into();
+        assert_eq!(index_runtime_settings_changed(&before, &after), (true, false));
+    }
+
+    #[test]
+    fn model_creation_parameters_require_lazy_reload() {
+        let before = AppConfig::default();
+        let mut after = before.clone();
+        after.index.image_token_budget = 560;
+        assert_eq!(index_runtime_settings_changed(&before, &after), (true, true));
+        after = before.clone();
+        after.index.batch_size = 16;
+        assert_eq!(index_runtime_settings_changed(&before, &after), (true, true));
+        after = before.clone();
+        after.model.gpu_device = "cpu".into();
+        assert_eq!(index_runtime_settings_changed(&before, &after), (true, true));
+    }
+
+    #[test]
+    fn text_only_start_applies_index_settings_once_without_waking_model() {
+        let (state, root) = crate::state::test_support::state();
+        state.index_settings_dirty.store(true, Ordering::Release);
+        state.model_settings_dirty.store(true, Ordering::Release);
+        prepare_index_runtime(&state, false).unwrap();
+        let first = state.indexer().unwrap();
+        assert!(!state.index_settings_dirty.load(Ordering::Acquire));
+        assert!(state.model_settings_dirty.load(Ordering::Acquire));
+        assert_eq!(state.embedder.read().info().backend, "hash");
+        prepare_index_runtime(&state, false).unwrap();
+        assert!(Arc::ptr_eq(&first, &state.indexer().unwrap()));
+        first.stop();
+        drop(first);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 // ---------------------------------------------------------------- 模型管理
@@ -1752,8 +2309,13 @@ pub async fn model_deactivate(state: State<'_, Arc<AppState>>) -> Result<ModelIn
     // so calling it before the worker has observed cancellation can make the
     // settings window appear hung for the duration of a large document pass.
     quiesce_before_model_change(&state, true).await?;
-    let _model_change = state.model_change_lock.lock();
-    model_deactivate_inner(&state)
+    let work_state = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _model_change = work_state.model_change_lock.lock();
+        model_deactivate_inner(&work_state)
+    })
+    .await
+    .map_err(|error| format!("模型停用任务失败: {error}"))?
 }
 
 fn model_deactivate_inner(state: &Arc<AppState>) -> Result<ModelInfoOut, String> {
@@ -1783,20 +2345,21 @@ fn model_deactivate_inner(state: &Arc<AppState>) -> Result<ModelInfoOut, String>
         needs_reindex = true;
     }
 
-    cfg.save(&crate::config::config_path(Some(&state.app_dir)))
+    cfg.save(&state.data_dir.join("config.json"))
         .map_err(|e| format!("保存模型配置失败: {e}"))?;
     *state.cfg.write() = cfg;
-    *state.embedder.write() = emb;
-    *state.media_embedder.write() = media_emb;
+    let old_embedder = std::mem::replace(&mut *state.embedder.write(), emb);
+    let old_media = std::mem::replace(&mut *state.media_embedder.write(), media_emb);
     state.clear_search_cache();
     // Deactivation must also remove any CLIP/CLAP instances loaded for the
     // previous model. Otherwise the settings page can report stale media
     // capability and indexing can keep using those encoders.
-    *state.clip.write() = None;
-    *state.clap.write() = None;
+    let old_clip = state.clip.write().take();
+    let old_clap = state.clap.write().take();
     *state.vectors.write() = Arc::new(vectors);
     *state.media_vectors.write() = Arc::new(media_vectors);
     let _ = state.rebuild_indexer();
+    drop((old_embedder, old_media, old_clip, old_clap));
     if needs_reindex {
         let _ = state.db.log("model", "模型已切换；待处理向量会在你手动开始索引后重建");
     }
@@ -1829,7 +2392,7 @@ pub async fn ocr_model_deactivate(state: State<'_, Arc<AppState>>) -> Result<(),
     let _model_change = state.model_change_lock.lock();
     let mut cfg = state.cfg.read().clone();
     cfg.model.teleocr_model_dir.clear();
-    cfg.save(&crate::config::config_path(Some(&state.app_dir)))
+    cfg.save(&state.data_dir.join("config.json"))
         .map_err(|e| format!("淇濆瓨 OCR 閰嶇疆澶辫触: {e}"))?;
     *state.cfg.write() = cfg;
     crate::ocr::shutdown();
@@ -3616,11 +4179,31 @@ fn unload_cross_modal_for_extension(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-/// Install an optional extension into the project-local `.tools` directory.
-/// Only the two fixed script names are accepted; no user-provided command is
-/// executed and existing files are never removed.
+// ONNX has no files in common with Python. Python and PyTorch share the same
+// runtime, so accept both requests but serialize only their filesystem changes.
+static ONNX_EXTENSION_OPERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PYTHON_EXTENSION_OPERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_extension_operation(kind: &str) -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    let lock = match kind {
+        "onnxruntime" => &ONNX_EXTENSION_OPERATION,
+        "python" | "pytorch" => &PYTHON_EXTENSION_OPERATION,
+        _ => return Err("未知扩展类型".into()),
+    };
+    Ok(lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+}
+
+/// Install only a fixed bundled script; run downloads away from the UI thread.
 #[tauri::command]
-pub fn extension_install(state: State<'_, Arc<AppState>>, kind: String) -> Result<ExtensionStatusOut, String> {
+pub async fn extension_install(state: State<'_, Arc<AppState>>, kind: String) -> Result<ExtensionStatusOut, String> {
+    let worker_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || extension_install_inner(&worker_state, kind))
+        .await
+        .map_err(|error| format!("扩展安装任务失败：{error}"))?
+}
+
+fn extension_install_inner(state: &AppState, kind: String) -> Result<ExtensionStatusOut, String> {
+    let _operation = lock_extension_operation(&kind)?;
     let script_name = match kind.as_str() {
         "onnxruntime" => "install-onnxruntime.ps1",
         "python" => "install-python-sidecar.ps1",
@@ -3636,12 +4219,17 @@ pub fn extension_install(state: State<'_, Arc<AppState>>, kind: String) -> Resul
         return Err(format!("找不到扩展安装脚本：{}", script.display()));
     }
     let root_arg = root.as_os_str().to_string_lossy().into_owned();
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+    let mut command = std::process::Command::new("powershell.exe");
+    command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&script)
         .args(["-InstallRoot", root_arg.as_str()])
-        .current_dir(&root)
-        .output()
+        .current_dir(&root);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output()
         .map_err(|e| format!("启动 PowerShell 失败：{e}"))?;
     if !output.status.success() {
         let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -3652,10 +4240,18 @@ pub fn extension_install(state: State<'_, Arc<AppState>>, kind: String) -> Resul
 }
 
 #[tauri::command]
-pub fn extension_update(state: State<'_, Arc<AppState>>, kind: String) -> Result<ExtensionStatusOut, String> {
+pub async fn extension_update(state: State<'_, Arc<AppState>>, kind: String) -> Result<ExtensionStatusOut, String> {
+    let worker_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || extension_update_inner(&worker_state, kind))
+        .await
+        .map_err(|error| format!("扩展更新任务失败：{error}"))?
+}
+
+fn extension_update_inner(state: &AppState, kind: String) -> Result<ExtensionStatusOut, String> {
     if kind != "onnxruntime" {
         return Err("目前仅支持检查 ONNX Runtime 更新".into());
     }
+    let _operation = lock_extension_operation(&kind)?;
     let before = extension_status_for(&state);
     if !before.onnxruntime {
         return Err("ONNX Runtime 尚未安装".into());
@@ -3670,14 +4266,19 @@ pub fn extension_update(state: State<'_, Arc<AppState>>, kind: String) -> Result
         return Err(format!("找不到 ONNX Runtime 更新脚本：{}", script.display()));
     }
     let root_arg = root.as_os_str().to_string_lossy().into_owned();
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+    let mut command = std::process::Command::new("powershell.exe");
+    command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&script)
         .arg("-Update")
         .arg("-InstallRoot")
         .arg(root_arg)
-        .current_dir(&root)
-        .output()
+        .current_dir(&root);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output()
         .map_err(|e| format!("启动 ONNX Runtime 更新失败：{e}"))?;
     if !output.status.success() {
         let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -3753,10 +4354,18 @@ fn move_extension_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn extension_remove(state: State<'_, Arc<AppState>>, kind: String) -> Result<ExtensionStatusOut, String> {
+pub async fn extension_remove(state: State<'_, Arc<AppState>>, kind: String) -> Result<ExtensionStatusOut, String> {
+    let worker_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || extension_remove_inner(&worker_state, kind))
+        .await
+        .map_err(|error| format!("扩展删除任务失败：{error}"))?
+}
+
+fn extension_remove_inner(state: &AppState, kind: String) -> Result<ExtensionStatusOut, String> {
     if kind != "onnxruntime" {
         return Err("目前仅支持删除 ONNX Runtime 扩展".into());
     }
+    let _operation = lock_extension_operation(&kind)?;
     unload_cross_modal_for_extension(&state)?;
     let root = extension_root(&state);
     let candidates = [

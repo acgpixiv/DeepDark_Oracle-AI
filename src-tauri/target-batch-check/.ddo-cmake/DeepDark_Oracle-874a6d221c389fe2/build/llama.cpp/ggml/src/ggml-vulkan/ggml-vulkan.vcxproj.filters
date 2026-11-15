@@ -1,0 +1,825 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="E:\项目\AI--deepaisee\vendor\llama.cpp\ggml\src\ggml-vulkan\ggml-vulkan.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\acc.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\add.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\add1.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\add_id.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\arange.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\argmax.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\argsort.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\argsort_large.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\col2im_1d.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\concat.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\contig_copy.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\conv2d_dw.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\conv2d_mm.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\conv3d_mm.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\conv_transpose_1d.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\copy.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\copy_from_quant.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\copy_to_quant.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\copy_transpose.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\count_equal.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\count_experts.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\cumsum.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\cumsum_multipass1.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\cumsum_multipass2.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_f32.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_iq1_m.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_iq1_s.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_iq2_s.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_iq2_xs.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_iq2_xxs.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_iq3_s.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_iq3_xxs.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_iq4_nl.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_iq4_xs.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_mxfp4.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_nvfp4.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q1_0.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q2_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q3_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q4_0.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q4_1.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q4_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q5_0.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q5_1.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q5_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q6_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\dequant_q8_0.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\diag.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\diag_mask_inf.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\div.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\fill.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\flash_attn.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\flash_attn_cm1.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\flash_attn_cm2.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\flash_attn_mask_opt.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\flash_attn_split_k_reduce.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\fwht.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\gated_delta_net.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\geglu.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\geglu_erf.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\geglu_quick.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\get_rows.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\get_rows_back.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\get_rows_quant.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\group_norm.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\im2col.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\im2col_3d.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\l2_norm.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\log.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_split_k_reduce.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_iq1_m.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_iq1_s.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_iq2_s.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_iq2_xs.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_iq2_xxs.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_iq3_s.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_iq3_xxs.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_nc.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_p021.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_q2_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_q3_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_q4_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_q5_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vec_q6_k.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mat_vecq.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mm.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mm_cm2.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\mul_mmq.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\multi_add.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\norm.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\opt_step_adamw.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\opt_step_sgd.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\pad.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\pool2d.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\quantize_q8_1.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\reglu.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\repeat.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\repeat_back.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\rms_norm.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\rms_norm_back.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\rms_norm_partials.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\roll.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\rope_multi.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\rope_neox.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\rope_norm.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\rope_vision.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\scale.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\silu_back.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\snake.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\soft_max.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\soft_max_back.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\soft_max_large1.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\soft_max_large2.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\soft_max_large3.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\solve_tri.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\ssm_conv.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\ssm_scan.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\sub.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\sum_rows.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\swiglu.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\swiglu_oai.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\timestep_embedding.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\topk_argsort.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\topk_moe.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\topk_nary_search.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\tri.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\unary.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\upscale.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\wkv6.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\wkv7.comp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="E:\项目\AI--deepaisee\vendor\llama.cpp\ggml\include\ggml-vulkan.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\llama.cpp\ggml\src\ggml-vulkan\ggml-vulkan-shaders.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\ggml-vulkan-shaders.hpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\acc.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\add.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\add1.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\add_id.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\arange.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\argmax.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\argsort.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\argsort_large.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\col2im_1d.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\concat.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\contig_copy.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\conv2d_dw.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\conv2d_mm.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\conv3d_mm.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\conv_transpose_1d.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\copy.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\copy_from_quant.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\copy_to_quant.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\copy_transpose.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\count_equal.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\count_experts.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\cumsum.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\cumsum_multipass1.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\cumsum_multipass2.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_f32.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_iq1_m.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_iq1_s.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_iq2_s.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_iq2_xs.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_iq2_xxs.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_iq3_s.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_iq3_xxs.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_iq4_nl.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_iq4_xs.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_mxfp4.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_nvfp4.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q1_0.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q2_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q3_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q4_0.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q4_1.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q4_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q5_0.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q5_1.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q5_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q6_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\dequant_q8_0.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\diag.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\diag_mask_inf.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\div.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\fill.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\flash_attn.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\flash_attn_cm1.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\flash_attn_cm2.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\flash_attn_mask_opt.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\flash_attn_split_k_reduce.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\fwht.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\gated_delta_net.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\geglu.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\geglu_erf.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\geglu_quick.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\get_rows.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\get_rows_back.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\get_rows_quant.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\group_norm.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\im2col.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\im2col_3d.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\l2_norm.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\log.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_split_k_reduce.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_iq1_m.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_iq1_s.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_iq2_s.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_iq2_xs.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_iq2_xxs.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_iq3_s.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_iq3_xxs.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_nc.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_p021.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_q2_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_q3_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_q4_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_q5_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vec_q6_k.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mat_vecq.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mm.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mm_cm2.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\mul_mmq.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\multi_add.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\norm.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\opt_step_adamw.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\opt_step_sgd.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\pad.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\pool2d.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\quantize_q8_1.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\reglu.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\repeat.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\repeat_back.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\rms_norm.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\rms_norm_back.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\rms_norm_partials.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\roll.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\rope_multi.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\rope_neox.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\rope_norm.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\rope_vision.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\scale.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\silu_back.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\snake.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\soft_max.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\soft_max_back.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\soft_max_large1.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\soft_max_large2.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\soft_max_large3.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\solve_tri.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\ssm_conv.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\ssm_scan.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\sub.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\sum_rows.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\swiglu.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\swiglu_oai.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\timestep_embedding.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\topk_argsort.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\topk_moe.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\topk_nary_search.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\tri.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\unary.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\upscale.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\wkv6.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\cf3e96c80303c273ca06c7dee8c73cd2\wkv7.comp.cpp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="E:\项目\AI--deepaisee\vendor\llama.cpp\ggml\src\ggml-vulkan\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{8DC6A6E4-7A9B-3C0D-9B1F-FF8ADB748EF2}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{A1FBF90C-6D5F-3A8C-8632-910037B08841}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4894F0D5-7DBC-353E-9897-144576BDEB97}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

@@ -109,15 +109,15 @@ pub fn run() -> i32 {
 
     // 3. 模型
     let t = Instant::now();
-    let mut dim = 512usize;
+    let model_dim: usize;
     let mut engine_ok = false;
     match build_embedder(&cfg.model) {
         Ok(emb) => {
-            dim = emb.dim();
+            model_dim = emb.dim();
             let info = emb.info();
             r.ok(
                 "加载嵌入模型",
-                format!("{} · {} 维 · {}", info.backend, dim, info.model),
+                format!("{} · {} 维 · {}", info.backend, model_dim, info.model),
                 t.elapsed().as_secs_f64() * 1000.0,
             );
             engine_ok = true;
@@ -147,7 +147,8 @@ pub fn run() -> i32 {
 
     // 5. 文本向量库
     let t = Instant::now();
-    let vectors = match VectorStore::open(&data.join("vectors"), dim) {
+    let store_dim = crate::state::configured_vector_dim(cfg.index.vector_dim);
+    let vectors = match VectorStore::open(&data.join("vectors"), store_dim) {
         Ok(v) => {
             r.ok(
                 "打开文本向量库",
@@ -162,15 +163,15 @@ pub fn run() -> i32 {
         }
     };
     let media = Arc::new(
-        VectorStore::open(&data.join("vectors_media"), 256)
+        VectorStore::open(&data.join("vectors_media"), store_dim)
             .unwrap_or_else(|_| panic!("无法创建媒体向量库")),
     );
     let clip_space = Arc::new(
-        VectorStore::open(&data.join("vectors_clip"), 512)
+        VectorStore::open(&data.join("vectors_clip"), store_dim)
             .unwrap_or_else(|_| panic!("无法创建跨模态图片向量库")),
     );
     let audio_space = Arc::new(
-        VectorStore::open(&data.join("vectors_audio"), 512)
+        VectorStore::open(&data.join("vectors_audio"), store_dim)
             .unwrap_or_else(|_| panic!("无法创建跨模态音频向量库")),
     );
 

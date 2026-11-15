@@ -60,7 +60,8 @@ function Assert-ReleasePrerequisites {
     "src-tauri\nsis\installer.nsi",
     "src-tauri\nsis\installer-hooks.nsh",
     "scripts\install-onnxruntime.ps1",
-    "scripts\install-python-sidecar.ps1"
+    "scripts\install-python-sidecar.ps1",
+    "scripts\install-pytorch.ps1"
   )
   $missing = @()
   foreach ($relative in $required) {
@@ -96,17 +97,13 @@ function Resolve-TargetRoot {
 # 手动覆写 TEMP 才跑得动。这里把临时目录钉在仓库内的 .tmpbuild，
 # 让 VSCode 终端里直接敲 `npm run tauri:release` 就能出包。
 # 注意必须放在仓库内：放到构建盘的 D:\DeepDark_Oracle-build\tmp 实测仍然被拒。
-function Set-BuildTemp {
+Push-Location $repo
+try {
   $tempRoot = Join-Path $repo ".tmpbuild"
   New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
   $env:TEMP = $tempRoot
   $env:TMP = $tempRoot
   Write-Host "Temp dir     : $tempRoot"
-}
-
-Push-Location $repo
-try {
-  Set-BuildTemp
   & (Join-Path $PSScriptRoot "patch-llama-embeddinggemma2.ps1")
   Assert-ReleasePrerequisites
   $runtimeDir = Join-Path $repo ".tools\cuda-runtime"

@@ -28,91 +28,128 @@ const excludeDirs = computed({
   get: () => props.excludeDirsText,
   set: (value: string) => emit("update-exclude-dirs", value),
 });
+
+const tokenBudgets = [70, 140, 280, 560, 1120];
+
+// Keep existing custom settings selectable when presenting the common presets.
+function presets(current: number, values: number[]) {
+  return Array.from(new Set([...values, current])).filter(Number.isFinite).sort((a, b) => a - b);
+}
 </script>
 
 <template>
   <div class="settings-index-tab">
     <div class="embedded-view scan-embed"><ScanView /></div>
 
-    <section v-if="false" class="settings-section common-settings">
-      <div class="section-head">
-        <div>
-          <h2>{{ t("通用设置") }}</h2>
-          <p>{{ t("搜索时可选择目标语言。多语言嵌入模型会直接进行跨语言匹配。") }}</p>
-        </div>
-        <button class="save-button" @click="props.saveFileConfig"><Save :size="14" />{{ t("保存") }}</button>
-      </div>
-      <div class="language-options">
-        <span class="language-label">{{ t("搜索目标语言") }}</span>
-        <label v-for="item in [
-          { value: 'en', label: '英语 / English' },
-          { value: 'ja', label: '日语 / 日本語' },
-          { value: 'de', label: '德语 / Deutsch' },
-          { value: 'fr', label: '法语 / Français' },
-          { value: 'es', label: '西班牙语 / Español' },
-          { value: 'ko', label: '韩语 / 한국어' }
-        ]" :key="item.value" class="language-option">
-          <span></span>
-          <span>{{ item.label }}</span>
-        </label>
-      </div>
-    </section>
-
-    <section v-if="props.cfg.ui?.professional_mode" class="settings-section">
+    <section v-if="props.cfg.ui?.professional_mode" class="settings-section index-parameters">
       <div class="section-head">
         <div>
           <h2>{{ t("索引参数") }}</h2>
-          <p>{{ t("控制正文、缩略图和向量任务的处理范围。") }}</p>
+          <p>{{ t("设置处理范围、向量精度与媒体预算，保存后从下一次建立索引生效。") }}</p>
         </div>
         <button class="save-button" @click="props.saveFileConfig"><Save :size="14" />{{ t("保存") }}</button>
       </div>
-      <div class="field-hint">{{ t("EmbeddingGemma2 共用 8192 token 上下文；图片和视频预算可在 70-1120 之间调整，视频默认按 1 FPS 采样。Qwen3-Embedding/Jina 等 GGUF 使用通用文本参数；这些多模态参数仅对 EmbeddingGemma2 safetensors 生效。") }}</div>
-      <div class="form-grid three">
-        <label>{{ t("最大文件（MB）") }}<input type="number" v-model.number="props.cfg.scan.max_size_mb" /></label>
-        <label>{{ t("最小文件（KB）") }}<input type="number" v-model.number="props.cfg.scan.min_size_kb" /></label>
-        <label>{{ t("正文最大字符数") }}<input type="number" v-model.number="props.cfg.index.max_text_chars" /></label>
-        <label>{{ t("索引批量大小") }}<input type="number" v-model.number="props.cfg.index.batch_size" /></label>
-        <label>{{ t("搜索结果数") }}<input type="number" v-model.number="props.cfg.search.page_size" /></label>
-        <label>{{ t("语义权重") }}<input type="number" min="0" max="1" step="0.05" v-model.number="props.cfg.search.semantic_weight" /></label>
-        <label>{{ t("语义最低分") }}<input type="number" min="0" max="1" step="0.05" v-model.number="props.cfg.search.semantic_floor" /></label>
-        <label>{{ t("输入防抖（毫秒）") }}<input type="number" min="0" step="50" v-model.number="props.cfg.search.debounce_ms" /></label>
-      </div>
       <div class="param-groups">
         <section class="param-group">
-          <h3>{{ t("图片参数") }}</h3>
-          <div class="form-grid three">
-            <label>{{ t("图片最长边") }}<input type="number" min="64" max="4096" v-model.number="props.cfg.index.image_max_side" /></label>
-            <label>{{ t("图片 Token 预算") }}<input type="number" min="70" max="1120" step="10" v-model.number="props.cfg.index.image_token_budget" /></label>
-            <label>{{ t("PDF 内嵌图片 Token 预算") }}<input type="number" min="70" max="1120" step="10" v-model.number="props.cfg.index.pdf_image_token_budget" /></label>
-            <label class="check-label"><input type="checkbox" v-model="props.cfg.index.vision_encoder" />{{ t("启用 EmbeddingGemma 图片/视频编码器") }}</label>
+          <h3>{{ t("索引库与正文") }}</h3>
+          <label class="param-field">
+            <span>{{ t("向量维度") }}</span>
+            <select v-model.number="props.cfg.index.vector_dim">
+              <option :value="768">768</option>
+              <option :value="512">512</option>
+              <option :value="256">256</option>
+            </select>
+          </label>
+          <label class="param-field">
+            <span>{{ t("正文字符上限") }}</span>
+            <select v-model.number="props.cfg.index.max_text_chars">
+              <option v-for="value in presets(props.cfg.index.max_text_chars, [50000, 100000, 200000, 500000, 1000000])" :key="value" :value="value">{{ value.toLocaleString() }}</option>
+            </select>
+          </label>
+          <label class="param-field">
+            <span>{{ t("批处理目标") }}</span>
+            <select v-model.number="props.cfg.index.batch_size">
+              <option v-for="value in presets(props.cfg.index.batch_size, [4, 8, 16, 32])" :key="value" :value="value">{{ value }}</option>
+            </select>
+          </label>
+          <p class="param-note">{{ t("实际批量按显存与任务调整；修改维度需要匹配的模型并重新建立向量。") }}</p>
+          <div class="param-switches">
+            <label class="check-label"><input type="checkbox" v-model="props.cfg.index.auto_fulltext" />{{ t("自动抽取正文") }}</label>
+            <label class="check-label"><input type="checkbox" v-model="props.cfg.index.auto_embed" />{{ t("自动生成向量") }}</label>
           </div>
         </section>
         <section class="param-group">
-          <h3>{{ t("视频参数") }}</h3>
-          <div class="form-grid three">
-            <label>{{ t("视频帧 Token 预算") }}<input type="number" min="70" max="1120" step="10" v-model.number="props.cfg.index.video_token_budget" /></label>
-            <label>{{ t("视频抽帧数") }}<input type="number" min="1" v-model.number="props.cfg.index.video_frames" /></label>
-            <label>{{ t("视频抽帧间隔（秒）") }}<input type="number" min="0.1" step="0.1" v-model.number="props.cfg.index.video_frame_interval" /></label>
-            <label>{{ t("单视频最大帧数") }}<input type="number" min="1" max="256" v-model.number="props.cfg.index.video_max_frames" /></label>
-            <label>{{ t("抽帧去重阈值") }}<input type="number" min="0" max="64" v-model.number="props.cfg.index.video_dedup_distance" /></label>
+          <h3>{{ t("图片") }}<span>Token</span></h3>
+          <label class="param-field">
+            <span>{{ t("独立图片预算") }}</span>
+            <select v-model.number="props.cfg.index.image_token_budget">
+              <option v-for="value in presets(props.cfg.index.image_token_budget, tokenBudgets)" :key="value" :value="value">{{ value }}</option>
+            </select>
+          </label>
+          <label class="param-field">
+            <span>{{ t("PDF 内嵌图片预算") }}</span>
+            <select v-model.number="props.cfg.index.pdf_image_token_budget">
+              <option v-for="value in presets(props.cfg.index.pdf_image_token_budget, tokenBudgets)" :key="value" :value="value">{{ value }}</option>
+            </select>
+          </label>
+          <label class="param-field">
+            <span>{{ t("独立图片最长边") }}</span>
+            <select v-model.number="props.cfg.index.image_max_side">
+              <option v-for="value in presets(props.cfg.index.image_max_side, [256, 448, 512, 768, 1024, 2048])" :key="value" :value="value">{{ value }} px</option>
+            </select>
+          </label>
+          <p class="param-note">{{ t("多模态预算适用于支持相应编码器的 GGUF + mmproj 或 safetensors 模型。") }}</p>
+          <div class="param-switches">
+            <label class="check-label"><input type="checkbox" v-model="props.cfg.index.vision_encoder" />{{ t("启用图片 / 视频编码器") }}</label>
+          </div>
+        </section>
+        <section class="param-group">
+          <h3>{{ t("视频与音频") }}</h3>
+          <label class="param-field">
+            <span>{{ t("视频每帧预算") }}</span>
+            <select v-model.number="props.cfg.index.video_token_budget">
+              <option v-for="value in presets(props.cfg.index.video_token_budget, tokenBudgets)" :key="value" :value="value">{{ value }} Token</option>
+            </select>
+          </label>
+          <label class="param-field">
+            <span>{{ t("音频窗口时长") }}</span>
+            <select v-model.number="props.cfg.index.audio_seconds">
+              <option v-for="value in presets(props.cfg.index.audio_seconds, [5, 10, 15, 30])" :key="value" :value="value">{{ value }} {{ t("秒") }}</option>
+            </select>
+          </label>
+          <p class="param-note">{{ t("视频最长 30 秒一段，每秒 1 帧；上下文不足时自动缩短。") }}</p>
+          <div class="param-switches">
             <label class="check-label"><input type="checkbox" v-model="props.cfg.index.video_index_audio" />{{ t("索引视频音轨") }}</label>
+            <label class="check-label"><input type="checkbox" v-model="props.cfg.index.audio_encoder" />{{ t("启用音频编码器") }}</label>
           </div>
         </section>
         <section class="param-group">
-          <h3>{{ t("音频参数") }}</h3>
-          <div class="form-grid three">
-            <label>{{ t("音频秒数") }}<input type="number" min="0.25" max="30" step="0.5" v-model.number="props.cfg.index.audio_seconds" /></label>
-            <label class="check-label"><input type="checkbox" v-model="props.cfg.index.audio_encoder" />{{ t("启用 EmbeddingGemma 音频编码器") }}</label>
+          <h3>{{ t("文件范围") }}</h3>
+          <label class="param-field">
+            <span>{{ t("最大文件大小") }}</span>
+            <select v-model.number="props.cfg.scan.max_size_mb">
+              <option v-for="value in presets(props.cfg.scan.max_size_mb, [256, 1024, 4096, 16384, 65536])" :key="value" :value="value">{{ value.toLocaleString() }} MB</option>
+            </select>
+          </label>
+          <label class="param-field">
+            <span>{{ t("最小文件大小") }}</span>
+            <select v-model.number="props.cfg.scan.min_size_kb">
+              <option v-for="value in presets(props.cfg.scan.min_size_kb, [0, 1, 10, 100, 1024])" :key="value" :value="value">{{ value }} KB</option>
+            </select>
+          </label>
+          <div class="param-switches">
+            <label class="check-label"><input type="checkbox" v-model="props.cfg.scan.follow_links" />{{ t("扫描时跟随符号链接") }}</label>
           </div>
         </section>
       </div>
-      <div class="switch-row">
-        <label><input type="checkbox" v-model="props.cfg.index.auto_fulltext" />{{ t("自动抽取正文") }}</label>
-        <label><input type="checkbox" v-model="props.cfg.index.auto_embed" />{{ t("自动生成向量") }}</label>
-        <label><input type="checkbox" v-model="props.cfg.search.use_pinyin" />{{ t("启用拼音检索") }}</label>
-        <label><input type="checkbox" v-model="props.cfg.search.use_fuzzy" />{{ t("启用模糊匹配") }}</label>
-        <label><input type="checkbox" v-model="props.cfg.scan.follow_links" />{{ t("扫描时跟随符号链接") }}</label>
-      </div>
+      <details v-if="props.cfg.model.clip_enabled" class="clip-options">
+        <summary>{{ t("CLIP 备用视频采样") }}</summary>
+        <div class="clip-fields">
+          <label class="param-field"><span>{{ t("抽帧间隔（秒）") }}</span><input type="number" min="0.1" step="0.1" v-model.number="props.cfg.index.video_frame_interval" /></label>
+          <label class="param-field"><span>{{ t("最大帧数") }}</span><input type="number" min="1" max="256" v-model.number="props.cfg.index.video_max_frames" /></label>
+          <label class="param-field"><span>{{ t("去重阈值") }}</span><input type="number" min="0" max="64" v-model.number="props.cfg.index.video_dedup_distance" /></label>
+        </div>
+      </details>
       <label class="wide-label exclude-label">
         {{ t("排除目录（每行一个名称）") }}
         <textarea v-model="excludeDirs" rows="3" placeholder="node_modules&#10;.git&#10;System Volume Information"></textarea>
@@ -148,7 +185,7 @@ const excludeDirs = computed({
         <div v-for="(rule, index) in props.rules" :key="index" class="rule-row">
           <input type="checkbox" v-model="rule.enabled" />
           <span class="mono">{{ rule.field }} {{ rule.op }} "{{ rule.value }}"</span>
-          <span class="muted">→ {{ rule.category }}</span>
+          <span class="muted">{{ rule.category }}</span>
           <button class="icon-button tiny-button" :title="t('删除规则')" :aria-label="t('删除规则')" @click="props.deleteRule(index)"><Trash2 :size="14" /></button>
         </div>
         <div v-if="!props.rules.length" class="empty-line">{{ t("还没有规则") }}</div>
@@ -172,25 +209,108 @@ const excludeDirs = computed({
 <style scoped>
 .param-groups {
   display: grid;
-  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 24px;
   margin: 16px 0;
 }
 
+.index-parameters .param-field {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin: 9px 0;
+  min-height: 30px;
+}
+
+.param-field > span {
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.index-parameters .param-field > select,
+.index-parameters .param-field > input {
+  width: 138px;
+  flex: 0 0 138px;
+}
+
+.param-note {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 .param-group {
-  border-top: 1px solid var(--line, #d0d0d0);
-  padding-top: 10px;
+  min-width: 0;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
 }
 
 .param-group h3 {
-  margin: 0 0 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 0 0 12px;
+  color: var(--text);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 600;
 }
 
-.check-label {
+.param-group h3 > span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.param-switches {
   display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-top: 14px;
+}
+
+.index-parameters .check-label {
+  display: flex;
+  flex-direction: row;
   align-items: center;
   gap: 8px;
+}
+
+.clip-options {
+  margin: 16px 0;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.clip-options summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.clip-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 24px;
+  margin-top: 10px;
+}
+
+@media (max-width: 760px) {
+  .param-groups,
+  .clip-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 420px) {
+  .index-parameters .param-field > select,
+  .index-parameters .param-field > input {
+    width: 118px;
+    flex-basis: 118px;
+  }
 }
 </style>
 

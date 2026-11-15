@@ -25,6 +25,10 @@ pub struct ModelEntry {
     pub format: String,
     pub files_complete: bool,
     pub direct_loadable: bool,
+    /// Whether the package looks like a supported OCR/vision-to-text model.
+    /// This is a conservative hint used by the UI; the OCR runtime remains
+    /// the final authority when the model is loaded.
+    pub ocr_compatible: bool,
     pub model_dir: String,
     /// 模型本身声明的输入模态：text / image / audio / video。
     /// 这只描述权重能力；是否能在当前构建运行由 files_complete/direct_loadable 决定。
@@ -122,6 +126,26 @@ fn candidate_backends(format: &str, config: &str) -> Vec<String> {
         "safetensors" => vec!["python".into()],
         _ => Vec::new(),
     }
+}
+
+/// Safetensors is only a weight container.  Do not offer every transformer
+/// checkpoint as an OCR model: ordinary text embedding packages (including
+/// EmbeddingGemma) cannot be loaded by the TeleOCR worker.  Keep this check
+/// deliberately cheap and conservative; the worker performs the definitive
+/// dependency/model validation later.
+fn likely_ocr_model(file: &str, config: &str, processor: &str) -> bool {
+    let hint = format!("{}\n{}\n{}", file, config, processor).to_ascii_lowercase();
+    [
+        "teleocr",
+        "trocr",
+        "ocr",
+        "text_recognition",
+        "vision_encoder_decoder",
+        "vision2seq",
+        "pix2struct",
+    ]
+    .iter()
+    .any(|needle| hint.contains(needle))
 }
 
 /// Return the capabilities that can be declared cheaply while scanning a
@@ -389,6 +413,8 @@ pub fn scan(cfg: &ModelConfig, extra_dirs: &[PathBuf]) -> Vec<ModelEntry> {
             );
             let embedding_gemma = config.to_ascii_lowercase().contains("embeddinggemma2model")
                 || config.to_ascii_lowercase().contains("embedding_gemma2");
+            let ocr_compatible = is_safetensors
+                && likely_ocr_model(&file, &config, &processor);
             out.push(ModelEntry {
                 name: if display.is_empty() { file.clone() } else { display },
                 path: path_s,
@@ -404,6 +430,7 @@ pub fn scan(cfg: &ModelConfig, extra_dirs: &[PathBuf]) -> Vec<ModelEntry> {
                 files_complete: model_files_complete(&p, if is_gguf { "gguf" } else { "safetensors" }),
                 direct_loadable: model_files_complete(&p, if is_gguf { "gguf" } else { "safetensors" })
                     && candle_model_loadable(&p, if is_gguf { "gguf" } else { "safetensors" }, embedding_gemma),
+                ocr_compatible,
                 model_dir,
                 modalities,
                 candidate_backends,
@@ -670,6 +697,7 @@ pub fn import_folder(src: &str, dir: &Path) -> Result<ModelImportResult, String>
         return Err("所选文件夹内没有找到 .gguf 或 .safetensors 模型文件".into());
     }
     let Some((primary_path, primary_kind, primary_format, _)) = primary else {
+        let _ = std::fs::remove_dir_all(&destination);
         return Err("没有可识别的模型权重文件".into());
     };
     let files_complete = model_files_complete(&primary_path, &primary_format);

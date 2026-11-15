@@ -9,16 +9,10 @@ $repo = Split-Path -Parent $PSScriptRoot
 # Make the normal `npm run tauri dev` command include the native Candle
 # backend when the local CUDA toolkit is available. Explicit --features wins.
 . (Join-Path $PSScriptRoot "activate-local.ps1")
-# Vulkan's shader-generator currently requires a nested MSBuild project that
-# is unreliable on this host. Keep the dependable CUDA path as the default;
-# callers can opt into the integrated-GPU backend with DEEPAISEE_VULKAN=1.
-if (-not $env:DEEPAISEE_VULKAN) { $env:DEEPAISEE_VULKAN = "0" }
-
-# Keep the normal development command deterministic on Windows. CUDA is
-# selected automatically when the toolkit is present; Vulkan remains an
-# explicit build opt-in because its shader compiler can fail on non-ASCII
-# checkout paths. Runtime device selection still exposes all compiled devices.
-if (-not $env:DEEPAISEE_VULKAN) { $env:DEEPAISEE_VULKAN = "0" }
+# build.rs/activate-local.ps1 detect a project-local or system Vulkan SDK.
+# Respect an explicit DEEPAISEE_VULKAN=0/1 override, otherwise let that
+# detection decide so integrated GPUs and AMD adapters are compiled in when
+# the local toolchain supports them.
 
 $tauri = Join-Path $repo "node_modules\.bin\tauri.cmd"
 if (-not (Test-Path -LiteralPath $tauri)) {

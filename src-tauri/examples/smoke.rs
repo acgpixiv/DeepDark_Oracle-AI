@@ -106,6 +106,7 @@ fn main() {
         emb.clone(),
         media_emb.clone(),
         cfg.index.clone(),
+        deepdark_oracle_lib::ocr::OcrConfig::from(&cfg.model),
         data.join("thumbs"),
     ));
     idx.start();

@@ -84,6 +84,11 @@ impl Default for ScanConfig {
 // 缺字段时用 Default 补齐，避免用户手改配置时整份失效
 #[serde(default)]
 pub struct IndexConfig {
+    /// Requested index dimension exposed in expert settings. Runtime use must
+    /// be paired with a model-specific projection; changing it alone cannot
+    /// preserve embedding geometry.
+    #[serde(default = "default_vector_dim")]
+    pub vector_dim: usize,
     pub max_text_chars: usize,
     pub auto_fulltext: bool,
     pub auto_embed: bool,
@@ -121,6 +126,7 @@ pub struct IndexConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
+            vector_dim: 768,
             max_text_chars: 200_000,
             auto_fulltext: true,
             auto_embed: true,
@@ -146,6 +152,7 @@ impl Default for IndexConfig {
 fn default_image_token_budget() -> usize { 1120 }
 fn default_pdf_image_token_budget() -> usize { 280 }
 fn default_video_token_budget() -> usize { 140 }
+fn default_vector_dim() -> usize { 768 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // 缺字段时用 Default 补齐，避免用户手改配置时整份失效
@@ -174,6 +181,18 @@ pub struct ModelConfig {
     pub clap_dir: String,
     /// 关掉后不做「用文字描述找声音」
     pub clap_enabled: bool,
+    /// Optional TeleOCR model directory. TeleOCR and its Python dependencies
+    /// are user-provided and are never bundled with the lightweight installer.
+    #[serde(default)]
+    pub teleocr_model_dir: String,
+    /// Python executable used by the optional TeleOCR worker. Empty means
+    /// resolve `python` from PATH.
+    #[serde(default)]
+    pub teleocr_python_path: String,
+    /// Optional TeleOCR source checkout root, used when not installed as a
+    /// Python package.
+    #[serde(default)]
+    pub teleocr_code_dir: String,
     /// Single-model CPU batching policy. `eco` uses at most one third of the
     /// logical CPUs, `auto` uses up to 90% while respecting current load, and
     /// `custom` uses the requested thread count.
@@ -204,6 +223,9 @@ impl Default for ModelConfig {
             clip_enabled: true,
             clap_dir: String::new(),
             clap_enabled: true,
+            teleocr_model_dir: String::new(),
+            teleocr_python_path: String::new(),
+            teleocr_code_dir: String::new(),
             parallel_mode: "auto".into(),
             parallel_threads: 4,
         }
@@ -441,6 +463,9 @@ impl AppConfig {
             if let Ok(normalized) = serde_json::to_string_pretty(&config) {
                 let _ = std::fs::write(path, normalized);
             }
+        }
+        if !matches!(config.index.vector_dim, 256 | 512 | 768) {
+            config.index.vector_dim = 768;
         }
         config
     }

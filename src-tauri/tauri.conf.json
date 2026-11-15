@@ -42,7 +42,8 @@
       "../tools/bin/ffmpeg.exe": "tools/bin/ffmpeg.exe",
       "../.tools/cuda-runtime/": "_up_/.tools/cuda-runtime/",
       "../scripts/install-onnxruntime.ps1": "resources/scripts/install-onnxruntime.ps1",
-      "../scripts/install-python-sidecar.ps1": "resources/scripts/install-python-sidecar.ps1"
+      "../scripts/install-python-sidecar.ps1": "resources/scripts/install-python-sidecar.ps1",
+      "../scripts/install-pytorch.ps1": "resources/scripts/install-pytorch.ps1"
     },
     "windows": {
       "nsis": {

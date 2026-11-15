@@ -183,7 +183,9 @@ export function starRadiusOf(totalBytes: number): number {
   // 770 的恒星半径比整个星系还大，四张 billboard 直接把视口铺满，
   // 屏幕上只剩一块褐色矩形（实测截图就是这样）。
   // 20 + cbrt(GB)*8.5：16GB=41、1TB=106、8TB=190，与 150~300 的轨道尺度匹配。
-  return 20 + Math.cbrt(gb) * 8.5;
+  // Match the backend cap so unusually large or synthetic capacities cannot
+  // fill the whole camera frustum.
+  return Math.min(300, 20 + Math.cbrt(gb) * 8.5);
 }
 
 /** 容量 → 引力强度 0~1。恒星越大，行星轨道越远、公转越慢。 */

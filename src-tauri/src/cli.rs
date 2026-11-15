@@ -124,22 +124,14 @@ impl Ctx {
         //   2. config 里缓存的 embedding_dim（model_load_inner 成功后写回）；
         //   3. 512 兜底。
         // 只有真正要跑 index/sem 时才在 cmd_index / query_vec 里加载模型。
-        let dim = crate::vector::saved_dim_of(&data_dir.join("vectors"))
-            .or_else(|| {
-                if cfg.model.embedding_dim > 0 {
-                    Some(cfg.model.embedding_dim)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(512);
+        let dim = crate::state::configured_vector_dim(cfg.index.vector_dim);
         let vectors = VectorStore::open(&data_dir.join("vectors"), dim)
             .map_err(|e| format!("打开向量库失败：{e}"))?;
-        let media = VectorStore::open(&data_dir.join("vectors_media"), 256)
+        let media = VectorStore::open(&data_dir.join("vectors_media"), dim)
             .map_err(|e| format!("打开媒体向量库失败：{e}"))?;
-        let clip = VectorStore::open(&data_dir.join("vectors_clip"), 512)
+        let clip = VectorStore::open(&data_dir.join("vectors_clip"), dim)
             .map_err(|e| format!("打开跨模态图片向量库失败：{e}"))?;
-        let audio = VectorStore::open(&data_dir.join("vectors_audio"), 512)
+        let audio = VectorStore::open(&data_dir.join("vectors_audio"), dim)
             .map_err(|e| format!("打开跨模态音频向量库失败：{e}"))?;
         // 命令行跑跨模态：模型缺失就关掉，不阻塞其它子命令。
         //
@@ -484,6 +476,9 @@ fn cmd_search(ctx: &Ctx, args: &[String]) -> i32 {
     if semantic_requested && !has_flag(args, "--no-cross") {
         if let Some(m) = &ctx.clip_model {
             q.clip_query = m.text_vec(&text).ok();
+            if q.clip_query.is_some() {
+                q.clip_model_key = Some(format!("clip:{}|{}", m.model_path().display(), m.dim()));
+            }
         }
         if let Some(m) = &ctx.clap_model {
             // CLAP 是英文模型：中文查询先映射成英文提示再编码。
@@ -620,6 +615,7 @@ fn cmd_index(ctx: &Ctx, args: &[String]) -> i32 {
         emb,
         Arc::new(crate::ai::hash::HashEmbedder::new()),
         ctx.cfg.index.clone(),
+        crate::ocr::OcrConfig::from(&ctx.cfg.model),
         ctx.data_dir.join("thumbs"),
     );
     // CLI 也必须走 GUI 那套批尺寸推导，否则永远用配置文件里的 8。

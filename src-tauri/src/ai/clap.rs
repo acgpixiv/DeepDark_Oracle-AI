@@ -94,11 +94,44 @@ impl ClapModel {
     /// `pcm` 是 16 位单声道、任意采样率的样本；内部会重采样到 48kHz
     /// 并补齐/截断到 10 秒——CLAP 的位置编码是固定的，长度不对会直接报错。
     pub fn audio_vec(&self, path: &Path) -> Result<Vec<f32>, String> {
-        let pcm = crate::media::load_audio_48k(path, SECONDS as f32)
-            .ok_or_else(|| "读不出音频（需要 ffmpeg）".to_string())?;
-        self.audio_vec_pcm(&pcm)
-    }
+        let Some(duration) = crate::media::media_duration(path)
+            .filter(|value| value.is_finite() && *value > 0.0)
+        else {
+            // Some containers do not expose duration metadata. Preserve the
+            // previous behaviour in that case instead of failing indexing.
+            let pcm = crate::media::load_audio_48k(path, SECONDS as f32)
+                .ok_or_else(|| "读不出音频（需要 ffmpeg）".to_string())?;
+            return self.audio_vec_pcm(&pcm);
+        };
 
+        let mut fused = vec![0.0f32; self.dim];
+        let mut total_weight = 0.0f32;
+        for (start, window) in audio_windows(duration) {
+            let pcm = crate::media::load_audio_segment_at_rate(
+                path,
+                start,
+                window,
+                SAMPLE_RATE as u32,
+            )
+            .ok_or_else(|| format!("读不出音频窗口（{start:.1}s）（需要 ffmpeg）"))?;
+            let vector = self.audio_vec_pcm(&pcm)?;
+            // Weight by source duration so a short tail cannot skew a long
+            // recording as much as a complete 10-second window.
+            let weight = window as f32;
+            for (dst, src) in fused.iter_mut().zip(vector) {
+                *dst += src * weight;
+            }
+            total_weight += weight;
+        }
+        if total_weight <= f32::EPSILON {
+            return Err("音频没有可用的窗口输入".into());
+        }
+        for value in &mut fused {
+            *value /= total_weight;
+        }
+        normalize(&mut fused);
+        Ok(fused)
+    }
     /// 已经解码好的 48kHz 单声道波形 → 向量（索引线程批量使用时省一次解码）。
     pub fn audio_vec_pcm(&self, pcm: &[f32]) -> Result<Vec<f32>, String> {
         let feats = log_mel(pcm);
@@ -313,6 +346,23 @@ fn fft(re: &mut [f32; N_FFT], im: &mut [f32; N_FFT]) {
     }
 }
 
+/// Split a media duration into contiguous CLAP windows. The final window is
+/// allowed to be shorter than ten seconds; the feature extractor pads it to
+/// the fixed input shape. Keeping this policy separate makes the coverage
+/// guarantee easy to test without loading ONNX models.
+fn audio_windows(duration: f64) -> Vec<(f64, f64)> {
+    if !duration.is_finite() || duration <= 0.0 {
+        return Vec::new();
+    }
+    let mut windows = Vec::new();
+    let mut start = 0.0;
+    while start < duration {
+        let length = (duration - start).min(SECONDS as f64).max(0.25);
+        windows.push((start, length));
+        start += SECONDS as f64;
+    }
+    windows
+}
 fn normalize(v: &mut [f32]) {
     let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if n > 1e-8 {
@@ -422,4 +472,28 @@ pub fn resolve_dir(cfg: &crate::config::ModelConfig, app_dir: &Path, data_dir: &
         return Some(b);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audio_windows;
+
+    #[test]
+    fn clap_windows_cover_the_full_duration() {
+        assert_eq!(audio_windows(0.0), Vec::<(f64, f64)>::new());
+        assert_eq!(audio_windows(7.5), vec![(0.0, 7.5)]);
+        assert_eq!(audio_windows(25.0), vec![(0.0, 10.0), (10.0, 10.0), (20.0, 5.0)]);
+    }
+
+    #[test]
+    fn clap_window_tail_is_never_zero_length() {
+        let windows = audio_windows(20.01);
+        assert_eq!(windows.len(), 3);
+        assert!(windows.iter().all(|(_, length)| *length >= 0.25));
+        let end = windows
+            .iter()
+            .map(|(start, length)| start + length)
+            .fold(0.0, f64::max);
+        assert!(end >= 20.01);
+    }
 }

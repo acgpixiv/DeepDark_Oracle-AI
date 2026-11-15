@@ -185,7 +185,10 @@ pub fn star_radius_of(total_bytes: u64) -> f32 {
     // 在"已索引"与"未索引"两条路径下大小会跳。
     // 20 + cbrt(GB)*8.5：16GB=41、1TB=106、8TB=190 —— 与 3D 场景
     // 150~300 的轨道尺度匹配（旧公式 1.8TB 算出 770，会铺满整个视口）。
-    (20.0 + gb.cbrt() * 8.5) as f32
+    // Keep synthetic/very large disks from filling the camera frustum.  The
+    // frontend uses the same cap so indexed and unindexed drive nodes remain
+    // visually identical.
+    (20.0 + gb.cbrt() * 8.5).min(300.0) as f32
 }
 
 /// 容量 → 引力强度 0~1（恒星越大引力越强）。

@@ -22,8 +22,8 @@ const EN: Record<string, string> = {
   "日志": "Logs",
 
   // 设置页头部描述
-  "界面语言与主题、启动行为，以及无需建索引的工作区目录。":
-    "Language, theme and startup behaviour, plus workspaces that need no indexing.",
+  "界面语言与主题、启动行为设置。":
+    "Language, theme, and startup behaviour.",
   "扫描目录、建立全文与向量索引、管理分类规则。":
     "Pick folders, build full-text and vector indexes, manage category rules.",
   "选择嵌入与对话模型、分配显存与线程。":
@@ -89,8 +89,7 @@ const EN: Record<string, string> = {
   "正在读取设置…": "Loading settings…",
   "当前文件": "current file",
   "正在处理：": "Processing: ",
-  "正在安全停止并保存进度…": "Stopping safely and saving progress…",
-  "正在停止…": "Stopping…",
+  "正在停止": "Stopping",
 
   // 通用配置
   "语言与主题": "Language & theme",
@@ -108,7 +107,16 @@ const EN: Record<string, string> = {
   "综合（全文 + 语义）": "Hybrid (full-text + semantic)",
   "记住窗口大小和位置": "Remember window size and position",
   "启动行为": "Startup",
-  "启动搜索范围": "Startup search scope",
+  "启动搜索范围": "工作区",
+  "默认工作区": "Default workspace",
+  "启动时默认工作区": "Default workspace on startup",
+  "上次使用": "Last used",
+  "默认路径": "Default path",
+  "选择默认工作区": "Choose default workspace",
+  "选择一个文件夹": "Choose a folder",
+  "默认工作区已保存": "Default workspace saved",
+  "保存默认工作区失败": "Could not save default workspace",
+  "读取工作区失败": "Could not read workspace",
   "设置应用启动后使用的搜索范围；记忆会恢复上次关闭时选择的路径。":
     "Choose the search scope at launch. Remember restores the last selected scope.",
   "默认搜索范围": "Default search scope",
@@ -199,6 +207,9 @@ const EN: Record<string, string> = {
   "停止监控": "Stop watching",
   "停用当前模型": "Deactivate current model",
   "停用模型": "Deactivate model",
+  "停用": "Disable",
+  "停用推理模型": "Disable embedding model",
+  "停用 OCR": "Disable OCR",
   "允许启动局域网服务": "Enable LAN service",
   "允许实时监控": "Enable live watching",
   "允许远程写操作": "Allow remote writes",
@@ -235,6 +246,7 @@ const EN: Record<string, string> = {
   "EmbeddingGemma2 共用 8192 token 上下文；图片和视频预算可在 70-1120 之间调整，视频默认按 1 FPS 采样。Qwen3-Embedding/Jina 等 GGUF 使用通用文本参数；这些多模态参数仅对 EmbeddingGemma2 safetensors 生效。": "EmbeddingGemma2 shares an 8192-token context; image and video budgets range from 70 to 1120, with 1 FPS video sampling by default. Qwen3-Embedding/Jina GGUF models use the general text parameters; these multimodal options apply only to EmbeddingGemma2 safetensors.",
   "在同一局域网内访问索引和搜索。": "Reach the index and search from the same LAN.",
   "处理中…": "Working…",
+  "正在准备处理文件…": "Preparing files…",
   "失败": "Failed",
   "安装中…": "Installing…",
   "完整路径": "Full path",
@@ -518,6 +530,10 @@ const EN: Record<string, string> = {
   "加入工作区": "Add to workspaces",
   "匹配到": "Matched",
   "个文件夹": "folders",
+  "未检测到可选 GPU": "No selectable GPU detected",
+  "列表来自当前编译的推理后端；核显和 AMD 显卡需要 Vulkan 构建及对应驱动。": "The list comes from the inference backends compiled into this build. Integrated and AMD GPUs require a Vulkan build and a compatible driver.",
+  "当前构建未包含 Vulkan，无法列出核显或 AMD 显卡。": "This build does not include Vulkan, so integrated or AMD GPUs cannot be listed.",
+  "当前构建包含 Vulkan；请检查显卡 Vulkan 驱动是否正常。": "This build includes Vulkan. Check that the GPU's Vulkan driver is working.",
 };
 
 export function setLang(lang: string) {

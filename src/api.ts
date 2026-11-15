@@ -32,6 +32,11 @@ export interface Hit {
   reason: string;
   /** One-based page/slide number when a page-level match is available. */
   page?: number | null;
+  /** Matching video segment boundaries, in seconds from the beginning. */
+  start_seconds?: number | null;
+  end_seconds?: number | null;
+  /** Subtitle text associated with the matched video segment. */
+  subtitle?: string | null;
   snippet: string;
   /** 视觉标签（图片/视频自动生成）：蓝天、草地、雪景、夕阳… */
   tags?: string | null;
@@ -55,6 +60,8 @@ export interface SearchQuery {
   use_pinyin?: boolean;
   use_fuzzy?: boolean;
   use_semantic?: boolean;
+  /** Explicit retrieval mode selected by the search toolbar. */
+  search_mode?: "fulltext" | "semantic" | "image" | "audio" | string;
   /** 用文字描述找图片/声音（需要装了 CLIP/CLAP 模型），三态：不传=跟随界面开关 */
   cross_modal?: boolean | null;
   /** 是否把「工作区目录」里尚未入库的文件也一起检索（正文现场抽取），不传=开启 */
@@ -128,6 +135,9 @@ export interface IndexStats {
   current_items: string[];
   /** Backend task elapsed time, in whole seconds. */
   elapsed_seconds: number;
+  /** Transient progress within the current video's bounded windows. */
+  segment_completed: number;
+  segment_total: number;
 }
 
 export interface ModelInfo {
@@ -227,6 +237,8 @@ export interface ModelEntry {
   files_complete: boolean;
   /** 当前构建是否已包含可直接加载此模型的原生后端 */
   direct_loadable: boolean;
+  /** Conservative package-level hint for TeleOCR-compatible safetensors. */
+  ocr_compatible: boolean;
   /** 模型文件所在目录 */
   model_dir: string;
   /** 模型声明支持的输入模态：text / image / audio / video */
@@ -490,7 +502,28 @@ export interface ExtensionStatus {
   detail: string;
   python: boolean;
   python_path: string;
+  pytorch: boolean;
+  pytorch_path: string;
+  pytorch_version: string;
   root: string;
+}
+
+export interface OcrStatus {
+  python_available: boolean;
+  teleocr_available: boolean;
+  model_configured: boolean;
+  /** Lightweight fallback available when no TeleOCR model is configured. */
+  tesseract_available: boolean;
+  /** A PDF page renderer (pdftoppm or mutool) is available for fallback OCR. */
+  pdf_renderer_available: boolean;
+  /** Locally detected OCR model candidates; not automatically enabled unless selected. */
+  model_candidates: string[];
+  /** Runtime pieces missing for the selected OCR model. */
+  missing_dependencies: string[];
+  python_path: string;
+  code_dir: string;
+  model_dir: string;
+  detail: string;
 }
 
 export interface Activity {
@@ -588,6 +621,7 @@ export const api = {
   modelLoad: (backend: string, path?: string) =>
     invoke<ModelInfo>("model_load", { backend, path }),
   modelDeactivate: () => invoke<ModelInfo>("model_deactivate"),
+  ocrModelDeactivate: () => invoke<void>("ocr_model_deactivate"),
   modelList: () => invoke<ModelEntry[]>("model_list"),
   modelDir: () => invoke<string>("model_dir_path"),
   modelDelete: (path: string) => invoke<void>("model_delete", { path }),
@@ -601,8 +635,8 @@ export const api = {
   renamePath: (path: string, name: string) => invoke<string>("rename_path", { path, name }),
   ensurePreview: (fileId: number, path: string) =>
     invoke<boolean>("ensure_preview", { fileId, path }),
-  savePdfThumbnail: (fileId: number, path: string, dataUrl: string) =>
-    invoke<void>("save_pdf_thumbnail", { fileId, path, dataUrl }),
+  savePdfThumbnail: (fileId: number, path: string, dataUrl: string, page?: number) =>
+    invoke<void>("save_pdf_thumbnail", { fileId, path, dataUrl, page }),
 
   opExport: (paths: string[], out: string, fmt?: string) =>
     invoke<number>("op_export", { paths, out, fmt }),
@@ -668,11 +702,12 @@ export const api = {
   dbClear: () => invoke<void>("db_clear"),
   dataDir: () => invoke<string>("data_dir_path"),
   extensionStatus: () => invoke<ExtensionStatus>("extension_status"),
-  extensionInstall: (kind: "onnxruntime" | "python") =>
+  extensionInstall: (kind: "onnxruntime" | "python" | "pytorch") =>
     invoke<ExtensionStatus>("extension_install", { kind }),
   extensionRemove: (kind: "onnxruntime") =>
     invoke<ExtensionStatus>("extension_remove", { kind }),
   extensionUpdate: () => invoke<ExtensionStatus>("extension_update", { kind: "onnxruntime" }),
+  teleocrStatus: () => invoke<OcrStatus>("teleocr_status"),
 };
 
 /** Tauri 未注入时（比如直接用浏览器打开 vite dev）给一个明确的错误。 */

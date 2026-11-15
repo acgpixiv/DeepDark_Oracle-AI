@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="E:\项目\AI--deepaisee\src-tauri\target-batch-check\.ddo-cmake\DeepDark_Oracle-874a6d221c389fe2\build\CMakeFiles\8b5dc1337998acb6ded445096191b654\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{8DC6A6E4-7A9B-3C0D-9B1F-FF8ADB748EF2}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

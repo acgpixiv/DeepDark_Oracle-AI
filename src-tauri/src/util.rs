@@ -155,7 +155,16 @@ pub fn fts_query_terms(query: &str) -> Vec<String> {
 pub fn build_fts_expr(query: &str) -> Option<String> {
     let terms = fts_query_terms(query);
     if terms.is_empty() {
-        return None;
+        // Keep a literal fallback for short ASCII/CJK queries.  The indexed
+        // CJK bigram stream intentionally omits some one-character tokens,
+        // but video subtitles are stored as ordinary text and still need to
+        // be searchable.  Callers that use this expression for docs simply
+        // receive no FTS rows when the token is absent.
+        let literal = query.trim().replace('"', "");
+        if literal.is_empty() {
+            return None;
+        }
+        return Some(format!("\"{}\"", literal));
     }
     let parts: Vec<String> = terms
         .iter()

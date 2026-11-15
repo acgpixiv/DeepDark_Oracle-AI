@@ -1,14 +1,14 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { Database, Network, Search, Settings2 } from "lucide-vue-next";
+import { defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { Database, Search, Settings2 } from "lucide-vue-next";
 import { api, type ScanProgress } from "./api";
 import { refreshInfo, refreshStats, store, toast } from "./store";
 import { applyAppearance } from "./theme";
 import { langState, t } from "./i18n";
 import SearchView from "./views/SearchView.vue";
-import TreeView from "./views/TreeView.vue";
-import GalaxyView from "./views/GalaxyView.vue";
-import SettingsDrawer from "./components/SettingsDrawer.vue";
+const TreeView = defineAsyncComponent(() => import("./views/TreeView.vue"));
+const GalaxyView = defineAsyncComponent(() => import("./views/GalaxyView.vue"));
+const SettingsDrawer = defineAsyncComponent(() => import("./components/SettingsDrawer.vue"));
 import IndexTreePanel from "./components/IndexTreePanel.vue";
 
 type Page = "home" | "tree" | "graph" | "settings";
@@ -145,15 +145,6 @@ watch(page, (next) => {
           @open-full="openFullTree"
         />
       </div>
-      <button
-        class="icon-button graph-button"
-        :class="{ current: page === 'graph' }"
-        :title="t('星系图谱（Ctrl+G）')"
-        :aria-label="t('星系图谱')"
-        @click="page === 'graph' ? (page = 'home') : openGalaxy()"
-      >
-        <Network :size="19" aria-hidden="true" />
-      </button>
       <button class="icon-button settings-button" :title="t('设置')" :aria-label="t('设置')" @click="page === 'settings' ? (page = 'home') : showSettings()">
         <Settings2 :size="19" aria-hidden="true" />
       </button>
@@ -252,8 +243,6 @@ watch(page, (next) => {
 .icon-button:hover { background: var(--panel); border-color: var(--border); color: var(--text); }
 .icon-button:active { transform: scale(.94); }
 .settings-button { margin-left: 4px; }
-.graph-button { margin-left: 2px; }
-.graph-button.current { background: var(--panel); border-color: var(--border); color: var(--text); }
 .app-content { flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
 
 /* 页面切换：淡入 + 轻微上移，避免整块界面硬切。 */

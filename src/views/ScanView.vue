@@ -16,6 +16,8 @@ const progress = ref<ScanProgress | null>(null);
 const idx = ref<IndexStats | null>(null);
 const polling = ref<number | null>(null);
 const operationActive = ref(false);
+const cancelPending = ref(false);
+const activeOperationRoots = ref<string[]>([]);
 const cancelledIndexPct = ref<number | null>(null);
 const selectedExtensions = ref<string[]>([]);
 const knownExtensions = ref<string[]>([]);
@@ -204,7 +206,18 @@ function setSelectedRootState(root: string) {
 }
 
 function rootProgress(stats?: RootIndexStats) {
-  return stats ? Math.max(0, Math.min(100, Math.round(stats.index_progress))) : 0;
+  return stats ? displayProgress(stats.index_progress) : 0;
+}
+
+// Keep small but real progress visible while a large index is being built.
+// Integer rounding made a few completed videos/pages look stuck at 0% (for
+// example 2 of 500 = 0.4%). The progress bar accepts fractional percentages,
+// so expose one decimal place and only use a tiny floor for non-zero work.
+function displayProgress(value: number): number {
+  const clamped = Math.max(0, Math.min(100, Number(value) || 0));
+  if (clamped <= 0) return 0;
+  if (clamped >= 100) return 100;
+  return Math.max(0.1, Math.round(clamped * 10) / 10);
 }
 
 const persistedIndexPct = computed(() => {
@@ -212,7 +225,7 @@ const persistedIndexPct = computed(() => {
   const total = rows.reduce((sum, row) => sum + row.files, 0);
   if (!total) return 0;
   const pending = rows.reduce((sum, row) => sum + row.embed_pending, 0);
-  return Math.max(0, Math.min(100, Math.round(((total - pending) / total) * 100)));
+  return displayProgress(((total - pending) / total) * 100);
 });
 
 async function pickDir() {
@@ -220,12 +233,18 @@ async function pickDir() {
     const p = await open({ directory: true, multiple: true, title: t("选择要扫描的目录") });
     if (!p) return;
     const arr = Array.isArray(p) ? p : [p];
+    const added: string[] = [];
     for (const d of arr) {
       if (!roots.value.includes(d)) {
         roots.value.push(d);
         rootEnabled.value[d] = true;
+        added.push(d);
       }
     }
+    if (!added.length) return;
+    setSelectedRootState(added[0]);
+    await saveRoots();
+    await startScan(added);
   } catch (e) {
     toast(`${t("选择目录失败：")}${e}`, "error");
   }
@@ -276,14 +295,18 @@ async function saveRoots() {
   await refreshRootStats();
 }
 
-async function startScan(targetRoot?: string) {
+async function startScan(targetRoot?: string | string[]) {
   if (operationBusy.value) return;
-  const selected = targetRoot ? [targetRoot] : activeRoots.value;
+  cancelPending.value = false;
+  const selected = targetRoot
+    ? (Array.isArray(targetRoot) ? targetRoot : [targetRoot])
+    : activeRoots.value;
   if (!selected.length) return toast(t("至少启用一个扫描目录"), "warn");
   await api.saveConfig({ scan: scanSettingsPatch() });
   try {
     defaultsAppliedForRun = false;
     progress.value = null;
+    activeOperationRoots.value = [...selected];
     await api.scanStart(selected, undefined, true);
     store.scanBusy = true;
     operationActive.value = true;
@@ -383,16 +406,18 @@ async function removeExcludedPath(path: string) {
 }
 
 async function cancelScan() {
+  if (cancelPending.value) return;
   cancelledIndexPct.value = indexPct.value;
-  // Stop presenting the task as active immediately. The backend cancellation
-  // remains cooperative so an in-flight model call can checkpoint safely.
-  operationActive.value = false;
-  store.scanBusy = false;
+  // The backend returns after setting the cooperative stop flag. Polling
+  // below observes the final checkpoint without blocking this view.
+  cancelPending.value = true;
   try {
     await api.scanCancel();
-    await api.indexCancel();
-    toast(t("已取消当前任务，已完成部分会保留"), "warn");
+    // Keep the operation alive while polling waits for the worker to reach a
+    // checkpoint; do not mark the UI idle before native inference returns.
+    toast(t("正在停止"), "warn");
   } catch (e) {
+    cancelPending.value = false;
     toast(`${e}`, "error");
   }
 }
@@ -408,6 +433,18 @@ function startPolling() {
         lastRootRefresh = Date.now();
         await refreshRootStats();
       }
+      // The worker belongs to the backend and survives route changes. Rebuild
+      // the local busy state when this view is mounted again mid-operation.
+      const remoteBusy = !!progress.value?.running
+        || !!idx.value?.running
+        || (idx.value?.queued ?? 0) > 0;
+      if (remoteBusy && !operationActive.value) {
+        operationActive.value = true;
+        store.scanBusy = true;
+      }
+      if (remoteBusy && (progress.value?.cancelled || idx.value?.cancelled)) {
+        cancelPending.value = true;
+      }
       if (operationActive.value && (
         (progress.value?.cancelled && !progress.value.running) ||
         (idx.value?.cancelled && !progress.value?.running && !idx.value.running && idx.value.queued === 0) ||
@@ -415,6 +452,7 @@ function startPolling() {
           && idx.value && !idx.value.running && idx.value.queued === 0)
       )) {
         operationActive.value = false;
+        cancelPending.value = false;
         store.scanBusy = false;
         await refreshStats();
         await refreshRootStats();
@@ -436,8 +474,10 @@ async function buildIndex(what: "auto" | "text" | "embed") {
   try {
     if (!activeRoots.value.length) return toast(t("至少启用一个扫描目录"), "warn");
     await api.saveConfig({ scan: scanSettingsPatch() });
+    cancelPending.value = false;
     cancelledIndexPct.value = null;
     defaultsAppliedForRun = false;
+    activeOperationRoots.value = [...activeRoots.value];
     await api.scanStart(activeRoots.value, what);
     operationActive.value = true;
     startPolling();
@@ -463,10 +503,30 @@ function formatBytes(bytes: number): string {
 
 const indexPct = computed(() => {
   if (cancelledIndexPct.value !== null) return cancelledIndexPct.value;
-  if (selectedRoot.value) return rootProgress(selectedRootStats.value);
   const s = idx.value;
+  const partialCompleted = s && s.segment_total > 0
+    ? Math.min(1, Math.max(0, s.segment_completed / s.segment_total))
+    : 0;
+  // A video reports segment progress before its file-level SQLite state is
+  // committed. Keep that fraction visible even when the selected-root
+  // snapshot is one polling cycle behind (small video-only directories used
+  // to remain at 0% while their first windows were already searchable).
+  const liveProgress = s && s.total > 0
+    ? ((s.completed + partialCompleted) / s.total) * 100
+    : partialCompleted * 100;
+  // IndexStats follows the active queue even when several roots are included.
+  // The per-root snapshot is checkpointed less often and can stay at 0% while
+  // completed video windows/files are already available to search.
+  const selectedRootInOperation = !selectedRoot.value
+    || activeOperationRoots.value.length === 0
+    || activeOperationRoots.value.some((root) => rootKey(root) === rootKey(selectedRoot.value!));
+  if (operationBusy.value && selectedRootInOperation && s && s.total > 0) {
+    return displayProgress(liveProgress);
+  }
+  if (partialCompleted > 0) return displayProgress(liveProgress);
+  if (selectedRoot.value) return rootProgress(selectedRootStats.value);
   if (s && s.total) {
-    return Math.min(100, Math.round((s.completed / s.total) * 100));
+    return displayProgress(liveProgress);
   }
   return persistedIndexPct.value;
 });
@@ -479,8 +539,14 @@ const indexElapsedLabel = computed(() => {
 });
 
 const currentItemsLabel = computed(() => {
-  const names = (idx.value?.current_items || []).filter((name) => name.trim());
-  if (names.length) return names.join(",");
+  // IndexStats reports the active model batch. During the short scan/extract
+  // hand-off only ScanProgress has a current file, so include both sources
+  // instead of leaving the label blank while work is already running.
+  const names = [...new Set([
+    ...(idx.value?.current_items || []),
+    progress.value?.current || "",
+  ].map((name) => name.trim()).filter(Boolean))];
+  if (names.length) return names.join(", ");
   return idx.value?.current?.trim() || "";
 });
 
@@ -496,7 +562,7 @@ onBeforeUnmount(stopPolling);
   <div class="view">
     <div class="grid">
       <section class="card blk roots-card">
-        <h3>{{ t("扫描目录") }}</h3>
+        <h3>{{ t("索引目录") }}</h3>
         <div class="roots">
           <div
             v-for="r in roots"
@@ -573,12 +639,14 @@ onBeforeUnmount(stopPolling);
         <div><b>{{ idx.text_fail + idx.emb_fail }}</b><span>{{ t("失败") }}</span></div>
         <div><b>{{ indexElapsedLabel }}</b><span>{{ t("已用时间") }}</span></div>
       </div>
-      <div v-if="operationBusy && currentItemsLabel" class="index-current muted mono" :title="currentItemsLabel">
-        {{ t("正在处理：") }}{{ currentItemsLabel }}
+      <div v-if="operationBusy" class="index-current muted mono" :title="currentItemsLabel || undefined" aria-live="polite">
+        <template v-if="cancelPending">{{ t("正在停止") }}</template>
+        <template v-else-if="currentItemsLabel">{{ t("正在处理：") }}{{ currentItemsLabel }}</template>
+        <template v-else>{{ t("正在准备处理文件…") }}</template>
       </div>
       <div class="row">
         <button class="primary" :disabled="operationBusy" @click="buildIndex('auto')">{{ t("建立索引") }}</button>
-        <button class="ghost" :disabled="!operationBusy" @click="cancelScan">{{ t("取消") }}</button>
+        <button class="ghost" :disabled="!operationBusy || cancelPending" @click="cancelScan">{{ cancelPending ? t("正在停止") : t("取消") }}</button>
         <button class="ghost" :disabled="operationBusy" @click="buildIndex('text')">{{ t("仅补正文") }}</button>
         <button class="ghost" :disabled="operationBusy" @click="buildIndex('embed')">{{ t("仅补向量") }}</button>
       </div>

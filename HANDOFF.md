@@ -2,9 +2,45 @@
 
 ## 当前快照
 
-- 截止日期：2026-11-01。产品版本号 **`0.0.26`**（显示版 `0.26`），应用名 `DeepDark_Oracle`。当前工作目录 `D:\软件\DeepDark_Oracle`，**不是 git 仓库**。
-- **v0.26 安装包已产出**：`release/DeepDark_Oracle_0.0.26_x64-setup.exe`，34,642,746 字节（33.04 MiB），SHA-256 `a8e945321e1f220c587436285921cd97106c7b0adc114e4c6319eac0815530ea`。这一版实现《2D转3D与星图需求明细》的 33 条需求（`src/galaxy/star/` 2588 行），并清掉了安装包里用不上的陈旧二进制（MinGW 三个运行时 DLL、`onnxruntime.dll`、`vulkan-1.dll`、`resources/`、`plugins/`）。上一版 v0.25 是 34,276,337 字节、SHA-256 `677aca3e6367cb247e3ea003750081a686c62bbf47a2a06dee7961501912d606`。
-- **根目录 `WebView2Loader.dll`（160,880 B）绝对不能删**：删掉即 `0xC0000135 STATUS_DLL_NOT_FOUND`（退出码 3221225781），窗口一个都不出。它由 cargo 生成在 `D:\DeepDark_Oracle-build\target\release\` 下，但**不会自动复制到项目根**，重新出包后要手动补。
+### 2026-11-15 可选扩展并发安装与视频误召回修复
+
+- 可选扩展的安装状态改为每张卡片独立维护。安装 PyTorch 时 ONNX Runtime、Python 和刷新按钮仍可操作；某项失败只恢复自身按钮，并发返回的状态按扩展字段合并，避免互相覆盖。安装、更新、删除通过后台 `spawn_blocking` 执行并隐藏 PowerShell 窗口。ONNX 与 Python 操作使用独立锁；Python 和 PyTorch 共享运行目录，其文件修改仅在后台串行，前台可同时提交请求。
+- 修复已有 embedded Python 但缺少 pip 时安装 PyTorch 直接失败：安装前统一运行可重复执行的 Python sidecar 修复流程，补齐 `_pth` 的 `Lib\\site-packages`、`import site` 和 pip；缺少 pip 的探测不再向 PowerShell 输出会中断流程的原生 stderr。实际临时 Python 3.12.10 的无 pip 自动安装与重复运行已验证，没有下载大型 PyTorch 或更改正式 Python 环境。
+- 实际 debug 数据库只读核查：五个汽车视频共 37 个窗口，均为当前 GGUF 的 768 维向量，没有字幕；未发现 Hash 或模型空间混用。问题是 `video_semantic_score` 及最终过滤对带时间戳视频额外放宽到 0.40–0.45，导致无关的 0.66–0.67 相似度也进入结果。时间戳只能证明来源，不能证明相关性。
+- 删除视频低阈值与最终显示豁免。共享编码器的视频窗口和历史文件级视频向量在语义、图像、音频、混合通道均使用普通语义证据门槛：一般查询至少原始余弦 0.68，1–2 字符查询至少 0.76，更高用户阈值仍有效；非有限分数直接拒绝。不会借图像通道把视频的弱余弦映射成高分。文件名/字幕精确全文命中仍可独立返回，较强视频匹配仍保留时间范围。此修复无需清空或重建已有视频向量。
+- 验证：`cargo test --manifest-path src-tauri/Cargo.toml --lib --no-default-features` 138/138 通过；新增五个弱视频、旧文件级视频、短/长查询、四种通道及 primary/media 空间的回归；现有字幕精确定位测试保留通过。`npm run build`、`git diff --check` 通过。没有重新运行真实 GPU 查询的相关性评测，也没有生成新安装包。
+- 前端运行验证：Browser 插件不可用，使用已缓存的 Playwright + Edge，在 `http://localhost:1420/`、1440×1000 检查首页/设置和三项模拟延迟安装。无空白页、Vite 错误层或 Vue 运行错误；仅开发 favicon 404。独立安装按钮、失败恢复和并发状态合并通过。截图在 `C:\\Users\\bug_fish\\AppData\\Local\\Temp\\deepaisee-extension-qa\\`，未在真实运行目录执行扩展下载。
+
+### 2026-11-15 检索、模型切换与索引参数修复
+
+- 修复指定索引目录/文件类型时全文结果全部丢失：显式全文通道原先从空的候选映射获取 FTS 命中，现在从已通过范围筛选的文件行构建映射。用真实数据的独立副本验证，`活塞环` 在 `E:\项目\CN` 下能返回 `645 - EA888系列Audi 2.0l-TFSI-发动机.pdf` 第 12 页，完整词命中分数 1.0。
+- 修复冷启动语义查询和过期搜索缓存的重复加锁死锁。查询向量复用单次编码结果；原生推理期间不持有 AppState 的模型 RwLock，查询与模型切换通过独立的生命周期锁协调，避免旧查询向量检索新模型空间。
+- 主模型能力检测、图像/音频查询及 CLIP/CLAP 准备后的查询均锁内复核运行时，防止空闲卸载恰好发生在检测和编码之间而漏结果；显式关闭跨模态派生查询时不再重复调用扩展编码器。
+- 模型加载、停用在后台阻塞任务中执行；切换先取消/停止旧消费者，释放旧原生上下文，再分配新模型，避免 GGUF 与 Candle 同时占用显存。模型信息使用加载时缓存，状态轮询不再等待媒体推理锁。
+- 向量库新增持久化编码器身份 `encoder.json`（后端、解析后的模型路径、原生维度）。不同编码器即使同为 768 维也不直接混用；切换时旧向量保留在 `previous-models/`，正文保留，向量状态转为待重建。没有身份标记的历史库仅作兼容接管并记录日志，无法据此证明历史模型一致。GGUF 和 safetensors 当前保守地按不同编码器处理。身份尚不含权重指纹，同一路径原地替换权重无法据此自动识别。
+- 运行时模型释放、语义搜索按需重载和模型切换重建 Indexer 时继承上一任务的正文/向量/失败计数、耗时、目录范围和恢复状态，直到下一次任务明确重置。
+- PDF 文字层预检改为解析真实内容操作符，支持紧贴字符串的 `Tj/TJ`、Form XObject 和合法的引号文本操作符；主提取器失败时，为明确 `GBK-EUC-H` 的中文字体增加严格解码兜底并保留空页位置。只对旧版本判空且没有正文的 PDF 做一次增量待处理迁移（`pdf_text_preflight_version=1`），不删除原数据。实际源文件只读验证：012 PDF 提取 60 页/19,102 字符，183 PDF 提取 62 页/20,881 字符。
+- 专业索引参数改为「索引库与正文、图片、视频与音频、文件范围」四组常用预设；保留已有自定义值，隐藏无效/不属于索引的字段，CLIP 备用采样条件折叠。GGUF 独立图片与 PDF 图片 token 预算接入实际加载参数。
+- 保存参数只标记待应用，下次空闲建立索引时统一应用；正文补建不唤醒 GPU 模型。向量维度变更同步检查四个库，模型构造参数变化按需重载，正在运行的任务保持当前参数快照。同一编码器仅改变图片预算时仍可搜索已有图片记录。
+- 验证：`npm run build`、`cargo check --manifest-path src-tauri/Cargo.toml --lib --features candle-cuda` 和 `git diff --check` 通过。CUDA 功能完整单元测试 138 项通过；另用本机 RTX 4080 跑通真实 GGUF → Candle/Safetensors 后端测试，覆盖索引、语义检索、直接切换、卸载后重载、向量隔离和完成计数保留，1 项通过（20.18 秒）。该原生测试默认忽略，显式设置 `DDO_TEST_GGUF_MODEL`、`DDO_TEST_SAFETENSORS_MODEL`、可选 `DDO_TEST_GPU_DEVICE` 后，以 `cargo test --manifest-path src-tauri/Cargo.toml --lib --features candle-cuda native_gguf_to_safetensors_indexes_searches_and_keeps_progress -- --ignored --nocapture --test-threads=1` 运行。所有测试使用独立临时数据和配置，模型配置保存直接使用 `state.data_dir`，不重新解析用户数据根目录。
+- 更新后运行一次普通增量索引可补建此前误判为空的 PDF，无需清空索引。前端设置页尚未做截图/实际窗口交互验收：当前环境没有 Browser 插件及 Playwright 依赖。本轮没有重新生成安装包；历史安装包不含本轮源码修复。
+
+### 2026-11-07 最新变更
+
+- 通用设置不再保存或显示工作区配置；工作区记忆、默认范围和路径选择统一由主页工作区选择器维护。通用设置仍保留界面、主题、启动行为和专业模式，并通过变更自动保存。
+- 可选扩展保持两列布局；ONNX Runtime、Python sidecar 和 PyTorch 都是按需安装，不随安装包默认分发。
+- 图片索引批次现在由 OCR worker 与主图像编码同时处理。Tesseract 使用 Rayon 并行；TeleOCR 与图像向量化重叠执行，单图失败会回退 Tesseract；同一文本编码上下文只在 OCR worker 完成后批量生成 OCR 向量。
+- 索引进入稳定空闲后会释放主模型、跨模态模型、TeleOCR sidecar 和 CUDA 上下文；全文和已落盘向量仍可检索，下一次明确的语义搜索或建立索引才按需加载模型。
+- 四个向量库统一使用 `index.vector_dim`，默认 768，专业模式支持 768/512/256。修改维度会保留旧向量文件并标记向量状态待重建，不删除用户数据。
+- GPU 设置页显示当前编译后端可枚举的独显和 Vulkan 核显，按显存排序并可选择一个主推理设备。当前 GGUF/Candle 仍是单设备执行；尚未实现同一索引任务的核显+独显协同，也不应对外宣称已经实现。
+- 主页工作区半圆角区域保持透明，只保留渐变边框及向搜索胶囊延伸的透明边线。
+- PDF 的文本和代表性嵌入图片按物理页保存页级向量；图片抽取最多覆盖 128 个物理页。基础文本/图片向量先落盘，OCR 作为后台增量任务补充正文并重建对应页向量，后台任务会继续反映在索引活动状态中。
+- DOCX/PPTX 走页级向量路径；DOCX 只有存在显式分页标记时才能恢复真实 Word 页码，没有分页标记的文件使用稳定的逻辑页切分，不能视为原 Word 页码。
+- 本次验证：`npm run build` 成功；`cargo check --features llama,candle,candle-cuda` 成功；`cargo test --lib` 58/58 通过；`git diff --check` 通过；`cargo fmt` 因 stable toolchain 未安装 rustfmt 未执行。
+
+- 截止日期：2026-11-04。当前产品版本 **`0.0.28`**（显示版 `0.28`），应用名 `DeepDark_Oracle`；当前工作目录 `E:\项目\AI--deepaisee`，是 git 仓库。
+- **当前安装包已产出**：`D:\DeepDark_Oracle-build\target\release\bundle\nsis\DeepDark_Oracle_0.0.28_x64-setup.exe`，528,067,092 字节（503.60 MiB），SHA-256 `C3E445748D4C4CAB5F191BB896652299954E3849972A4029E5567701FF16FA7C`。此构建在本机启用了 CUDA 与 Vulkan，且不含用户模型或索引数据。v0.26 及更早安装包信息保留在后文作为历史记录。
+- WebView2 loader 的旧版手动复制说明不适用于当前安装包：v0.28 的 NSIS hooks 将 Tauri/WebView2 运行时作为当前构建布局处理；本次 release exe 的 PE 依赖表没有动态导入 `WebView2Loader.dll`，NSIS 配置也没有单独复制该 DLL。旧版便携 exe 若启动报 `0xC0000135`，需按该旧版本的文件布局单独诊断，不能直接照搬到当前安装包。
 - 项目是离线桌面磁盘检索工具，不自带或分发模型权重。用户自行导入 GGUF 或 safetensors；ONNX Runtime 和 Python sidecar 是可选扩展，安装包默认不带它们。
 - 本节以下各章记录的是 v0.23 及更早的架构与历史；v0.24 的增量（星系图谱、思维模型图、安装包瘦身、工具链自愈）见「v0.24 增量」章，v0.25 的增量（GPU 兼容性、双渲染管线、Vulkan 默认启用）见文末「v0.25 增量」章。
 
@@ -229,7 +265,7 @@ GNU 工具链不认非 ASCII 路径，**sysroot 和 target 目录都必须是 AS
 ### 其他修复
 
 - `scripts/patch-llama-embeddinggemma2.ps1`：判据从 `build_inp_embd(model.tok_embd);` 改成前缀匹配 `build_inp_embd(model.tok_embd`（上游新增了 attention scale 参数），否则条件恒假 → 走进 `git apply` 分支 → 项目非 git 仓库 → 打包失败。
-- `src-tauri/native/llama_shim.cpp` 跟进 llama.cpp 0.7 的 mtmd API：`mtmd_context_params.backend_device`（字符串）→ `device`（`ggml_backend_dev_t` 句柄），共 2 处；`mtmd_set_image_max_tokens()` 已被移除，共 2 处删除（图像 token 预算只在 `mtmd_context_params.image_max_tokens` 初始化时设定）。
+- `src-tauri/native/llama_shim.cpp` 跟进当前 vendored llama.cpp 的 mtmd API：`mtmd_context_params.device`（旧代码中的字段）改为 `backend_device`（设备名称字符串），共 2 处；`mtmd_set_image_max_tokens()` 已被移除，共 2 处删除（图像 token 预算只在 `mtmd_context_params.image_max_tokens` 初始化时设定）。
 - 消掉 `graph_data` 的 `unused variable: dir_depth` 警告。
 
 ### 验证记录
@@ -614,3 +650,26 @@ const BG_DEEP_CSS = "#050510";    // fg.backgroundColor() 用，必须是 CSS �
 - **`npm run build` 的 esbuild 临时文件在 `%TEMP%` 被拒**（`Access is denied`）。解法：把 `$env:TMP`/`$env:TEMP` 指到项目内 `build-tmp\` 再构建。
 - **`npm run tauri dev` 在本机链接失败**（`cannot find -lwinapi_advapi32` 等），与本次改动无关。**验证一律走 release 构建**。
 - **PowerShell 脚本里不能写中文字面量路径**（`Set-Location 'D:\软件\...'` 找不到路径），用 `Join-Path $PSScriptRoot ".."`。
+
+## v0.28 接手构建记录（2026-11-04）
+
+- 全新/转交工作区第一次打包时，Vite 报 `Rollup failed to resolve import "3d-force-graph"`。源码和 `package.json` 已声明依赖，问题是 `node_modules` 不完整；在项目根目录执行 `npm install` 可恢复，之后 `npm run build` 通过。锁文件根包版本同时从 `0.0.27` 同步到当前 `0.0.28`。新环境建议优先用 `npm ci` 按锁文件安装完整依赖。
+- 恢复前端依赖后，发布构建还暴露两个原生构建问题：llama.cpp 当前 `mtmd_context_params` 使用 `backend_device`（设备名），旧代码引用不存在的 `device` 字段；Vulkan 嵌套 CMake shader 子项目的 MSBuild 路径过深会触发 `FTK1011`。`src-tauri/native/llama_shim.cpp` 已改为传入 `ggml_backend_dev_name(selected_device)`，`src-tauri/build.rs` 将 Windows CMake 中间目录缩短到对应构建盘根目录下的 `.ddo-cmake/<build_id>`。
+- 本次环境：Visual Studio 2022 Community、CUDA Toolkit 13.1、项目内 Vulkan SDK `.tools/vulkan`。运行 `npm run tauri:release` 完整成功（前端、Rust/C++、CUDA/Vulkan、NSIS）；产物路径和 SHA-256 见「当前快照」。发布 exe `--selftest` 结果为通过 6、失败 0、跳过 10；跳过项是因为构建目录没有用户索引和 CLIP/CLAP 模型，不是测试失败。
+- 若再次出现 `3d-force-graph` 无法解析，先检查 `npm ls 3d-force-graph --depth=0`；此错误发生在 `beforeBuildCommand` 的 Vite 阶段，和 CUDA、Vulkan、Rust 链接无关。修复依赖后再运行完整发布命令，不要将模块配置为 Rollup external。
+
+## 检索歧义修正记录（2026-11-15）
+
+- 搜索框默认同时启用“全文、语义、图像、音频”四个通道。全文通道先走 SQLite FTS5，不调用 AI；语义、图像、音频通道在后台按需唤醒对应模型。只保留“全文”按钮时，后端会直接返回 FTS 结果，不触发自动语义回退。
+- 修复中文多词查询的全文误报：`fts_query_terms` 会把“发动机活塞”拆成中文二元词，旧逻辑使用 `OR`，单独出现“活塞”的页面也会被标为全文匹配。现在分页文档必须在同一页命中至少 `max(2, 查询词总数 - 1)` 个词；只有连续完整短语才给 `1.0`，非连续词面共现统一限制在 `0.70`，等待语义通道确认上下文关系。
+- 默认 hybrid 兼容路径也使用同一页上下文规则。无法通过全文上下文的英文文档、图片或无文字内容，仍可由后台语义/图像/音频通道补回。
+- 前端合并结果时，精确全文命中优先级最高；非精确全文命中不再无条件压过语义命中。二者同时命中同一文件时，使用 `25%` 全文词覆盖 + `75%` 语义分数，并按新分数重新排序。
+- 回归测试覆盖：单独“活塞”不进入“发动机活塞”的全文首屏、跨 PDF 页拆词不构成精确命中、同页短语保持 `1.0`、默认 hybrid 与显式全文行为一致。
+
+## 图谱与视频检索记录（2026-11-15）
+
+- 列表检索不挂载 `GalaxyCanvas` 或 `MindMap`。思维图只在用户切换到思维图页面后请求 `mind_map_data`，并等待前台检索、语义/图像/音频后台首轮和静默分页全部结束后再防抖刷新；搜索过程中会取消旧图谱请求，旧响应不会覆盖新结果。
+- 视频向量仍按时间窗口保存：默认目标为 30 秒，模型上下文不足时由 `safe_video_window_seconds` 自动缩短。每个窗口最多按 1 FPS 抽帧，并将窗口内画面和音频融合为一个向量；同一窗口的字幕 cue 会保留原始时间标记。
+- 视频卡片现在显示时间范围，例如 `00:00-00:30`，不再把首个窗口的起点误显示成精确的 `00:00`。有字幕命中时，后端会进一步细化到 cue 范围，例如 `00:41-00:45`。
+- 视频字幕全文检索使用窗口内上下文门槛，多词查询需要在同一个 30 秒窗口命中大部分词，避免只出现一个词的窗口被误报。
+- 当前视频精度瓶颈是无字幕场景：窗口内多帧被平均成一个向量，因此只能定位到窗口范围。要定位到具体画面秒数，需要保存帧级向量或缩短窗口，会增加 FFmpeg 解码、GPU 推理、存储空间和重建索引成本。
